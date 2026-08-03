@@ -20,21 +20,58 @@ EXPECT_BYTES=1560936091448
 
 command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
 
-if ! python3 -c "import huggingface_hub" 2>/dev/null; then
-    echo "installing huggingface_hub…"
+# `hf download` is the supported CLI entry point. Check for checksum verification too:
+# an older installation may provide `hf` but not `hf cache verify`.
+if ! command -v hf >/dev/null 2>&1 || ! hf cache verify --help >/dev/null 2>&1; then
+    echo "installing/upgrading huggingface_hub CLI…"
     python3 -m pip install --quiet --upgrade "huggingface_hub[cli]"
+    hash -r
 fi
+
+command -v hf >/dev/null 2>&1 || {
+    echo "hf CLI required; install or upgrade huggingface_hub"
+    exit 1
+}
+hf cache verify --help >/dev/null 2>&1 || {
+    echo "hf cache verify unavailable; upgrade huggingface_hub"
+    exit 1
+}
+
+# Resolve `main` once, before downloading. Both download and verification then target the
+# same immutable Hub commit rather than allowing `main` to move between the two steps.
+REVISION="${K3_REVISION:-}"
+if [ -z "$REVISION" ]; then
+    REVISION="$(
+        python3 - "$REPO" <<'PY'
+import sys
+from huggingface_hub import HfApi
+
+info = HfApi().model_info(sys.argv[1])
+if not info.sha:
+    raise SystemExit("Hub did not return an immutable revision")
+print(info.sha)
+PY
+    )"
+fi
+
+[ -n "$REVISION" ] || {
+    echo "could not resolve model revision"
+    exit 1
+}
 
 mkdir -p "$DEST"
 
-echo "downloading $REPO -> $DEST"
+echo "downloading $REPO@$REVISION -> $DEST"
 echo "  1.56 TB across $EXPECT_SHARDS shards; expect ~30 min at 1 GB/s"
 echo
 
-# The token is read from the environment and never echoed.
+# The token is read from the environment or the saved Hugging Face login and never
+# echoed. Pinning the revision keeps download and verification on the same snapshot.
 HF_HUB_ENABLE_HF_TRANSFER=1 \
-python3 -m huggingface_hub.commands.huggingface_cli download "$REPO" \
-    --local-dir "$DEST" --max-workers 16
+hf download "$REPO" \
+    --revision "$REVISION" \
+    --local-dir "$DEST" \
+    --max-workers 16
 
 echo
 echo "verifying…"
@@ -80,7 +117,15 @@ if [ -f "$SIZES" ]; then
     printf '  shards : all %s match their published sizes individually\n' "$EXPECT_SHARDS"
 fi
 
-echo "  RESULT : byte-exact match"
+echo
+echo "verifying file checksums against Hub metadata for revision $REVISION…"
+hf cache verify "$REPO" \
+    --revision "$REVISION" \
+    --local-dir "$DEST" \
+    --fail-on-missing-files
+
+echo
+echo "  RESULT : checksum-verified snapshot"
 echo
 echo "next: scripts/pack-trunk.sh $DEST <trunk_dir>"
 echo "      packing the trunk is what lets the engine stream it, which is what makes"
