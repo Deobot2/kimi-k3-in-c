@@ -3,6 +3,8 @@
 #define _POSIX_C_SOURCE 200809L
 #define _FILE_OFFSET_BITS 64
 
+#include "k3_portable_io.h"   /* first: sets _DARWIN_C_SOURCE before any libc header */
+
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -137,6 +139,8 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
      * O_DIRECT, fall back rather than fail: correctness does not depend on it. */
     tr->direct = 1;
     tr->fd = open(p, O_RDONLY | O_DIRECT);
+    if (tr->fd >= 0 && k3_set_direct(tr->fd) != 0)
+        tr->direct = 0;   /* Darwin refused F_NOCACHE: reads stay buffered but correct */
     if (tr->fd < 0) {
         tr->direct = 0;
         tr->fd = open(p, O_RDONLY);
