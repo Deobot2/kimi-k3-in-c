@@ -61,6 +61,52 @@ jobs:
       - name: Full-model oracle gates
         run: ./bin/k3_model tests/fixtures
 
+  # A separate job rather than a matrix leg: the toolchain step is brew rather than apt,
+  # nproc does not exist on macOS, and Apple Clang ships no OpenMP runtime, so the flags
+  # the Makefile has to discover are exactly the ones this job exists to check.
+  build-and-test-macos:
+    name: build + test (macos-14, apple clang)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: |
+          brew install libomp
+          cc --version
+          echo "libomp prefix: $(brew --prefix libomp)"
+
+      # Deliberately no arguments. The defect this job guards against is `make` failing
+      # on a Mac, so it must exercise the platform-detection path, not bypass it.
+      - name: Build (default flags, platform detection)
+        run: make -j"$(getconf _NPROCESSORS_ONLN)"
+
+      # The other arm64 branch: `portable` must drop tuning rather than pass x86 flags.
+      - name: Build (portable baseline)
+        run: |
+          make clean
+          make portable -j"$(getconf _NPROCESSORS_ONLN)"
+
+      - name: Build tests
+        run: make bin/test_ops bin/test_cache bin/test_st bin/test_cfg bin/test_tok bin/k3_model -j"$(getconf _NPROCESSORS_ONLN)"
+
+      - name: Op kernels
+        run: ./bin/test_ops tests/fixtures/ops
+
+      - name: Streaming expert cache
+        run: ./bin/test_cache tests/fixtures/cache
+
+      - name: Safetensors reader
+        run: |
+          ./bin/test_st tests/fixtures/st "$RUNNER_TEMP/idx.json" \
+            plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
+
+      - name: Config reader (both layouts + refusal cases)
+        run: ./bin/test_cfg fixture tests/fixtures/ref_k3.json
+
+      - name: Full-model oracle gates
+        run: ./bin/k3_model tests/fixtures
+
   # Warnings are defects here. The engine does arithmetic on `const void *` weight
   # pointers, where a missing -Wpointer-arith silently strides by one byte.
   strict-warnings:
