@@ -121,7 +121,12 @@ def main():
                 "layer": L,
                 "shard": os.path.basename(sp),
                 "run_start": lo,          # absolute offset in the shard
-                "nbytes": own,
+                # The engine reads this many bytes with O_DIRECT, which requires
+                # the LENGTH to be sector-aligned (512). Real-checkpoint runs are
+                # huge and align by luck; small runs (fixtures, tiny models) are
+                # not. The tail is already zero-padded to ALIGN in trunk.bin, so
+                # rounding the recorded length up to 512 reads only padding.
+                "nbytes": (own + 511) & ~511,
                 "file_off": file_off,     # offset in trunk.bin
                 "tensors": {k: {"off": v[1] - lo, "nbytes": v[2],
                                 "dtype": v[3], "shape": v[4]}
