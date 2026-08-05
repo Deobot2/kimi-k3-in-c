@@ -18,12 +18,21 @@ REPO="moonshotai/Kimi-K3"
 EXPECT_SHARDS=96
 EXPECT_BYTES=1560936091448
 
-command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
-
-if ! python3 -c "import huggingface_hub" 2>/dev/null; then
+if ! command -v hf >/dev/null 2>&1; then
+    command -v python3 >/dev/null || {
+        echo "python3 required to install the hf CLI"
+        exit 1
+    }
     echo "installing huggingface_hub…"
-    python3 -m pip install --quiet --upgrade "huggingface_hub[cli]"
+    python3 -m pip install --quiet --upgrade huggingface_hub
+    # pip may install console scripts in the per-user bin directory.
+    PATH="$(python3 -m site --user-base)/bin:$PATH"
+    export PATH
 fi
+command -v hf >/dev/null 2>&1 || {
+    echo "hf CLI not found after installation"
+    exit 1
+}
 
 mkdir -p "$DEST"
 
@@ -31,9 +40,9 @@ echo "downloading $REPO -> $DEST"
 echo "  1.56 TB across $EXPECT_SHARDS shards; expect ~30 min at 1 GB/s"
 echo
 
-# The token is read from the environment and never echoed.
-HF_HUB_ENABLE_HF_TRANSFER=1 \
-python3 -m huggingface_hub.commands.huggingface_cli download "$REPO" \
+# The token is read from the environment and never echoed. Xet replaces hf_transfer in
+# huggingface_hub 1.x and is the backend used by the current hf CLI.
+HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}" hf download "$REPO" \
     --local-dir "$DEST" --max-workers 16
 
 echo
