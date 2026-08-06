@@ -270,19 +270,39 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
     for (int i = 0; i < RING; i++) tr->layer_of[i] = -1;
     tr->widen_bytes = (int64_t)widen;
 
-    K3TrunkIO *io = (K3TrunkIO *)calloc(1, sizeof *io);
-    if (!io) return -1;
-    io->tr = tr;
-    pthread_mutex_init(&io->mu, NULL);
-    pthread_cond_init(&io->cv, NULL);
-    tr->io_state = io;
-    if (pthread_create(&io->thread, NULL, trunk_io_main, io) != 0) {
-        fprintf(stderr, "k3_trunk: cannot start asynchronous reader\n");
-        pthread_cond_destroy(&io->cv);
-        pthread_mutex_destroy(&io->mu);
-        free(io);
+    /* The reader is started ONLY when there are at least two slots, and this is a
+     * correctness requirement rather than an optimisation.
+     *
+     * k3_trunk_prefetch claims tr->ring for the incoming layer. With one slot, tr->ring
+     * is necessarily the slot k3_trunk_bind just returned to the caller, so the worker
+     * preads layer L+1 straight over layer L's bytes while the caller is still computing
+     * on them. Nothing detects it: the read succeeds, no bound pointer changes, and the
+     * run completes and emits fluent, wrong tokens.
+     *
+     * Measured on the released checkpoint. With one slot and the reader running, the same
+     * prompt that gives 17374 20829 10 427 414 1008 606 142957 instead produced
+     * 32609 2329 146429 2539 11 152834 44449 7569, with no diagnostic of any kind.
+     *
+     * With io_state NULL, trunk_io_wait returns 0 and k3_trunk_prefetch returns
+     * immediately, which is exactly the synchronous path this file had before the reader
+     * existed. */
+    if (RING >= 2) {
+        K3TrunkIO *io = (K3TrunkIO *)calloc(1, sizeof *io);
+        if (!io) return -1;
+        io->tr = tr;
+        pthread_mutex_init(&io->mu, NULL);
+        pthread_cond_init(&io->cv, NULL);
+        tr->io_state = io;
+        if (pthread_create(&io->thread, NULL, trunk_io_main, io) != 0) {
+            fprintf(stderr, "k3_trunk: cannot start asynchronous reader\n");
+            pthread_cond_destroy(&io->cv);
+            pthread_mutex_destroy(&io->mu);
+            free(io);
+            tr->io_state = NULL;
+            return -1;
+        }
+    } else {
         tr->io_state = NULL;
-        return -1;
     }
 
     printf("trunk stream: %.2f GB packed, %d/%d layers PINNED (%.2f GB), "
