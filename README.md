@@ -775,8 +775,8 @@ so that getting it wrong changes the output: `A_log` by a linspace that a per-ch
 misindex scrambles, NoPE by asserting the softmax scale is over the full head width, and
 the routing bias by a fixture whose bias reorders the top-k on five of its six rows.
 
-This list used to have five entries. The other two — that the UT-transform inverse is
-`(I + Akk)^-1`, and that `Aqk` keeps its diagonal while `Akk` does not — describe the
+This list used to have five entries. The other two, that the UT-transform inverse is
+`(I + Akk)^-1` and that `Aqk` keeps its diagonal while `Akk` does not, describe the
 chunked parallel form of the delta rule. This engine does not use it. `k3_kda_step` runs
 the naive sequential recurrence one position at a time, and so does the PyTorch reference
 it is checked against, so neither matrix is ever formed. They were claims about an
