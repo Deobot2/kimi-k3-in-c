@@ -94,7 +94,23 @@ def mxfp4_quant(w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     g = C // GROUP
     blocks = w.reshape(R, g, GROUP)
     amax = np.abs(blocks).max(axis=2)
-    exp = np.maximum(np.ceil(np.log2(np.maximum(amax, 1e-30))), 0).astype(np.int32)
+    # OCP MXFP4: the shared exponent puts the block maximum near the top of the E2M1
+    # range, whose largest value is 6.0 = 1.5 * 2^2, hence the -2.
+    #
+    # This previously read max(ceil(log2 amax), 0). The clamp is the problem. It makes
+    # 2^0 the smallest scale, so the smallest representable non-zero magnitude is 0.5 *
+    # 1 = 0.5, and anything under 0.25 rounds to zero. Routed w2 keeps the base
+    # N(0, 0.02) init while only w1 and w3 are re-scaled, so its block maxima are around
+    # 0.03 to 0.07 and EVERY element of every routed w2 quantised to exactly zero. The C
+    # engine and the torch reference then agreed perfectly, because both computed zero,
+    # and a fixture built that way cannot fail: a wrong top-k, a reversed nibble order,
+    # dropped routing weights or wrong SiTU betas all produce identical output.
+    #
+    # Checked against tests/fixtures/mxfp4.json, which holds real bytes from the released
+    # checkpoint: the clamped rule reproduces 0 of its 7168 scale exponents, this one
+    # reproduces the majority. It cannot reproduce all of them, because the fixture's
+    # amax can only be recovered from already-quantised values.
+    exp = (np.floor(np.log2(np.maximum(amax, 1e-30))) - 2).astype(np.int32)
     scales = (exp + 127).astype(np.uint8)
     mult = np.exp2(exp.astype(np.float32)).reshape(R, g, 1)
     x = blocks / mult
@@ -103,6 +119,22 @@ def mxfp4_quant(w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     idx = np.argmin(np.abs(pos[..., None] - lut), axis=-1).astype(np.uint8)
     nib = np.where(x < 0, idx | 0x8, idx).astype(np.uint8)
     packed = (nib[:, :, 0::2] | (nib[:, :, 1::2] << 4)).reshape(R, g * GROUP // 2)
+
+    # A matrix that quantises to all zeros still round-trips perfectly, still matches the
+    # reference exactly, and tests nothing at all. Refuse to emit one: the whole point of
+    # this checkpoint is to be a fixture that CAN fail.
+    if not np.any(packed & 0x77):          # 0x77 masks both nibbles' magnitude bits
+        raise SystemExit(
+            "mxfp4_quant: every element quantised to zero (block maxima %.4g..%.4g).\n"
+            "  The scale rule cannot represent values this small, so this tensor would\n"
+            "  make the reference and the engine agree by both computing nothing.\n"
+            "  Re-scale the tensor's initialisation, or widen the scale rule."
+            % (float(amax.min()), float(amax.max())))
+
+    # E8M0 is unsigned: an exponent outside -127..127 cannot be encoded and would wrap.
+    if exp.min() < -127 or exp.max() > 127:
+        raise SystemExit("mxfp4_quant: exponent %d..%d is outside the E8M0 range"
+                         % (int(exp.min()), int(exp.max())))
     return packed, scales
 
 
