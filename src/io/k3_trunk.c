@@ -10,12 +10,28 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <pthread.h>
 
 #include "json.h"
 #include "k3_st.h"
 #include "k3_trunk.h"
 
 static int k3_alloc_direct(void **out, size_t bytes);   /* defined below */
+
+typedef struct {
+    pthread_t thread;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    K3Trunk *tr;
+    int stop;
+    int busy;
+    int done;
+    int layer;
+    int slot;
+    int result;
+} K3TrunkIO;
+
+static void *trunk_io_main(void *arg);
 
 /* WHERE THE TIME IN A BIND ACTUALLY GOES.
  *
@@ -169,18 +185,9 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
     if (!tr->slot_of) return -1;
     for (int i = 0; i < tr->n_layers; i++) tr->slot_of[i] = -1;
 
-    /* ONE ring slot, not two.
-     *
-     * The second slot was sized for a prefetch that does not exist: k3_trunk_prefetch is
-     * inert on the O_DIRECT path, because POSIX_FADV_WILLNEED warms the page cache and
-     * O_DIRECT bypasses it. The engine's own logs prove the slot never paid for itself:
-     * the 12 GB run reports "binds 558, hits 0 (0.0%)". A cyclic 0..92 scan cannot hit in
-     * a 2-slot ring anyway, so the slot held 2.34 GB and returned nothing, which is 20%
-     * of a 12 GB budget.
-     *
-     * Restore RING = 2 only alongside a real asynchronous reader (a thread or io_uring)
-     * filling the spare slot, at which point it starts earning its keep. */
-    const int RING = 1;
+    /* Two ring slots: current layer plus one asynchronous read in flight. The old
+     * implementation allocated a spare slot without a reader, wasting memory. */
+    const int RING = 2;
 
     /* Size the ring from the layers that will actually STREAM through it.
      *
@@ -244,6 +251,21 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
     for (int i = 0; i < RING; i++) tr->layer_of[i] = -1;
     tr->widen_bytes = (int64_t)widen;
 
+    K3TrunkIO *io = (K3TrunkIO *)calloc(1, sizeof *io);
+    if (!io) return -1;
+    io->tr = tr;
+    pthread_mutex_init(&io->mu, NULL);
+    pthread_cond_init(&io->cv, NULL);
+    tr->io_state = io;
+    if (pthread_create(&io->thread, NULL, trunk_io_main, io) != 0) {
+        fprintf(stderr, "k3_trunk: cannot start asynchronous reader\n");
+        pthread_cond_destroy(&io->cv);
+        pthread_mutex_destroy(&io->mu);
+        free(io);
+        tr->io_state = NULL;
+        return -1;
+    }
+
     printf("trunk stream: %.2f GB packed, %d/%d layers PINNED (%.2f GB), "
            "ring %d x %.2f GB\n",
            (double)total / 1e9, npin, tr->n_layers,
@@ -261,6 +283,17 @@ bad:
 
 void k3_trunk_close(K3Trunk *tr)
 {
+    K3TrunkIO *io = (K3TrunkIO *)tr->io_state;
+    if (io) {
+        pthread_mutex_lock(&io->mu);
+        io->stop = 1;
+        pthread_cond_signal(&io->cv);
+        pthread_mutex_unlock(&io->mu);
+        pthread_join(io->thread, NULL);
+        pthread_cond_destroy(&io->cv);
+        pthread_mutex_destroy(&io->mu);
+        free(io);
+    }
     if (tr->fd >= 0) close(tr->fd);
     if (tr->pin) { for (int i = 0; i < tr->npin; i++) free(tr->pin[i]); free(tr->pin); }
     free(tr->arena); free(tr->layer_of); free(tr->slot_of);
@@ -319,6 +352,56 @@ static int load_run(K3Trunk *tr, int L, unsigned char *dst)
     return 0;
 }
 
+static void *trunk_io_main(void *arg)
+{
+    K3TrunkIO *io = (K3TrunkIO *)arg;
+    for (;;) {
+        pthread_mutex_lock(&io->mu);
+        while (!io->busy && !io->stop)
+            pthread_cond_wait(&io->cv, &io->mu);
+        if (io->stop) {
+            pthread_mutex_unlock(&io->mu);
+            return NULL;
+        }
+        const int L = io->layer;
+        const int slot = io->slot;
+        K3Trunk *tr = io->tr;
+        pthread_mutex_unlock(&io->mu);
+
+        const int rc = load_run(tr, L, tr->arena + (size_t)slot * tr->slot_bytes);
+
+        pthread_mutex_lock(&io->mu);
+        io->result = rc;
+        io->done = 1;
+        io->busy = 0;
+        pthread_cond_broadcast(&io->cv);
+        pthread_mutex_unlock(&io->mu);
+    }
+}
+
+static int trunk_io_wait(K3Trunk *tr, int L)
+{
+    K3TrunkIO *io = (K3TrunkIO *)tr->io_state;
+    if (!io) return 0;
+    pthread_mutex_lock(&io->mu);
+    if ((io->busy || io->done) && io->layer == L) {
+        while (!io->done && !io->stop)
+            pthread_cond_wait(&io->cv, &io->mu);
+        const int rc = io->result;
+        const int slot = io->slot;
+        if (!io->stop && rc == 0) {
+            tr->layer_of[slot] = L;
+            tr->slot_of[L] = slot;
+            tr->misses++;
+        }
+        io->done = 0;
+        pthread_mutex_unlock(&io->mu);
+        return rc == 0 ? 1 : -1;
+    }
+    pthread_mutex_unlock(&io->mu);
+    return 0;
+}
+
 int k3_trunk_bind(K3Trunk *tr, const K3Cfg *c, int L, K3LayerBind *b)
 {
     if (L < 0 || L >= tr->n_layers) return -1;
@@ -337,26 +420,25 @@ int k3_trunk_bind(K3Trunk *tr, const K3Cfg *c, int L, K3LayerBind *b)
         }
     } else {
         int slot = -1;
-        for (int i = 0; i < tr->nslot; i++)
-            if (tr->layer_of[i] == L) { slot = i; break; }
-        if (slot >= 0) {
-            tr->hits++;
+        const int prefetched = trunk_io_wait(tr, L);
+        if (prefetched < 0) return -1;
+        if (prefetched > 0) {
+            slot = tr->slot_of[L];
         } else {
-            slot = tr->ring;
-            tr->ring = (tr->ring + 1) % tr->nslot;
-            if (tr->layer_of[slot] >= 0) tr->slot_of[tr->layer_of[slot]] = -1;
-            /* Mark the slot EMPTY before reading into it, not after.
-             * load_run overwrites the slot as it goes, so a read that fails part way
-             * through leaves the buffer holding a mixture of the old layer and the new
-             * one. Registering the new layer only on success looked safe but left
-             * layer_of[slot] still naming the OLD layer over a buffer that no longer
-             * contains it: the next bind for that layer matched, counted a HIT, skipped
-             * the read entirely and handed the caller corrupt weights. Invalidating
-             * first means a failed load costs a re-read, which is the correct price. */
-            tr->layer_of[slot] = -1;
-            if (load_run(tr, L, tr->arena + (size_t)slot * tr->slot_bytes) != 0) return -1;
-            tr->layer_of[slot] = L;
-            tr->misses++;
+            for (int i = 0; i < tr->nslot; i++)
+                if (tr->layer_of[i] == L) { slot = i; break; }
+            if (slot >= 0) {
+                tr->hits++;
+            } else {
+                slot = tr->ring;
+                tr->ring = (tr->ring + 1) % tr->nslot;
+                if (tr->layer_of[slot] >= 0) tr->slot_of[tr->layer_of[slot]] = -1;
+                /* Mark the slot EMPTY before reading into it, not after. */
+                tr->layer_of[slot] = -1;
+                if (load_run(tr, L, tr->arena + (size_t)slot * tr->slot_bytes) != 0) return -1;
+                tr->layer_of[slot] = L;
+                tr->misses++;
+            }
         }
         base = tr->arena + (size_t)slot * tr->slot_bytes;
     }
@@ -380,21 +462,23 @@ void k3_trunk_prefetch(K3Trunk *tr, int L)
     if (L < 0 || L >= tr->n_layers || L < tr->npin) return;
     for (int i = 0; i < tr->nslot; i++) if (tr->layer_of[i] == L) return;
 
-    /* LIMITATION: this is a no-op on the O_DIRECT path.
-     *
-     * POSIX_FADV_WILLNEED warms the PAGE CACHE, and O_DIRECT exists precisely to bypass
-     * it, so the hint has nothing to populate. It still helps on the buffered fallback,
-     * which is why it is kept rather than deleted.
-     *
-     * Real overlap needs an actual asynchronous read (a thread or io_uring) filling the
-     * other ring slot while the current layer computes. That is worth roughly 16 s/token
-     * at the measured 6.4 GB/s, against about 3 s of arithmetic per layer, so it would
-     * hide almost entirely. It is deliberately NOT written yet: it introduces a
-     * concurrent writer to the slot the kernels are reading, and that is a race worth
-     * paying for with a test rather than guessing at. */
-    if (tr->direct) return;
-    posix_fadvise(tr->fd, (off_t)tr->lay[L].file_off, (off_t)tr->lay[L].nbytes,
-                  POSIX_FADV_WILLNEED);
+    K3TrunkIO *io = (K3TrunkIO *)tr->io_state;
+    if (!io) return;
+    pthread_mutex_lock(&io->mu);
+    if (io->busy || tr->slot_of[L] >= 0) {
+        pthread_mutex_unlock(&io->mu);
+        return;
+    }
+    const int slot = tr->ring;
+    tr->ring = (tr->ring + 1) % tr->nslot;
+    if (tr->layer_of[slot] >= 0) tr->slot_of[tr->layer_of[slot]] = -1;
+    tr->layer_of[slot] = -1;
+    io->layer = L;
+    io->slot = slot;
+    io->done = 0;
+    io->busy = 1;
+    pthread_cond_signal(&io->cv);
+    pthread_mutex_unlock(&io->mu);
 }
 
 void k3_trunk_report(const K3Trunk *tr, const char *label)

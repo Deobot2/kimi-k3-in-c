@@ -30,8 +30,8 @@ ARCH     ?= -march=native
 # disabling automatic FMA contraction. The test-suite compares against a reference to a
 # fixed tolerance; letting the compiler fuse changes results by more than that.
 WARN     := -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter
-CFLAGS   ?= -O3 -std=gnu99 $(WARN) $(ARCH) -fopenmp -ffp-contract=off
-LDFLAGS  ?= -lm -fopenmp
+CFLAGS   ?= -O3 -std=gnu99 $(WARN) $(ARCH) -fopenmp -pthread -ffp-contract=off
+LDFLAGS  ?= -lm -fopenmp -pthread
 
 # Flat include search across the module dirs: sources use "k3.h", "k3_cache.h" etc
 # rather than path-qualified includes, which keeps them relocatable.

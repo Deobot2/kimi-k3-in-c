@@ -28,6 +28,7 @@ option(K3_NATIVE_ARCH "Optimise for the building CPU (-march=native)" OFF)
 option(K3_SANITIZE    "Build with ASan + UBSan"                        OFF)
 
 find_package(OpenMP)
+find_package(Threads REQUIRED)
 
 add_library(k3_flags INTERFACE)
 target_compile_options(k3_flags INTERFACE
@@ -72,7 +73,7 @@ target_include_directories(k3 PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src/model
   ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer)
 
-target_link_libraries(k3 PUBLIC k3_flags m)
+target_link_libraries(k3 PUBLIC k3_flags m Threads::Threads)
 if(OpenMP_C_FOUND)
   target_link_libraries(k3 PUBLIC OpenMP::OpenMP_C)
 endif()
