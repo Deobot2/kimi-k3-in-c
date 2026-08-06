@@ -38,6 +38,11 @@
  *   keep correct and the copy is the one that goes stale.
  */
 #define _POSIX_C_SOURCE 200809L
+/* _POSIX_C_SOURCE alone hides the BSD rusage fields, ru_maxrss among them, from
+ * <sys/resource.h> on Darwin. peak_rss_bytes() below needs it. */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
 
 #include <math.h>
 #include <stdio.h>
@@ -207,7 +212,9 @@ static void k3_preset_list(FILE *f)
                "Run scripts/k3-doctor.sh to see which one this machine fits.\n");
 }
 
-/* PEAK resident set, in bytes. ru_maxrss is kilobytes on Linux.
+/* PEAK resident set, in bytes. ru_maxrss is kilobytes on Linux and BYTES on Darwin, so
+ * the scale factor differs by platform; applying the Linux one on macOS would overstate
+ * the peak by 1024x.
  *
  * This is the authoritative memory figure. The banner printed before allocation is a
  * PLAN and understates: it omits the safetensors index (~78 MB at full scale), reports
@@ -217,7 +224,11 @@ static double peak_rss_bytes(void)
 {
     struct rusage ru;
     if (getrusage(RUSAGE_SELF, &ru) != 0) return 0.0;
-    return (double)ru.ru_maxrss * 1024.0;
+#if defined(__APPLE__)
+    return (double)ru.ru_maxrss;            /* already bytes */
+#else
+    return (double)ru.ru_maxrss * 1024.0;   /* kilobytes */
+#endif
 }
 
 /* MemAvailable, which is what the kernel thinks can actually be handed out, not
