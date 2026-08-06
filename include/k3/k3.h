@@ -30,19 +30,34 @@
  *   latent width 3584, SiTU-GLU activation, MXFP4 expert weights.
  *   docs/ARCHITECTURE.md maps each of these onto the technical report.
  *
- * FIVE INVARIANTS THAT MUST HOLD
+ * THREE INVARIANTS THAT MUST HOLD
  *   Each of these is a place where a plausible-looking implementation produces a model
- *   that runs, emits fluent text, and is wrong. They are asserted by the test-suite and
- *   restated at their point of use.
+ *   that runs, emits fluent text, and is wrong. Each is gated by a fixture in
+ *   tests/fixtures/ops chosen so that getting it wrong changes the output, and each is
+ *   restated at its point of use.
  *
  *   1. A_log is indexed PER HEAD, not per channel. The checkpoint ships head_dim floats
  *      but only the first num_heads are meaningful; the remainder are padding.
- *   2. The UT-transform inverse is (I + Akk)^-1. The sign is not a convention.
- *   3. Aqk retains its diagonal; Akk does not.
- *   4. MLA uses NoPE, yet the 64 rope dimensions still exist and are still cached.
+ *      Gated by the kda_decay fixture, whose A_log is a linspace, so a per-channel
+ *      misindex moves every element.
+ *   2. MLA uses NoPE, yet the 64 rope dimensions still exist and are still cached.
  *      Only the rotation is absent. Dropping the slots changes the head width.
- *   5. The MoE routing bias steers SELECTION only. Combining weights come from the
+ *      Gated by the mla fixture, which asserts the softmax scale is over the FULL head
+ *      width qk_nope + qk_rope, not over qk_nope alone.
+ *   3. The MoE routing bias steers SELECTION only. Combining weights come from the
  *      UNBIASED sigmoid scores.
+ *      Gated by the router fixture, whose bias reorders the top-k on 5 of its 6 rows.
+ *
+ * NOT INVARIANTS OF THIS IMPLEMENTATION
+ *   Earlier revisions of this header also listed the UT-transform inverse (I + Akk)^-1
+ *   and the retention of Aqk's diagonal but not Akk's. Those describe the chunked
+ *   parallel form of the delta rule. This engine does not use it: k3_kda_step runs the
+ *   naive sequential O(T) recurrence, one position at a time, and so does the reference
+ *   in tools/k3_ref.py. Neither matrix is ever formed, so there was nothing to get right
+ *   and no test could have caught getting it wrong. They are recorded in
+ *   docs/ARCHITECTURE.md as properties of the algorithm, which is where a claim the code
+ *   does not make belongs. Anyone adding a chunked KDA path must reinstate them here
+ *   together with the fixtures that gate them.
  */
 #ifndef K3_H
 #define K3_H

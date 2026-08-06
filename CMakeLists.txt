@@ -110,16 +110,32 @@ add_test(NAME cache      COMMAND test_cache ${FIX}/cache)
 add_test(NAME config     COMMAND test_cfg   fixture ${FIX}/ref_k3.json)
 add_test(NAME scale      COMMAND scale_test)
 add_test(NAME oracle     COMMAND k3_model   ${FIX})
+
+# The negative half of the config contract. Each fixture is the working flat config with
+# exactly one field mutated, so a rejection can only come from that field. Without these
+# the refuse-rather-than-guess policy -- the reason this reader exists -- has no executed
+# test at all, in either build system.
+add_test(NAME config_reject_no_layermap
+         COMMAND test_cfg reject ${FIX}/cfg/no_layermap.json)
+add_test(NAME config_reject_bad_layer_index
+         COMMAND test_cfg reject ${FIX}/cfg/bad_layer_index.json)
+add_test(NAME config_reject_bad_topk
+         COMMAND test_cfg reject ${FIX}/cfg/bad_topk.json)
 add_test(NAME safetensors COMMAND test_st   ${FIX}/st ${CMAKE_CURRENT_BINARY_DIR}/idx.json
          plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32)
 
 # The tokenizer test needs the released vocabulary, which is not in this repository.
-# Registered so `ctest` reports it as skipped rather than omitting it silently; point
-# K3_TOK_FILES at a checkpoint directory to make it run.
-if(DEFINED ENV{K3_TOK_FILES})
-  add_test(NAME tokenizer COMMAND test_tok $ENV{K3_TOK_FILES} roundtrip
-           ${CMAKE_CURRENT_SOURCE_DIR}/README.md)
-endif()
+# Registered UNCONDITIONALLY so ctest reports it as Skipped rather than omitting it:
+# wrapping this in if(DEFINED ENV{K3_TOK_FILES}) did the opposite of what that sentence
+# claims, and made `ctest` quietly report one fewer test than `make test` runs. The
+# wrapper resolves K3_TOK_FILES at TEST time, not configure time, so exporting it before
+# ctest now works as the docs say.
+add_test(NAME tokenizer
+         COMMAND ${CMAKE_COMMAND}
+                 -DTEST_TOK=$<TARGET_FILE:test_tok>
+                 -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/README.md
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/run_tok_test.cmake)
+set_tests_properties(tokenizer PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED:")
 
 add_executable(bench_kernels benchmarks/bench_kernels.c)
 target_link_libraries(bench_kernels PRIVATE k3)

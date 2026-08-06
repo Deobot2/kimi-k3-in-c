@@ -34,32 +34,29 @@ jobs:
           sudo apt-get install -y --no-install-recommends libomp-dev
           ${{ matrix.cc }} --version
 
-      # -march=native is wrong for CI: the runner's CPU is not the user's. `portable`
-      # targets a documented baseline (AVX2 + FMA) instead.
+      # -march=native is wrong for CI: the runner's CPU is not the user's. ARCH pins the
+      # documented baseline (AVX2 + FMA) instead. It is passed to `test`, not only to
+      # `all`, because the test binaries are built from the same objects and a mixed
+      # -march=native/-mavx2 tree is neither of the two configurations we ship.
       - name: Build (portable baseline)
-        run: make portable CC=${{ matrix.cc }} -j"$(nproc)"
+        run: make CC=${{ matrix.cc }} ARCH="-mavx2 -mfma" -j"$(nproc)"
 
-      - name: Build tests
-        run: make CC=${{ matrix.cc }} bin/test_ops bin/test_cache bin/test_st bin/test_cfg bin/test_tok bin/k3_model -j"$(nproc)"
+      # `make test` and not the individual binaries. This is the command the README's
+      # Quick start tells every user to run, so it is the one that has to be green. The
+      # per-binary list this replaced omitted scale_test entirely -- the only gate with a
+      # real memory cost, and the only one that exercises the real 7168-wide dimensions.
+      - name: make test
+        run: make CC=${{ matrix.cc }} ARCH="-mavx2 -mfma" test -j"$(nproc)"
 
-      - name: Op kernels
-        run: ./bin/test_ops tests/fixtures/ops
-
-      - name: Streaming expert cache
-        run: ./bin/test_cache tests/fixtures/cache
-
-      - name: Safetensors reader
+      # The tokenizer leg above reports NOT RUN without a vocabulary, which is correct but
+      # must not be mistaken for coverage. Assert the rest of the suite really ran.
+      - name: Assert the suite was not silently empty
         run: |
-          ./bin/test_st tests/fixtures/st /tmp/idx.json \
-            plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
-
-      - name: Config reader (both layouts + refusal cases)
-        run: ./bin/test_cfg fixture tests/fixtures/ref_k3.json
-
-      # The end-to-end gate: teacher forcing, greedy decode, and incremental decode must
-      # all match a reference implementation exactly on the tiny oracle model.
-      - name: Full-model oracle gates
-        run: ./bin/k3_model tests/fixtures
+          make CC=${{ matrix.cc }} ARCH="-mavx2 -mfma" test 2>&1 | tee /tmp/t.log
+          grep -q "22 passed, 0 failed, 0 skipped" /tmp/t.log
+          grep -q "SCALE TEST PASSED"              /tmp/t.log
+          grep -q "VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY" /tmp/t.log
+          grep -q "ALL WEIGHTLESS TESTS PASSED"    /tmp/t.log
 
   # Warnings are defects here. The engine does arithmetic on `const void *` weight
   # pointers, where a missing -Wpointer-arith silently strides by one byte.
@@ -95,6 +92,9 @@ jobs:
         run: |
           ./bin/test_ops tests/fixtures/ops
           ./bin/test_cfg fixture tests/fixtures/ref_k3.json
+          for f in no_layermap bad_layer_index bad_topk; do
+            ./bin/test_cfg reject "tests/fixtures/cfg/$f.json"
+          done
           ./bin/test_cache tests/fixtures/cache
           ./bin/test_st tests/fixtures/st "$RUNNER_TEMP/idx.json" \
             plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
