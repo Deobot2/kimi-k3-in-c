@@ -80,8 +80,11 @@ endif
 # disabling automatic FMA contraction. The test-suite compares against a reference to a
 # fixed tolerance; letting the compiler fuse changes results by more than that.
 WARN     := -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter
-CFLAGS   ?= -O3 -std=gnu99 $(WARN) $(ARCH) $(OMP_CFLAGS) -ffp-contract=off
-LDFLAGS  ?= -lm $(OMP_LDFLAGS)
+# -pthread is for the trunk's asynchronous reader, which is a plain pthread rather than
+# an OpenMP construct. It composes with the platform OpenMP flags above rather than
+# replacing them: Apple Clang needs -Xpreprocessor -fopenmp AND -pthread.
+CFLAGS   ?= -O3 -std=gnu99 $(WARN) $(ARCH) $(OMP_CFLAGS) -pthread -ffp-contract=off
+LDFLAGS  ?= -lm $(OMP_LDFLAGS) -pthread
 
 # Flat include search across the module dirs: sources use "k3.h", "k3_cache.h" etc
 # rather than path-qualified includes, which keeps them relocatable.

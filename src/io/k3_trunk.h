@@ -23,10 +23,17 @@
  *   the trunk access order is FIXED: layer 0, 1, ... 92, every single token, so the next
  *   read is always known in advance.
  *
- *   NOTE it is not currently hidden. k3_trunk_prefetch is a no-op on the O_DIRECT path
- *   (POSIX_FADV_WILLNEED warms the page cache, which O_DIRECT exists to bypass), so the
- *   read does not overlap the previous layer's arithmetic today. Doing so needs real
- *   async I/O; the fixed order is what would make it straightforward.
+ *   It IS hidden now. k3_trunk_prefetch hands layer L+1 to a reader thread while the
+ *   main thread computes on layer L, which is what the fixed walk order makes safe: the
+ *   next layer is always known, so there is nothing to predict. Measured on the released
+ *   checkpoint at the laptop preset, this took 71.75 s/token to 42.27 s/token, a 1.70x
+ *   improvement, and it beat running the same model with four times the memory and no
+ *   overlap.
+ *
+ *   The second ring slot it needs costs a full slot, 2.37 GB at the floor, so it is only
+ *   taken when the trunk budget can pay for it. Below that the ring stays at one slot and
+ *   reads are serial again; k3_trunk_open says so on stdout when that happens. Correctness
+ *   does not depend on which path runs, and the emitted tokens are identical either way.
  *
  * WHY LRU WOULD BE THE WORST POSSIBLE POLICY HERE
  *   A cyclic sequential scan is the classic LRU pathology. With N < 93 slots, by the
@@ -87,6 +94,10 @@ typedef struct {
     int         *layer_of;      /* [nslot] which layer occupies each ring slot  */
     int32_t     *slot_of;       /* [n_layers], -1 when not resident             */
     int          ring;          /* next ring slot to reuse                      */
+
+    /* One asynchronous reader owns one spare ring slot. The worker never publishes a
+     * layer name before its read succeeds; bind waits for completion before consuming it. */
+    void         *io_state;
 
     /* stats */
     uint64_t     hits, misses;

@@ -865,10 +865,17 @@ int main(int argc, char **argv)
          * trunk time with a last-step expert time and dividing by the whole run
          * understates the expert share by roughly the token count. */
         const double io_s = trunk_s + expert_s_total;
+        const double share = t_total > 0 ? 100.0 * io_s / t_total : 0.0;
         printf("I/O share of wall clock: %.1f%%  (trunk %.1f s + experts %.1f s of %.1f s)\n",
-               t_total > 0 ? 100.0 * io_s / t_total : 0.0, trunk_s,
-               expert_s_total, t_total);
+               share, trunk_s, expert_s_total, t_total);
         printf("  both figures are WHOLE-RUN totals over %d steps\n", nout);
+        /* Above 100% is not a bug in the arithmetic: with more than one trunk ring slot
+         * the reader thread does device work while the main thread computes, so the two
+         * terms genuinely overlap and their sum can exceed wall clock. Say so, rather
+         * than printing an impossible percentage with no explanation. */
+        if (share > 100.0)
+            printf("  over 100%% because trunk reads overlap compute on the reader thread;\n"
+                   "  %.1f s of device time was hidden behind arithmetic\n", io_s - t_total);
         /* Report the DERIVED retention, not the raw hit count. `hits` counts an expert
          * the batch prefetch pulled off disk microseconds earlier, so it equals the
          * request count at every cache size and means nothing on its own. An expert that
