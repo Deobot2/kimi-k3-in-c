@@ -117,11 +117,21 @@ test: $(TEST_BINS)
 	@echo "== safetensors ==";       ./$(BIN)/test_st $(FIXTURES)/st $(BUILD)/st_index.json \
 	    plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
 	@echo "== config reader ==";     ./$(BIN)/test_cfg fixture $(FIXTURES)/ref_k3.json
-	@echo "== tokenizer ==";         ./$(BIN)/test_tok $(TOK_FILES) roundtrip src/core/k3_ops.c \
-	    || echo "  (skipped: no tokenizer files at $(TOK_FILES))"
+	@echo "== tokenizer =="; \
+	  if [ -f "$(TOK_FILES)/tiktoken.model" ]; then \
+	      ./$(BIN)/test_tok $(TOK_FILES) roundtrip src/core/k3_ops.c; \
+	  else \
+	      echo "  NOT RUN: no tiktoken.model at $(TOK_FILES)"; \
+	      echo "           the vocabulary ships with the checkpoint, not with this"; \
+	      echo "           repository. Run: make tok TOK_FILES=/path/to/k3model"; \
+	  fi
 	@echo "== real dimensions ==";   ./$(BIN)/scale_test
 	@echo "== full-model oracle =="; ./$(BIN)/k3_model $(FIXTURES)
-	@echo; echo "ALL WEIGHTLESS TESTS PASSED"
+	@echo
+	@if [ ! -f "$(TOK_FILES)/tiktoken.model" ]; then \
+	     echo "NOTE: tokenizer parity did NOT run; see above. Everything else did."; \
+	 fi
+	@echo "ALL WEIGHTLESS TESTS PASSED"
 
 ## test-all: adds tests that need a real checkpoint (set SHARD_DIR)
 test-all: test

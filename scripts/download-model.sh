@@ -7,7 +7,9 @@
 # does not fail loudly, it produces wrong tokens, so the byte total is checked against
 # the published figure before anything else is allowed to use it.
 #
-# Requires a HuggingFace token in $HF_TOKEN or ~/.cache/huggingface/token.
+# The repository is public, so no token is needed. If you have one, the hf CLI picks it
+# up from $HF_TOKEN or ~/.cache/huggingface/token on its own; this script never reads,
+# echoes or forwards it.
 
 set -euo pipefail
 
@@ -18,23 +20,56 @@ REPO="moonshotai/Kimi-K3"
 EXPECT_SHARDS=96
 EXPECT_BYTES=1560936091448
 
-command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
+# The downloader is the `hf` CLI from huggingface_hub 1.x. The older entry points are
+# gone: `python3 -m huggingface_hub.commands.huggingface_cli` was removed when the CLI
+# was renamed, and the `[cli]` extra no longer exists.
+#
+# We deliberately do NOT attempt a pip install here. On the platform this project
+# targets, a system pip install cannot succeed: Ubuntu 24.04 ships no pip module at
+# all, and once pip is present PEP 668 marks the interpreter externally-managed and
+# refuses. Guessing wrong in an unattended script that is about to move 1.56 TB is
+# worse than stopping with an instruction.
+if ! command -v hf >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+the `hf` CLI is required and was not found on PATH.
 
-if ! python3 -c "import huggingface_hub" 2>/dev/null; then
-    echo "installing huggingface_hub…"
-    python3 -m pip install --quiet --upgrade "huggingface_hub[cli]"
+Install it one of these ways, then re-run:
+
+  pipx install huggingface_hub            # recommended; what PEP 668 points you to
+  uv tool install huggingface_hub
+  python3 -m venv ~/.venvs/hf && ~/.venvs/hf/bin/pip install huggingface_hub
+    then add ~/.venvs/hf/bin to PATH
+
+On Debian/Ubuntu, `pipx` is `sudo apt install pipx`.
+EOF
+    exit 1
 fi
 
 mkdir -p "$DEST"
+
+# Free-space preflight. Without this the transfer runs until the filesystem fills, which
+# takes the machine's logging and package manager with it, and the byte-total check below
+# then reports a mismatch -- a true statement that misdiagnoses the actual failure.
+AVAIL=$(df -P -k "$DEST" | awk 'NR==2 {print $4 * 1024}')
+if [ "$AVAIL" -lt "$EXPECT_BYTES" ]; then
+    printf 'FAIL: %s has %s bytes free, the checkpoint needs %s.\n' \
+        "$DEST" "$AVAIL" "$EXPECT_BYTES" >&2
+    printf '      Short by %s bytes (%.2f TB). Point <dest_dir> at a larger filesystem.\n' \
+        "$((EXPECT_BYTES - AVAIL))" \
+        "$(awk -v d="$((EXPECT_BYTES - AVAIL))" 'BEGIN{print d/1e12}')" >&2
+    printf '      Packing the trunk afterwards needs a further ~109 GB.\n' >&2
+    exit 1
+fi
 
 echo "downloading $REPO -> $DEST"
 echo "  1.56 TB across $EXPECT_SHARDS shards; expect ~30 min at 1 GB/s"
 echo
 
-# The token is read from the environment and never echoed.
-HF_HUB_ENABLE_HF_TRANSFER=1 \
-python3 -m huggingface_hub.commands.huggingface_cli download "$REPO" \
-    --local-dir "$DEST" --max-workers 16
+# Xet is the transfer backend in huggingface_hub 1.x. HF_HUB_ENABLE_HF_TRANSFER, which
+# this script used to set, is ignored there and was a hard error on 0.x whenever the
+# hf_transfer package was absent -- which it always was, since nothing installed it.
+HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}" \
+hf download "$REPO" --local-dir "$DEST" --max-workers 16
 
 echo
 echo "verifying…"

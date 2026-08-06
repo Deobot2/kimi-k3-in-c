@@ -510,7 +510,10 @@ int main(int argc, char **argv)
 
     char b1[32];
     printf("Kimi K3, pure C, released checkpoint\n");
-    printf("  shards   : %s\n", dir);
+    /* The directory, not a shard count: the index has not been built yet at this point.
+     * The count is printed by the "indexed N tensors from M shards" line below, once
+     * k3_st_open has actually counted them. */
+    printf("  model    : %s\n", dir);
     printf("  prompt   : %d tokens, generating %d\n", np, gen);
     /* Echo the preset so a captured log is self-describing: a timing figure is
      * meaningless without the budget that produced it. */

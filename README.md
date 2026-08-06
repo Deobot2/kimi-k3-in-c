@@ -2302,7 +2302,7 @@ The first time the engine touched all 2.78 trillion parameters:
 
 ```text
 Kimi K3, pure C, released checkpoint
-  shards   : 96
+  model    : /home/k3/k3model
   prompt   : 5 tokens, generating 2
 
 indexed 497220 tensors from 96 shards in 0.70 s
