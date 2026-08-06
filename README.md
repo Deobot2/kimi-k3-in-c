@@ -24,6 +24,15 @@
 </tr>
 </table>
 
+<hr>
+
+<p>
+  <img src="docs/images/patrick_pray.png" height="44" align="middle" alt="">
+  <i>I am open to AI research roles and PhD positions. <a href="https://drive.google.com/file/d/1yW5xHDS6Mr9ByrkCgVve85OqF4UOPv9K/view?usp=sharing">CV</a>.</i>
+</p>
+
+<hr>
+
 </div>
 
 <br>
