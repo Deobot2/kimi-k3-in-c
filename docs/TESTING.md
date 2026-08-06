@@ -43,8 +43,25 @@ With `tools/tok_parity.py` it also compares token-for-token against the referenc
 tokenizer across CJK, emoji, ZWJ sequences, accents, contractions and whitespace runs.
 This is the one gate that cannot run on a clean checkout: `tiktoken.model` has 163,584
 entries and ships with the checkpoint, not with this repository. `make test` reports it as
-**NOT RUN** rather than passing it quietly. Point `TOK_FILES` at a downloaded checkpoint
-to run it: `make tok TOK_FILES=~/k3model`.
+**NOT RUN** rather than passing it quietly.
+
+You do not need the 1.56 TB checkpoint to run it. Four small files are enough, about
+2.8 MB in total:
+
+```bash
+hf download moonshotai/Kimi-K3 \
+    tiktoken.model tokenizer_config.json config.json tokenization_kimi.py \
+    --local-dir ~/k3tok
+
+make test TOK_FILES=~/k3tok                 # the roundtrip leg now runs
+make tok  TOK_FILES=~/k3tok                 # token-for-token parity, needs `pip install tiktoken`
+./bin/test_cfg real ~/k3tok/config.json     # the released nested config
+```
+
+`tokenization_kimi.py` is required by `tools/tok_parity.py`, which reads the split regex
+out of it rather than restating it; without that file the parity run stops before its
+first case. The roundtrip leg in `make test` needs only `tiktoken.model` and
+`tokenizer_config.json`.
 
 **`k3_model`**, the end-to-end gate, on a tiny model whose tensor graph matches the released
 architecture exactly:

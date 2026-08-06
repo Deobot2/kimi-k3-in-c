@@ -87,7 +87,7 @@ else
     # people their machine was broken when the only thing they could not do was the one
     # thing that needs 1.56 TB of disk they also did not have.
     warn "under 10 GB available, below the floor for running the checkpoint (~8.2 GB peak RSS)"
-    printf '  %s      the build and \`make test\` need no weights and work fine here%s\n' \
+    printf '  %s      the build and "make test" need no weights and work fine here%s\n' \
         "$DIM" "$RST"
 fi
 
