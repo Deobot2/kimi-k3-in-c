@@ -17,6 +17,8 @@
 #define _POSIX_C_SOURCE 200809L
 #define _FILE_OFFSET_BITS 64
 
+#include "k3_portable_io.h"   /* first: sets _DARWIN_C_SOURCE before any libc header */
+
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -341,7 +343,10 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
     /* A second descriptor on the same file, for streamed expert reads that must not go
      * through the page cache. Optional: if the filesystem refuses O_DIRECT the reader
      * falls back to fd[]. */
-    if (s->dfd) s->dfd[shard] = open(path, O_RDONLY | O_DIRECT);
+    if (s->dfd) {
+        s->dfd[shard] = open(path, O_RDONLY | O_DIRECT);
+        k3_set_direct(s->dfd[shard]);   /* no-op off Darwin; advisory, failure is fine */
+    }
     return ntensor;
 bad:
     free(json);

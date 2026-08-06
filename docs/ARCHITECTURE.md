@@ -44,7 +44,7 @@ dial; the 5.3 GB is the floor.
 
 ```
 include/k3/
-  k3.h            public types, config, and the five invariants that must hold
+  k3.h            public types, config, and the three invariants that must hold
   k3_cfg.h        config reader, never defaults a missing field
 
 src/core/

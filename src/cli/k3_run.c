@@ -38,6 +38,11 @@
  *   keep correct and the copy is the one that goes stale.
  */
 #define _POSIX_C_SOURCE 200809L
+/* _POSIX_C_SOURCE alone hides the BSD rusage fields, ru_maxrss among them, from
+ * <sys/resource.h> on Darwin. peak_rss_bytes() below needs it. */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
 
 #include <math.h>
 #include <stdio.h>
@@ -207,7 +212,9 @@ static void k3_preset_list(FILE *f)
                "Run scripts/k3-doctor.sh to see which one this machine fits.\n");
 }
 
-/* PEAK resident set, in bytes. ru_maxrss is kilobytes on Linux.
+/* PEAK resident set, in bytes. ru_maxrss is kilobytes on Linux and BYTES on Darwin, so
+ * the scale factor differs by platform; applying the Linux one on macOS would overstate
+ * the peak by 1024x.
  *
  * This is the authoritative memory figure. The banner printed before allocation is a
  * PLAN and understates: it omits the safetensors index (~78 MB at full scale), reports
@@ -217,7 +224,11 @@ static double peak_rss_bytes(void)
 {
     struct rusage ru;
     if (getrusage(RUSAGE_SELF, &ru) != 0) return 0.0;
-    return (double)ru.ru_maxrss * 1024.0;
+#if defined(__APPLE__)
+    return (double)ru.ru_maxrss;            /* already bytes */
+#else
+    return (double)ru.ru_maxrss * 1024.0;   /* kilobytes */
+#endif
 }
 
 /* MemAvailable, which is what the kernel thinks can actually be handed out, not
@@ -510,7 +521,10 @@ int main(int argc, char **argv)
 
     char b1[32];
     printf("Kimi K3, pure C, released checkpoint\n");
-    printf("  shards   : %s\n", dir);
+    /* The directory, not a shard count: the index has not been built yet at this point.
+     * The count is printed by the "indexed N tensors from M shards" line below, once
+     * k3_st_open has actually counted them. */
+    printf("  model    : %s\n", dir);
     printf("  prompt   : %d tokens, generating %d\n", np, gen);
     /* Echo the preset so a captured log is self-describing: a timing figure is
      * meaningless without the budget that produced it. */
@@ -851,10 +865,17 @@ int main(int argc, char **argv)
          * trunk time with a last-step expert time and dividing by the whole run
          * understates the expert share by roughly the token count. */
         const double io_s = trunk_s + expert_s_total;
+        const double share = t_total > 0 ? 100.0 * io_s / t_total : 0.0;
         printf("I/O share of wall clock: %.1f%%  (trunk %.1f s + experts %.1f s of %.1f s)\n",
-               t_total > 0 ? 100.0 * io_s / t_total : 0.0, trunk_s,
-               expert_s_total, t_total);
+               share, trunk_s, expert_s_total, t_total);
         printf("  both figures are WHOLE-RUN totals over %d steps\n", nout);
+        /* Above 100% is not a bug in the arithmetic: with more than one trunk ring slot
+         * the reader thread does device work while the main thread computes, so the two
+         * terms genuinely overlap and their sum can exceed wall clock. Say so, rather
+         * than printing an impossible percentage with no explanation. */
+        if (share > 100.0)
+            printf("  over 100%% because trunk reads overlap compute on the reader thread;\n"
+                   "  %.1f s of device time was hidden behind arithmetic\n", io_s - t_total);
         /* Report the DERIVED retention, not the raw hit count. `hits` counts an expert
          * the batch prefetch pulled off disk microseconds earlier, so it equals the
          * request count at every cache size and means nothing on its own. An expert that

@@ -80,7 +80,15 @@ else PRESET=""; fi
 if [ -n "$PRESET" ]; then
     ok "recommended preset: --preset $PRESET   (expect $EXPECT)"
 else
-    bad "under 10 GB available, below the engine's floor (~8.2 GB measured peak RSS)"
+    # A warning, not a failure. This threshold is about RUNNING the checkpoint; it says
+    # nothing about building the engine or running the test suite, both of which need no
+    # weights and pass comfortably here. `make test`'s own ceiling is the ~1.7 GB single
+    # allocation in tests/unit/scale_test.c. Failing the whole check on this number told
+    # people their machine was broken when the only thing they could not do was the one
+    # thing that needs 1.56 TB of disk they also did not have.
+    warn "under 10 GB available, below the floor for running the checkpoint (~8.2 GB peak RSS)"
+    printf '  %s      the build and "make test" need no weights and work fine here%s\n' \
+        "$DIM" "$RST"
 fi
 
 # -------------------------------------------------------------------- storage --
@@ -129,7 +137,12 @@ fi
 
 hdr "result"
 if [ "$FAILED" -eq 0 ]; then
-    printf '  %sthis machine can run Kimi K3%s\n' "$GRN" "$RST"
+    if [ -n "$PRESET" ]; then
+        printf '  %sthis machine can run Kimi K3%s\n' "$GRN" "$RST"
+    else
+        printf '  %sthis machine can build and test the engine, but not run the checkpoint%s\n' \
+            "$YLW" "$RST"
+    fi
 
     # The command printed here is the one a user is most likely to copy, so every part
     # of it has to work as written:
@@ -146,6 +159,17 @@ if [ "$FAILED" -eq 0 ]; then
         printf '    %s./scripts/pack-trunk.sh %s ~/k3trunk%s\n' "$DIM" "$M" "$RST"
         printf '    %s./bin/k3 %s --trunk ~/k3trunk --preset %s \\%s\n' "$DIM" "$M" "$PRESET" "$RST"
         printf '    %s         --tok %s --prompt "Hello" --gen 8 --incremental%s\n' "$DIM" "$M" "$RST"
+    else
+        # No preset fits, but the weightless path always does, and it is the whole of
+        # the README's Quick start. Printing nothing here was what made the old FAIL
+        # read as "give up".
+        printf '\n  next:\n'
+        printf '    %smake -j%s\n' "$DIM" "$RST"
+        printf '    %smake test%s\n' "$DIM" "$RST"
+        printf '  %sboth need no checkpoint. Running the model needs ~10 GB of RAM and%s\n' \
+            "$DIM" "$RST"
+        printf '  %s~1.7 TB of disk; come back with those and re-run this check.%s\n' \
+            "$DIM" "$RST"
     fi
     exit 0
 else

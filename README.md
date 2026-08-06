@@ -104,7 +104,7 @@ component at a time.
 - [The four reductions](#the-four-reductions)
 - [The machine, and what it assumes](#the-machine-and-what-it-assumes)
 - [The codebase](#the-codebase)
-- [Five invariants](#five-invariants)
+- [Three invariants](#three-invariants)
 - [1. Reading a 1.56 TB checkpoint from its headers](#1-reading-a-156-tb-checkpoint-from-its-headers)
 - [2. The config reader that refuses to guess](#2-the-config-reader-that-refuses-to-guess)
 - [3. The tokenizer, byte for byte](#3-the-tokenizer-byte-for-byte)
@@ -757,22 +757,33 @@ Two compilers on two operating systems produce the same 6,862 token ids from the
 24,499 bytes. The md5 sums differ by exactly one byte, and the reason is the line ending
 the shell added, not anything the tokenizer did.
 
-## Five invariants
+## Three invariants
 
-The public header opens with five invariants that must hold. Each one is a place where a
+The public header opens with three invariants that must hold. Each one is a place where a
 plausible-looking implementation produces a model that runs, emits fluent text, and is
 wrong, with no crash and no NaN to warn you.
 
 1. **`A_log` is indexed per head, not per channel.** The checkpoint ships `head_dim`
    floats but only the first `num_heads` are meaningful; the rest are padding.
-2. **The UT-transform inverse is `(I + Akk)^-1`.** The sign is not a convention.
-3. **`Aqk` retains its diagonal and `Akk` does not.**
-4. **MLA uses NoPE, yet the 64 rope dimensions still exist and are still cached.** Only
+2. **MLA uses NoPE, yet the 64 rope dimensions still exist and are still cached.** Only
    the rotation is absent; dropping the slots changes the head width.
-5. **The MoE routing bias steers selection only.** The combining weights come from the
+3. **The MoE routing bias steers selection only.** The combining weights come from the
    unbiased sigmoid scores.
 
-Each is ticked off below as its component arrives.
+Each is ticked off below as its component arrives, and each is gated by a fixture chosen
+so that getting it wrong changes the output: `A_log` by a linspace that a per-channel
+misindex scrambles, NoPE by asserting the softmax scale is over the full head width, and
+the routing bias by a fixture whose bias reorders the top-k on five of its six rows.
+
+This list used to have five entries. The other two, that the UT-transform inverse is
+`(I + Akk)^-1` and that `Aqk` keeps its diagonal while `Akk` does not, describe the
+chunked parallel form of the delta rule. This engine does not use it. `k3_kda_step` runs
+the naive sequential recurrence one position at a time, and so does the PyTorch reference
+it is checked against, so neither matrix is ever formed. They were claims about an
+algorithm rather than about this code, nothing implemented them, and no test could have
+caught getting them wrong. They now live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+with the rest of the algorithm description. Restoring a chunked KDA path means restoring
+them, with the fixtures that gate them.
 
 ## 1. Reading a 1.56 TB checkpoint from its headers
 
@@ -1608,7 +1619,7 @@ of the head dimension **before** the recurrence rather than after it.
 
 ![Norm first, then gate, then project, and that order is not interchangeable](docs/images/eq_kda_gate.png)
 
-Steps 7, 8 and 9 are where **invariants two and three** live. The released model ends the
+Steps 7, 8 and 9 carry an ordering constraint of their own. The released model ends the
 layer with a fused kernel from the `fla` library called `FusedRMSNormGated`, which takes
 the raw gate and applies the sigmoid internally. The reference implementation instead does
 an explicit RMSNorm followed by a multiply by the sigmoid of the gate. Those are the same
@@ -2302,7 +2313,7 @@ The first time the engine touched all 2.78 trillion parameters:
 
 ```text
 Kimi K3, pure C, released checkpoint
-  shards   : 96
+  model    : /home/k3/k3model
   prompt   : 5 tokens, generating 2
 
 indexed 497220 tensors from 96 shards in 0.70 s

@@ -121,7 +121,18 @@ def main():
                 "layer": L,
                 "shard": os.path.basename(sp),
                 "run_start": lo,          # absolute offset in the shard
-                "nbytes": own,
+                # The engine reads this many bytes with O_DIRECT, which requires the
+                # LENGTH to be aligned as well as the offset. Real-checkpoint runs are
+                # huge and align by luck; fixture-sized runs are not, which is why this
+                # only ever showed up on small models as "short read on layer N".
+                #
+                # Rounded to ALIGN (4096) rather than to a 512-byte sector. 512 is not
+                # enough on a 4Kn device, and it disagrees with the rest of this file:
+                # runs are padded to ALIGN, file_off is asserted to be a multiple of
+                # ALIGN, the manifest advertises ALIGN, and k3_trunk.c refuses O_DIRECT
+                # outright unless that advertised value is 4096. The tail is already
+                # zero-padded to ALIGN below, so this still reads only padding.
+                "nbytes": (own + ALIGN - 1) & ~(ALIGN - 1),
                 "file_off": file_off,     # offset in trunk.bin
                 "tensors": {k: {"off": v[1] - lo, "nbytes": v[2],
                                 "dtype": v[3], "shape": v[4]}

@@ -16,8 +16,11 @@
  * This does NOT load real weights. It allocates at real shapes with synthetic values
  * to prove the plumbing survives the dimensions.
  */
-/* -std=c99 hides the POSIX clock API; request it before any include. */
-#define _POSIX_C_SOURCE 199309L
+/* -std=c99 hides the POSIX clock API; request it before any include.
+ * 200809L rather than 199309L: the older level predates C99 and, on Darwin's headers,
+ * gates out snprintf along with it. Both levels declare clock_gettime, which is the
+ * only reason this macro is here. */
+#define _POSIX_C_SOURCE 200809L
 
 #include <math.h>
 #include <stdio.h>

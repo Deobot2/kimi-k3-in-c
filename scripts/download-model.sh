@@ -7,7 +7,9 @@
 # does not fail loudly, it produces wrong tokens, so the byte total is checked against
 # the published figure before anything else is allowed to use it.
 #
-# Requires a HuggingFace token in $HF_TOKEN or ~/.cache/huggingface/token.
+# The repository is public, so no token is needed. If you have one, the hf CLI picks it
+# up from $HF_TOKEN or ~/.cache/huggingface/token on its own; this script never reads,
+# echoes or forwards it.
 
 set -euo pipefail
 
@@ -18,23 +20,90 @@ REPO="moonshotai/Kimi-K3"
 EXPECT_SHARDS=96
 EXPECT_BYTES=1560936091448
 
-command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
+# The downloader is the `hf` CLI from huggingface_hub 1.x. The older entry points are
+# gone: `python3 -m huggingface_hub.commands.huggingface_cli` was removed when the CLI
+# was renamed, and the `[cli]` extra no longer exists.
+#
+# We deliberately do NOT attempt a pip install here. On the platform this project
+# targets, a system pip install cannot succeed: Ubuntu 24.04 ships no pip module at
+# all, and once pip is present PEP 668 marks the interpreter externally-managed and
+# refuses. Guessing wrong in an unattended script that is about to move 1.56 TB is
+# worse than stopping with an instruction.
+if ! command -v hf >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+the `hf` CLI is required and was not found on PATH.
 
-if ! python3 -c "import huggingface_hub" 2>/dev/null; then
-    echo "installing huggingface_hub…"
-    python3 -m pip install --quiet --upgrade "huggingface_hub[cli]"
+Install it one of these ways, then re-run:
+
+  pipx install huggingface_hub            # recommended; what PEP 668 points you to
+  uv tool install huggingface_hub
+  python3 -m venv ~/.venvs/hf && ~/.venvs/hf/bin/pip install huggingface_hub
+    then add ~/.venvs/hf/bin to PATH
+
+On Debian/Ubuntu, `pipx` is `sudo apt install pipx`.
+EOF
+    exit 1
 fi
+
+# An older installation can provide `hf` without `hf cache verify`, which is what turns
+# the size check below into a real integrity check.
+hf cache verify --help >/dev/null 2>&1 || {
+    echo "this hf CLI has no 'cache verify'; upgrade huggingface_hub and re-run." >&2
+    exit 1
+}
+
+# Resolve the branch to an immutable commit ONCE, and use it for both the download and
+# the verification. Otherwise `main` can move between the two steps and the checksums are
+# compared against a different snapshot than the one on disk.
+#
+# Resolved through the hf CLI rather than `python3 -c "import huggingface_hub"`: the
+# recommended installs above put the library in an isolated environment and expose only
+# the `hf` executable, so importing it from the system interpreter fails on exactly the
+# setups this script just told the user to create.
+# NOTE: awk must read to EOF here. Exiting on the first match closes the pipe, `hf` takes
+# SIGPIPE, and under `set -o pipefail` that kills the script with 141 before it prints
+# anything at all.
+REVISION="${K3_REVISION:-}"
+if [ -z "$REVISION" ]; then
+    REVISION="$(hf models info "$REPO" 2>/dev/null \
+                | tr -d ' ",' \
+                | awk -F: '!v && /^sha:/ {v = $2} END {print v}')"
+fi
+case "$REVISION" in
+    ????????????????????????????????????????) ;;   # 40 hex characters
+    *) echo "could not resolve a commit for $REPO (got '${REVISION:-empty}')." >&2
+       echo "  Set K3_REVISION to a commit sha to skip this lookup." >&2
+       exit 1 ;;
+esac
 
 mkdir -p "$DEST"
 
-echo "downloading $REPO -> $DEST"
+# Free-space preflight. Without this the transfer runs until the filesystem fills, which
+# takes the machine's logging and package manager with it, and the byte-total check below
+# then reports a mismatch -- a true statement that misdiagnoses the actual failure.
+AVAIL=$(df -P -k "$DEST" | awk 'NR==2 {print $4 * 1024}')
+if [ "$AVAIL" -lt "$EXPECT_BYTES" ]; then
+    printf 'FAIL: %s has %s bytes free, the checkpoint needs %s.\n' \
+        "$DEST" "$AVAIL" "$EXPECT_BYTES" >&2
+    printf '      Short by %s bytes (%.2f TB). Point <dest_dir> at a larger filesystem.\n' \
+        "$((EXPECT_BYTES - AVAIL))" \
+        "$(awk -v d="$((EXPECT_BYTES - AVAIL))" 'BEGIN{print d/1e12}')" >&2
+    printf '      Packing the trunk afterwards needs a further ~109 GB.\n' >&2
+    exit 1
+fi
+
+echo "downloading $REPO@$REVISION -> $DEST"
 echo "  1.56 TB across $EXPECT_SHARDS shards; expect ~30 min at 1 GB/s"
 echo
 
-# The token is read from the environment and never echoed.
-HF_HUB_ENABLE_HF_TRANSFER=1 \
-python3 -m huggingface_hub.commands.huggingface_cli download "$REPO" \
-    --local-dir "$DEST" --max-workers 16
+# Xet is the transfer backend in huggingface_hub 1.x. HF_HUB_ENABLE_HF_TRANSFER, which
+# this script used to set, is ignored there and was a hard error on 0.x whenever the
+# hf_transfer package was absent -- which it always was, since nothing installed it.
+#
+# A token is not needed: the repository is public. If one is present in the environment
+# or in a saved login the CLI uses it for higher rate limits; this script never touches it.
+HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}" \
+hf download "$REPO" --revision "$REVISION" --local-dir "$DEST" --max-workers 16
 
 echo
 echo "verifying…"
@@ -80,7 +149,21 @@ if [ -f "$SIZES" ]; then
     printf '  shards : all %s match their published sizes individually\n' "$EXPECT_SHARDS"
 fi
 
-echo "  RESULT : byte-exact match"
+# Sizes prove the download is COMPLETE. They cannot prove it is the RIGHT bytes: a
+# substituted shard of identical length passes everything above. SECURITY.md names that
+# gap; this closes it by comparing against the hashes the Hub published for the exact
+# commit resolved earlier. It re-reads all 1.56 TB, so it is not free -- on a machine
+# without SHA-NI it can take longer than the download did.
+echo
+echo "verifying checksums against Hub metadata for $REVISION…"
+echo "  (re-reads the full 1.56 TB; set K3_SKIP_CHECKSUM=1 to skip)"
+if [ "${K3_SKIP_CHECKSUM:-0}" = "1" ]; then
+    echo "  SKIPPED by K3_SKIP_CHECKSUM=1; sizes were still checked above."
+else
+    hf cache verify "$REPO" --revision "$REVISION" --local-dir "$DEST" \
+        --fail-on-missing-files
+    echo "  RESULT : checksum-verified snapshot at $REVISION"
+fi
 echo
 echo "next: scripts/pack-trunk.sh $DEST <trunk_dir>"
 echo "      packing the trunk is what lets the engine stream it, which is what makes"

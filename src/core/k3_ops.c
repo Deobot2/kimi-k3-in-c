@@ -57,6 +57,23 @@ static void k3_fatal_oom(const char *what, size_t bytes)
     abort();
 }
 
+/* The same rule, for a bound that is exceeded rather than an allocation that fails.
+ * k3_mla_cached writes its output only after the capacity check, so returning early
+ * would hand the caller back whatever the scratch buffer held from the previous layer,
+ * and k3_decoder_layer_inc folds that straight into the residual. The run finishes and
+ * prints a token derived from the wrong layer's activations. Abort instead. */
+static void k3_fatal_bound(const char *what, long value, long limit)
+{
+    fprintf(stderr,
+            "k3: FATAL, %s is %ld, which exceeds the limit of %ld.\n"
+            "    Aborting rather than returning without writing the output buffer,\n"
+            "    which would fold the previous layer's values into the residual and\n"
+            "    produce plausible-looking but meaningless output.\n"
+            "    Shorten the prompt, lower --gen, or drop --incremental.\n",
+            what, value, limit);
+    abort();
+}
+
 /* ------------------------------------------------------------- layer map ---- */
 /* The released config lists full_attn_layers ONE-BASED, and
  * configuration_kimi_k3.py:152-156 tests (layer_idx + 1) in kda_layers. Getting this
@@ -284,10 +301,8 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     const float scale = 1.0f / sqrtf((float)qh);  /* :359, over qh not qn           */
     if (!kvc) cached = 0;
     const int last = cached + T - 1;              /* highest absolute position      */
-    if (kvc && last >= cap) {
-        fprintf(stderr, "k3_mla: position %d exceeds KV cache capacity %d\n", last, cap);
-        return;
-    }
+    if (kvc && last >= cap)
+        k3_fatal_bound("MLA KV cache position", (long)last, (long)cap - 1);
 
     /* Scratch layout. Every region below is DISJOINT and must stay so. Overlapping
      * any two of them can appear to work, aliasing the gate buffer onto q, say, is
