@@ -123,8 +123,187 @@ static int real_cfg(K3Cfg *c, int *fa, int fa_max,
 static int argmax_(const float *v, int n)
 { int b = 0; for (int i = 1; i < n; i++) if (v[i] > v[b]) b = i; return b; }
 
+/* ------------------------------------------------------- conversation state ----
+ * Everything the engine carries between tokens, on disk. The point is turn two of a
+ * conversation: without this, resuming re-reads the whole prompt through all 93 layers,
+ * which on a streamed trunk costs minutes; with it, a resumed session pays only for the
+ * tokens actually new.
+ *
+ * Three things are carried, and only three: the KDA recurrent matrices plus ShortConv
+ * history (fixed size, independent of context), the MLA KV cache, and the shared rope
+ * rows. The AttnRes block buffer is NOT carried because forward() clears it on entry and
+ * rebuilds it from the layer outputs every pass; saving it would be saving scratch.
+ *
+ * The KV cache is stored position-major inside each MLA layer's slice, so only the
+ * OCCUPIED positions are written and a resumed run may size its cache differently. The
+ * header carries a config fingerprint: restoring state built by a different architecture
+ * would produce fluent, wrong output with nothing to indicate it, which is the one
+ * failure mode this engine refuses to have. */
+#define K3_STATE_MAGIC "K3ST"
+#define K3_STATE_VER   1
+
+typedef struct {
+    char    magic[4];
+    int32_t version;
+    int32_t fp[12];        /* config fingerprint */
+    int32_t n_bound, n_mla, cached, nseq;
+    int64_t kper;          /* KDA+conv floats per layer */
+    int64_t kvpp, ropepp;  /* KV / rope floats per position, per MLA layer */
+} K3StateHdr;
+
+static void k3_state_fp(const K3Cfg *c, int32_t *fp)
+{
+    fp[0] = c->hidden;      fp[1] = c->n_layers;  fp[2]  = c->vocab;
+    fp[3] = c->kda_heads;   fp[4] = c->kda_head_dim; fp[5] = c->conv_k;
+    fp[6] = c->n_heads;     fp[7] = c->qk_nope;   fp[8]  = c->qk_rope;
+    fp[9] = c->v_head;      fp[10] = c->n_experts; fp[11] = c->topk;
+}
+
+#define K3_SPEC_MAX 8
+/* Longest-suffix n-gram drafting for --spec: if the last n ids (n=3, then 2) already
+ * appeared earlier in the sequence, propose the ids that followed them there. Costs
+ * nothing when it misses: no draft means the step runs exactly as without --spec. The
+ * drafts are PROPOSALS only; batched greedy verification accepts precisely the prefix
+ * the model itself would have emitted, so the output stream is identical to serial
+ * decode by construction, and the A/B gate checks it. */
+/* Reads only the header, so the caller can size buffers before committing to a load. */
+static int k3_state_peek(const char *path, K3StateHdr *hd)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); return -1; }
+    const size_t got = fread(hd, 1, sizeof *hd, f);
+    fclose(f);
+    if (got != sizeof *hd || memcmp(hd->magic, K3_STATE_MAGIC, 4) != 0) {
+        fprintf(stderr, "%s is not a k3 state file\n", path);
+        return -1;
+    }
+    if (hd->version != K3_STATE_VER) {
+        fprintf(stderr, "%s is state version %d, this build writes %d\n",
+                path, hd->version, K3_STATE_VER);
+        return -1;
+    }
+    return 0;
+}
+
+static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
+                         int *seq, float *ks, float *kvc, float *ropec,
+                         int n_bound, int n_mla, int kv_cap)
+{
+    int32_t fp[12];
+    k3_state_fp(c, fp);
+    if (memcmp(fp, hd->fp, sizeof fp) != 0) {
+        fprintf(stderr, "REFUSING: %s was written by a different model architecture.\n"
+                        "  Restoring it would produce fluent, wrong output.\n", path);
+        return -1;
+    }
+    if (hd->n_bound != n_bound || hd->n_mla != n_mla) {
+        fprintf(stderr, "REFUSING: %s holds %d bound layers and %d MLA layers, "
+                        "this run has %d and %d\n",
+                path, hd->n_bound, hd->n_mla, n_bound, n_mla);
+        return -1;
+    }
+    if (hd->cached > kv_cap) {
+        fprintf(stderr, "REFUSING: %s holds %d positions, this run's KV cache is %d.\n"
+                        "  Raise --gen or shorten the prompt.\n", path, hd->cached, kv_cap);
+        return -1;
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); return -1; }
+    if (fseek(f, (long)sizeof *hd, SEEK_SET) != 0) { fclose(f); return -1; }
+
+    int rc = 0;
+    if (fread(seq, sizeof(int), (size_t)hd->nseq, f) != (size_t)hd->nseq) rc = -1;
+    if (!rc && fread(ks, sizeof(float), (size_t)hd->kper * n_bound, f)
+               != (size_t)hd->kper * (size_t)n_bound) rc = -1;
+    /* Position-major inside each layer slice, so a differently-sized destination cache
+     * is written slice by slice rather than as one block. */
+    for (int mi = 0; !rc && mi < n_mla; mi++) {
+        float *dst = kvc + (size_t)mi * kv_cap * hd->kvpp;
+        const size_t n = (size_t)hd->cached * hd->kvpp;
+        if (fread(dst, sizeof(float), n, f) != n) rc = -1;
+    }
+    for (int mi = 0; !rc && mi < n_mla; mi++) {
+        float *dst = ropec + (size_t)mi * kv_cap * hd->ropepp;
+        const size_t n = (size_t)hd->cached * hd->ropepp;
+        if (fread(dst, sizeof(float), n, f) != n) rc = -1;
+    }
+    fclose(f);
+    if (rc) fprintf(stderr, "%s is truncated\n", path);
+    return rc;
+}
+
+static int k3_state_save(const char *path, const K3Cfg *c, const int *seq, int nseq,
+                         const float *ks, const float *kvc, const float *ropec,
+                         int n_bound, int n_mla, int kv_cap, int cached,
+                         int64_t kper, int64_t kvpp, int64_t ropepp)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); return -1; }
+    K3StateHdr hd;
+    memset(&hd, 0, sizeof hd);
+    memcpy(hd.magic, K3_STATE_MAGIC, 4);
+    hd.version = K3_STATE_VER;
+    k3_state_fp(c, hd.fp);
+    hd.n_bound = n_bound; hd.n_mla = n_mla; hd.cached = cached; hd.nseq = nseq;
+    hd.kper = kper; hd.kvpp = kvpp; hd.ropepp = ropepp;
+
+    int rc = 0;
+    if (fwrite(&hd, sizeof hd, 1, f) != 1) rc = -1;
+    if (!rc && fwrite(seq, sizeof(int), (size_t)nseq, f) != (size_t)nseq) rc = -1;
+    if (!rc && fwrite(ks, sizeof(float), (size_t)kper * n_bound, f)
+               != (size_t)kper * (size_t)n_bound) rc = -1;
+    for (int mi = 0; !rc && mi < n_mla; mi++) {
+        const float *src = kvc + (size_t)mi * kv_cap * kvpp;
+        const size_t n = (size_t)cached * kvpp;
+        if (fwrite(src, sizeof(float), n, f) != n) rc = -1;
+    }
+    for (int mi = 0; !rc && mi < n_mla; mi++) {
+        const float *src = ropec + (size_t)mi * kv_cap * ropepp;
+        const size_t n = (size_t)cached * ropepp;
+        if (fwrite(src, sizeof(float), n, f) != n) rc = -1;
+    }
+    if (fclose(f) != 0) rc = -1;
+    if (rc) fprintf(stderr, "failed writing %s\n", path);
+    return rc;
+}
+
+static int spec_draft(const int *seq, int T, int cap, int *out)
+{
+    /* Evidence-gated: a draft only fires when the suffix n-gram's occurrences AGREE on
+     * what follows. Measured on the released checkpoint, an eager most-recent-match
+     * drafter went 0.91x on code: partial acceptances pay a replay sweep, so weak
+     * drafts are worse than no drafts. Rules: match length 4 (then 3); if the n-gram
+     * occurred more than once, every occurrence must propose the same next id, and the
+     * draft stops at the first position where historical continuations diverge. */
+    if (cap > K3_SPEC_MAX) cap = K3_SPEC_MAX;
+    for (int n = 4; n >= 3; n--) {
+        if (T < n + 1) continue;
+        int m1 = -1, m2 = -1;                            /* two most recent matches */
+        for (int j = T - n - 1; j >= 0; j--) {
+            int hit = 1;
+            for (int i = 0; i < n; i++)
+                if (seq[j + i] != seq[T - n + i]) { hit = 0; break; }
+            if (!hit) continue;
+            if (m1 < 0) m1 = j;
+            else { m2 = j; break; }
+        }
+        if (m1 < 0) continue;
+        int nd = 0;
+        for (int i = 0; nd < cap && m1 + n + i < T; i++) {
+            const int cand = seq[m1 + n + i];
+            if (m2 >= 0) {
+                /* stop where the two histories stop agreeing */
+                if (m2 + n + i >= m1 || seq[m2 + n + i] != cand) break;
+            }
+            out[nd++] = cand;
+        }
+        if (nd > 0) return nd;
+    }
+    return 0;
+}
+
 #ifndef K3_VERSION
-#define K3_VERSION "0.1.0"
+#define K3_VERSION "1.0.0"
 #endif
 
 static void usage(FILE *f)
@@ -141,7 +320,9 @@ static void usage(FILE *f)
 "  --ids 1,2,3           raw token ids; the reproducible channel used by the tests\n"
 "\n"
 "memory:\n"
-"  --preset NAME         laptop | desktop | workstation | server | max\n"
+"  --preset NAME         auto | laptop | desktop | workstation | server | max\n"
+"                        auto sizes both budgets from this machine's free RAM,\n"
+"                        trunk-first; also spelled --trunk-gb auto\n"
 "  --list-presets        show each preset's split and expected speed\n"
 "  --trunk DIR           packed trunk directory; enables streaming (see scripts/)\n"
 "  --trunk-gb X          trunk ring / pinned-layer budget\n"
@@ -150,6 +331,21 @@ static void usage(FILE *f)
 "generation:\n"
 "  --gen N               tokens to generate (default 8)\n"
 "  --incremental         carry KV cache and recurrent state between tokens\n"
+"  --save-state PATH     write the carried state after the run, so the next turn of a\n"
+"                        conversation resumes instead of re-reading the whole prompt\n"
+"  --load-state PATH     resume from a saved state; the prompt given now is treated as\n"
+"                        the CONTINUATION of the saved sequence. Needs --incremental\n"
+"  --draft-trunk DIR     hybrid decode: a second packed trunk (typically a quantized\n"
+"                        derivation of the real one, see tools/qdq_trunk.py) DRAFTS\n"
+"                        tokens which the exact model verifies in batched sweeps.\n"
+"                        Output remains exactly the exact model's greedy decode; the\n"
+"                        draft only proposes. Needs --incremental; implies --spec 4\n"
+"  --draft-trunk-gb X    trunk budget for the draft model (default 6)\n"
+"  --spec N              speculative decode: draft up to N tokens by n-gram lookup and\n"
+"                        verify them in ONE batched sweep. Output is identical to\n"
+"                        serial decode by construction; needs --incremental. An extra\n"
+"                        verified position costs ~22%% of a serial token when the trunk\n"
+"                        streams, so repetitive text decodes up to several times faster\n"
 "  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
 "\n"
 "diagnostics:\n"
@@ -208,6 +404,8 @@ static void k3_preset_list(FILE *f)
     for (int i = 0; i < K3_NPRESET; i++)
         fprintf(f, "  %-12s %6.1f / %-6.1f  %s\n", K3_PRESETS[i].name,
                 K3_PRESETS[i].trunk_gb, K3_PRESETS[i].cache_gb, K3_PRESETS[i].note);
+    fprintf(f, "  %-12s %6s / %-6s  %s\n", "auto", "fit", "fit",
+            "sizes both from this machine's free RAM, trunk-first. Recommended.");
     fprintf(f, "\nAll presets stream the trunk, so they need --trunk <packed_dir>.\n"
                "Run scripts/k3-doctor.sh to see which one this machine fits.\n");
 }
@@ -255,6 +453,7 @@ typedef struct {
     float       *kvc, *ropec;
     int         *mla_slot;   /* [n_layers] -> dense MLA index, or -1 */
     int          n_mla, kv_cap, cached;
+    int          draft_mode;   /* 1 for the hybrid draft: cache-only expert routing */
 } Weights;
 
 /* One full forward over T tokens, writing logits for the LAST position only. Every
@@ -263,8 +462,14 @@ typedef struct {
  * Returns 0 on success and -1 if the forward could not be completed. The caller MUST
  * check: on failure logits_last is left untouched, and argmaxing an untouched buffer
  * yields a token drawn from uninitialised memory, printed as though it were output. */
+/* arg_all: when non-NULL, receives argmax(logits) for EVERY position 0..T-1, which is
+ * what batched greedy verification consumes. logits_last still gets the final position's
+ * full vector either way. The extra cost is one lm_head matmul per additional position,
+ * pure RAM-resident compute; measured, an extra verified position costs ~22% of a serial
+ * token at streamed-trunk budgets, which is the entire economics of --spec. */
 static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, int T,
-                   float *logits_last, float *scratch, float *h, float *br, float *kstate)
+                   float *logits_last, float *scratch, float *h, float *br, float *kstate,
+                   int *arg_all)
 {
     const int E = c->hidden;
     const int maxb = c->n_layers / c->attn_res_block + 2;
@@ -296,6 +501,9 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
         if (w->lay[L].lay.moe) {
             w->lay[L].moe.src = &cache->src;
             w->lay[L].moe.layer = L;
+            /* The draft routes only among resident experts, reading zero new expert bytes;
+             * the exact model keeps true routing. This is what makes a draft step cheap. */
+            w->lay[L].moe.cache_only = w->draft_mode;
         }
         if (w->kvc && w->mla_slot[L] >= 0) {
             const size_t kvper = (size_t)w->kv_cap * c->n_heads * (c->qk_nope + c->v_head);
@@ -329,6 +537,15 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     }
 
     float *nrm = scratch;
+    if (arg_all) {
+        for (int t = 0; t < T; t++) {
+            k3_rmsnorm(nrm, h + (size_t)t * E, w->mb.norm, E, c->rms_eps);
+            k3_mmw(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
+            arg_all[t] = argmax_(logits_last, c->vocab);
+        }
+        /* logits_last now holds the FINAL position's vector, same as the plain path. */
+        return 0;
+    }
     k3_rmsnorm(nrm, h + (size_t)(T - 1) * E, w->mb.norm, E, c->rms_eps);
     k3_mmw(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
     return 0;
@@ -362,6 +579,12 @@ int main(int argc, char **argv)
     const char *cfg_path = NULL;
     int gen = 8, want_layers = -1;
     double cache_gb = 64.0, trunk_gb = 16.0;
+    int budget_auto = 0;
+    int spec_n = 0;
+    int tf_check = 0;
+    const char *draft_dir = NULL;
+    double draft_gb = 6.0;
+    const char *load_state = NULL, *save_state = NULL;
     const char *preset_name = NULL;
     int incremental = 0;
     for (int i = 2; i < argc; i++) {
@@ -375,10 +598,27 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) want_layers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
         else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
-        else if (!strcmp(argv[i], "--trunk-gb") && i + 1 < argc) trunk_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--spec") && i + 1 < argc) spec_n = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--tf-check")) tf_check = 1;
+        else if (!strcmp(argv[i], "--load-state") && i + 1 < argc) load_state = argv[++i];
+        else if (!strcmp(argv[i], "--save-state") && i + 1 < argc) save_state = argv[++i];
+        else if (!strcmp(argv[i], "--draft-trunk") && i + 1 < argc) draft_dir = argv[++i];
+        else if (!strcmp(argv[i], "--draft-trunk-gb") && i + 1 < argc) draft_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--trunk-gb") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "auto")) budget_auto = 1;
+            else { trunk_gb = atof(v); budget_auto = 0; }
+        }
         else if (!strcmp(argv[i], "--incremental")) incremental = 1;
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) logits_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-cache-trace") && i + 1 < argc) trace_dir = argv[++i];
+        else if (!strcmp(argv[i], "--preset") && i + 1 < argc && !strcmp(argv[i + 1], "auto")) {
+            /* Not in the table: the table is fixed budgets, auto is computed from this
+             * machine's MemAvailable at startup, below, once parsing is complete. */
+            i++;
+            budget_auto = 1;
+            preset_name = "auto";
+        }
         else if (!strcmp(argv[i], "--preset") && i + 1 < argc) {
             const K3Preset *p = k3_preset_find(argv[++i]);
             if (!p) {
@@ -412,6 +652,68 @@ int main(int argc, char **argv)
             fprintf(stderr, "--ids, --prompt and --prompt-file are mutually exclusive\n");
             return 2;
         }
+    }
+
+    /* ---- auto budget ----
+     * RAM-first: per token the engine re-reads the ENTIRE streamed trunk but only
+     * ~25.8 GB of experts, and steady-state expert caching yields nothing until the
+     * arena is tens of GB. Measured: a gigabyte pinned in the trunk is worth roughly
+     * 70x a gigabyte of expert cache at the margin. So auto gives the trunk everything
+     * this machine has, minus a safety margin, and the cache gets real memory only
+     * after the whole 110 GB trunk would be resident. */
+    if (budget_auto) {
+        const double avail = mem_available_bytes();
+        if (avail <= 0.0) {
+            fprintf(stderr, "--preset auto needs /proc/meminfo; pass explicit "
+                            "--trunk-gb/--cache-gb on this platform\n");
+            return 2;
+        }
+        /* Fixed costs outside both budgets: embeddings + lm_head 4.70 GB, safetensors
+         * index, recurrent state 0.63 GB, KV cache and scratch. Reserve them plus a
+         * 2 GB + 2% margin so auto never invites the OOM killer. */
+        const double reserve = 2.0 + 0.02 * (avail / 1e9) + 4.70 + 1.70;
+        double usable = avail / 1e9 - reserve;
+        const double slot_min = 2.5;   /* one ring slot + headroom; refuse below */
+        const double cache_min = 0.5;  /* topk+1 expert slots is ~0.3 GB */
+        if (usable < slot_min + cache_min) {
+            fprintf(stderr, "auto: only %.1f GB usable after the %.1f GB reserve; "
+                            "below the %.1f GB floor. Pass explicit budgets.\n",
+                    usable, reserve, slot_min + cache_min);
+            return 2;
+        }
+        const double trunk_full = 111.0;   /* full packed trunk + widen headroom */
+        if (usable - cache_min >= trunk_full) {
+            /* Full residency: per-token trunk reads disappear entirely. This is the
+             * configuration auto exists for. */
+            trunk_gb = trunk_full;
+            cache_gb = usable - trunk_full;
+        } else {
+            /* Partial pinning has WEAK returns and real hazards, both measured on the
+             * released checkpoint: pinning 51 of 109 GB ran 14% SLOWER than pinning
+             * nothing (48.2 vs 42.1 s/token) because peak RSS at ~90% of RAM put the
+             * kernel into reclaim and the device served the remaining tail of the
+             * packed trunk a third slower, while a moderate pin stayed neutral to
+             * mildly positive (40.1 s/token at 25 GB, device throughput unharmed).
+             * So below full residency, auto pins only while the whole process stays
+             * comfortably clear of the RAM ceiling. */
+            double memtotal = 0.0;
+            FILE *mf = fopen("/proc/meminfo", "r");
+            if (mf) {
+                char ln[256];
+                while (fgets(ln, sizeof ln, mf))
+                    if (!strncmp(ln, "MemTotal:", 9)) { memtotal = atof(ln + 9) * 1024.0; break; }
+                fclose(mf);
+            }
+            const double rss_ceiling = memtotal > 0.0 ? 0.55 * memtotal / 1e9
+                                                      : usable;   /* no /proc: keep old cap */
+            double cap = rss_ceiling - reserve - cache_min;
+            if (cap < slot_min) cap = slot_min;
+            trunk_gb = usable - cache_min;
+            if (trunk_gb > cap) trunk_gb = cap;
+            cache_gb = cache_min;
+        }
+        printf("auto budget: %.1f GB available, %.1f GB reserved -> trunk %.1f GB / "
+               "expert cache %.1f GB\n", avail / 1e9, reserve, trunk_gb, cache_gb);
     }
 
     /* fa is sized for the released 24 MLA layers with generous headroom; k3_cfg_load
@@ -673,8 +975,22 @@ int main(int argc, char **argv)
            (double)cache.nslot * cache.slot_bytes / 1e9,
            100.0 * cache.nslot / (double)(92 * c.n_experts));
 
-    /* ---- buffers ---- */
-    const int Tmax = np + gen + 1;
+    /* ---- buffers ----
+     * A resumed session must hold the saved history as well as the new tokens, so the
+     * KV cache and every per-position buffer are sized for both. The header is read
+     * here, before anything is allocated; the payload is restored after. */
+    K3StateHdr shd;
+    int prior = 0;
+    if (load_state) {
+        if (!incremental) {
+            fprintf(stderr, "--load-state needs --incremental\n");
+            return 2;
+        }
+        if (k3_state_peek(load_state, &shd) != 0) return 1;
+        prior = shd.nseq;
+        printf("resuming from %s: %d prior positions, %d new\n\n", load_state, prior, np);
+    }
+    const int Tmax = prior + np + gen + 1;
     const int E = c.hidden;
     const int maxb = c.n_layers / c.attn_res_block + 2;
     const int P = c.kda_heads * c.kda_head_dim;
@@ -714,11 +1030,13 @@ int main(int argc, char **argv)
      * Heap and sized from the ACTUAL request, not from the ceiling. These were
      * `int seq[K3_MAX_PROMPT + K3_MAX_GEN]` and `int outtok[K3_MAX_GEN]` on the stack,
      * which is why the ceiling had to stay small enough to be a stack array. */
-    int *seq = (int *)malloc((size_t)(np + gen + 8) * sizeof(int));
+    int *seq = (int *)malloc((size_t)(prior + np + gen + 8) * sizeof(int));
     int *outtok = (int *)malloc((size_t)(gen + 8) * sizeof(int));
     if (!seq || !outtok) { fprintf(stderr, "OOM allocating sequence buffers\n"); return 1; }
-    memcpy(seq, prompt, (size_t)np * sizeof(int));
-    int T = np;
+    /* On a resume the saved history occupies the front of the sequence and the prompt
+     * given now is its continuation; the restore below fills seq[0..prior). */
+    memcpy(seq + prior, prompt, (size_t)np * sizeof(int));
+    int T = prior + np;
     int nout = 0;
 
     /* ---- optional incremental decode ----
@@ -745,6 +1063,121 @@ int main(int argc, char **argv)
         if (!w.kvc || !w.ropec) { fprintf(stderr, "KV cache allocation failed\n"); return 1; }
         memset(ks, 0, kper * (size_t)NL * sizeof(float));
         w.cached = 0;
+
+        if (load_state) {
+            const double tl = now_s();
+            if (k3_state_load(load_state, &c, &shd, seq, ks, w.kvc, w.ropec,
+                              w.n_bound, w.n_mla, w.kv_cap) != 0)
+                return 1;
+            w.cached = shd.cached;
+            printf("restored %d positions in %.2f s: decode continues without "
+                   "re-reading the prior context\n\n", w.cached, now_s() - tl);
+        }
+    }
+
+    /* --spec needs a snapshot of the carried KDA/ShortConv state to roll back a
+     * partially-rejected draft batch: the recurrent state is updated in place and is
+     * not positional, so the only sound recovery is restore-and-replay the accepted
+     * prefix. The snapshot is one memcpy; the replay is one short batched sweep. */
+    const size_t kperP  = (size_t)c.kda_heads * c.kda_head_dim;
+    const size_t kper_f = kperP * c.kda_head_dim + 3 * kperP * (c.conv_k - 1);
+    float *spec_snap = NULL;
+    if (spec_n > 0) {
+        if (!incremental) {
+            fprintf(stderr, "--spec needs --incremental; ignoring --spec\n");
+            spec_n = 0;
+        } else {
+            if (spec_n > K3_SPEC_MAX) spec_n = K3_SPEC_MAX;
+            spec_snap = (float *)malloc(kper_f * (size_t)w.n_bound * sizeof(float));
+            if (!spec_snap) { fprintf(stderr, "OOM for the --spec snapshot\n"); return 1; }
+            printf("speculative decode: up to %d drafted tokens per sweep, n-gram lookup, "
+                   "verified batched\n\n", spec_n);
+        }
+    }
+
+    /* ---- hybrid decode: a second, typically quantized, trunk drafts ----
+     * The draft model shares everything that is identical between the two models: the
+     * embedding, the lm_head, the layer map, and the routed experts (the qdq derivation
+     * touches only 2D trunk tensors). It differs ONLY in trunk weights, so it needs its
+     * own trunk stream, its own layer bindings, and its own recurrent/KV state. Output
+     * exactness is structural: drafts feed the SAME batched greedy verification as
+     * --spec, so what gets emitted is precisely what the exact model would have chosen.
+     * Measured teacher-forced agreement of an int8-derived draft on the released
+     * checkpoint is 94.2 percent against a 96.2 percent measurement ceiling, which is
+     * what makes the draft worth consulting at all. */
+    static K3Trunk trunk_d;
+    Weights dw; memset(&dw, 0, sizeof dw);
+    float *dks = NULL, *dsnap = NULL;
+    long hyb_rounds = 0, hyb_drafted = 0, hyb_accepted = 0;
+    if (draft_dir) {
+        if (!incremental || !trunk_dir) {
+            fprintf(stderr, "--draft-trunk needs --incremental and --trunk; ignoring\n");
+            draft_dir = NULL;
+        } else {
+            if (spec_n <= 0) spec_n = 4;
+            if (spec_n > K3_SPEC_MAX) spec_n = K3_SPEC_MAX;
+            if (!spec_snap) {
+                spec_snap = (float *)malloc(kper_f * (size_t)w.n_bound * sizeof(float));
+                if (!spec_snap) { fprintf(stderr, "OOM for the --spec snapshot\n"); return 1; }
+            }
+            if (k3_trunk_open(&trunk_d, draft_dir, &c, (int64_t)(draft_gb * 1e9)) != 0)
+                return 1;
+            dw.lay = (K3LayerBind *)calloc((size_t)NL, sizeof(K3LayerBind));
+            dks   = (float *)calloc(kper_f * (size_t)w.n_bound, sizeof(float));
+            dsnap = (float *)malloc(kper_f * (size_t)w.n_bound * sizeof(float));
+            const size_t kvperd = (size_t)w.kv_cap * c.n_heads * (c.qk_nope + c.v_head);
+            const size_t rpperd = (size_t)w.kv_cap * c.qk_rope;
+            dw.kvc   = (float *)calloc(kvperd * (size_t)w.n_mla, sizeof(float));
+            dw.ropec = (float *)calloc(rpperd * (size_t)w.n_mla, sizeof(float));
+            if (!dw.lay || !dks || !dsnap || !dw.kvc || !dw.ropec) {
+                fprintf(stderr, "OOM for the draft model state\n"); return 1;
+            }
+            dw.mb = w.mb;              /* embed + lm_head are the same tensors */
+            dw.trunk = &trunk_d;
+            dw.n_bound = w.n_bound;
+            dw.mla_slot = w.mla_slot;  /* read-only map, safely shared */
+            dw.n_mla = w.n_mla;
+            dw.kv_cap = w.kv_cap;
+            dw.cached = 0;
+            dw.draft_mode = 1;   /* cache-only routing: draft tokens read no new experts */
+            printf("hybrid decode: draft trunk %s (%.1f GB budget) proposes up to %d "
+                   "tokens per sweep;\n               the exact model verifies every one "
+                   "before it is emitted\n\n", draft_dir, draft_gb, spec_n);
+        }
+    }
+
+    /* --tf-check: teacher-forced agreement over the whole --ids sequence in ONE sweep.
+     * Prediction i is the argmax after positions 0..i; it is compared to the id the
+     * sequence actually continues with. This is the acceptance rate a draft model
+     * would see under batched greedy verification, measured directly, and it is the
+     * one number a quantized-draft design stands on. Free-running comparisons cannot
+     * measure it: a single early divergence changes every later context. */
+    if (tf_check) {
+        if (np < 2) { fprintf(stderr, "--tf-check needs at least 2 ids\n"); return 2; }
+        int *arg = (int *)malloc((size_t)np * sizeof(int));
+        if (!arg) { fprintf(stderr, "OOM for --tf-check\n"); return 1; }
+        const double t0c = now_s();
+        if (forward(&w, &c, &cache, seq, np, lg, sc, h, br, ks, arg) != 0) {
+            fprintf(stderr, "forward failed in --tf-check\n");
+            return 1;
+        }
+        int match = 0;
+        for (int i = 0; i + 1 < np; i++) match += (arg[i] == seq[i + 1]);
+        printf("teacher-forced agreement: %d/%d positions (%.1f%%) in %.1f s\n",
+               match, np - 1, 100.0 * match / (np - 1), now_s() - t0c);
+        printf("  per-position (p=predicted a=actual): ");
+        for (int i = 0; i + 1 < np; i++)
+            if (arg[i] != seq[i + 1])
+                printf("[%d p=%d a=%d] ", i, arg[i], seq[i + 1]);
+        printf("\n");
+        FILE *tf = fopen(outp, "w");
+        if (tf) {
+            fprintf(tf, "{\"tf_positions\":%d,\"tf_matches\":%d,\"tf_agreement\":%.4f}\n",
+                    np - 1, match, (double)match / (np - 1));
+            fclose(tf);
+        }
+        free(arg);
+        return 0;
     }
 
     printf("%-6s %-10s %-12s %-10s %-10s %s\n",
@@ -757,25 +1190,128 @@ int main(int argc, char **argv)
      * figure against a single step would misstate the I/O share. */
     double expert_s_total = 0.0, expert_gb_total = 0.0;
     uint64_t expert_reqs_total = 0, expert_evict_total = 0;
-    for (int g = 0; g < gen; g++) {
+    for (int g = 0; nout < gen; g++) {
         k3_cache_reset_stats(&cache);
         const double ts = now_s();
         int frc;
-        if (incremental) {
-            /* step 0 feeds the whole prompt; later steps feed only the new token */
+        int emit[K3_SPEC_MAX + 1];
+        int emitn = 0;
+        if (incremental && g == 0) {
+            /* Step 0 feeds everything not yet consumed: the whole prompt on a fresh
+             * run, and on a resume the carried pending token PLUS the new prompt.
+             * T - base covers both exactly; feeding np here instead dropped the last
+             * new token from a resumed batch, and the first generated token then came
+             * from a context one token short: fluent, plausible, and wrong. */
             const int base = w.cached;
-            const int nT   = (g == 0) ? np : 1;
-            frc = forward(&w, &c, &cache, seq + base, nT, lg, sc, h, br, ks);
-            w.cached = base + nT;
+            const int nT0 = T - base;
+            frc = forward(&w, &c, &cache, seq + base, nT0, lg, sc, h, br, ks, NULL);
+            if (frc == 0) { w.cached = base + nT0; emit[emitn++] = argmax_(lg, c.vocab); }
+            /* The draft model must absorb the same context, or its first proposals
+             * come from a shorter one; one draft sweep, paid once. Saved state does
+             * not include the draft's, so a resumed run replays the WHOLE sequence
+             * through the draft once; correctness never depends on this, only
+             * acceptance does. */
+            if (dw.trunk && frc == 0) {
+                const int db = load_state ? 0 : base;
+                if (forward(&dw, &c, &cache, seq + db, base + nT0 - db, lg, sc, h, br,
+                            dks, NULL) == 0)
+                    dw.cached = base + nT0;
+                else frc = -1;
+            }
+        } else if (incremental) {
+            const int base = w.cached;
+            int d[K3_SPEC_MAX], nd = 0;
+            if (spec_snap && T + spec_n + 1 < Tmax && base + spec_n + 1 <= w.kv_cap) {
+                if (dw.trunk) {
+                    /* The draft model proposes: k sequential one-token steps through
+                     * the draft trunk, chaining its own argmax. Its state is
+                     * snapshotted first so a partial acceptance can rewind it the
+                     * same way the exact side rewinds. */
+                    memcpy(dsnap, dks, kper_f * (size_t)w.n_bound * sizeof(float));
+                    int prev = seq[base];
+                    while (nd < spec_n) {
+                        if (forward(&dw, &c, &cache, &prev, 1, lg, sc, h, br,
+                                    dks, NULL) != 0) break;
+                        dw.cached += 1;
+                        prev = argmax_(lg, c.vocab);
+                        d[nd++] = prev;
+                    }
+                    hyb_rounds  += 1;
+                    hyb_drafted += nd;
+                } else {
+                    nd = spec_draft(seq, T, spec_n, d);
+                }
+            }
+            if (nd > 0) {
+                /* One sweep verifies the pending token plus nd drafts. arg[i] is the
+                 * model's own next token after batch position i; the accepted prefix is
+                 * exactly what serial decode would have emitted, and arg[m] after it is
+                 * clean because its context contains only accepted tokens. */
+                int arg[K3_SPEC_MAX + 1];
+                memcpy(spec_snap, ks, kper_f * (size_t)w.n_bound * sizeof(float));
+                for (int i = 0; i < nd; i++) seq[T + i] = d[i];
+                frc = forward(&w, &c, &cache, seq + base, nd + 1, lg, sc, h, br, ks, arg);
+                if (frc == 0) {
+                    int m = 0;
+                    while (m < nd && arg[m] == d[m]) m++;
+                    if (m == nd) {
+                        /* every fed position had true context; state is exact */
+                        w.cached = base + nd + 1;
+                    } else {
+                        /* the recurrent state absorbed rejected tokens: restore, then
+                         * replay only the accepted prefix. The replay also rewrites the
+                         * KV rows those positions touched, so nothing stale survives. */
+                        memcpy(ks, spec_snap, kper_f * (size_t)w.n_bound * sizeof(float));
+                        w.cached = base;
+                        frc = forward(&w, &c, &cache, seq + base, m + 1, lg, sc, h, br,
+                                      ks, NULL);
+                        if (frc == 0) w.cached = base + m + 1;
+                    }
+                    /* Resync the draft model to the ACCEPTED sequence. On full
+                     * acceptance its state already contains every fed token except
+                     * the last draft, so one step closes the gap; on partial
+                     * acceptance it rewinds to its snapshot and replays only the
+                     * accepted prefix, mirroring the exact side. */
+                    if (dw.trunk && frc == 0) {
+                        hyb_accepted += m;
+                        if (m == nd) {
+                            int last = d[nd - 1];
+                            if (forward(&dw, &c, &cache, &last, 1, lg, sc, h, br,
+                                        dks, NULL) == 0) dw.cached += 1;
+                            else frc = -1;
+                        } else {
+                            memcpy(dks, dsnap, kper_f * (size_t)w.n_bound * sizeof(float));
+                            dw.cached = base;
+                            if (forward(&dw, &c, &cache, seq + base, m + 1, lg, sc,
+                                        h, br, dks, NULL) == 0) dw.cached = base + m + 1;
+                            else frc = -1;
+                        }
+                    }
+                    if (frc == 0) {
+                        for (int i = 0; i < m; i++) emit[emitn++] = d[i];
+                        emit[emitn++] = arg[m];
+                    }
+                }
+            } else {
+                frc = forward(&w, &c, &cache, seq + base, 1, lg, sc, h, br, ks, NULL);
+                if (frc == 0) { w.cached = base + 1; emit[emitn++] = argmax_(lg, c.vocab); }
+                /* keep the draft in lockstep through non-drafted steps */
+                if (dw.trunk && frc == 0) {
+                    if (forward(&dw, &c, &cache, seq + base, 1, lg, sc, h, br,
+                                dks, NULL) == 0) dw.cached = base + 1;
+                    else frc = -1;
+                }
+            }
         } else {
-            frc = forward(&w, &c, &cache, seq, T, lg, sc, h, br, ks);
+            frc = forward(&w, &c, &cache, seq, T, lg, sc, h, br, ks, NULL);
+            if (frc == 0) emit[emitn++] = argmax_(lg, c.vocab);
         }
         /* Abort the run rather than argmax a buffer the forward never wrote. */
-        if (frc != 0) {
+        if (frc != 0 || emitn == 0) {
             fprintf(stderr, "forward pass failed at generation step %d; aborting.\n", g);
             return 1;
         }
-        const int nxt = argmax_(lg, c.vocab);
+        const int nxt = emit[emitn - 1];
         /* Dump the FIRST step's logits as raw float32 bits.
          * Comparing generated tokens against a reference only compares argmax, which
          * hides near-ties: two engines can agree on every token while disagreeing
@@ -805,10 +1341,42 @@ int main(int argc, char **argv)
         expert_gb_total    += (double)cache.bytes_read / 1e9;
         expert_reqs_total  += cache.hits + cache.misses;
         expert_evict_total += cache.evictions;
-        seq[T++] = nxt;
-        outtok[nout++] = nxt;
+        for (int i = 0; i < emitn && nout < gen && T < Tmax; i++) {
+            seq[T++] = emit[i];
+            outtok[nout++] = emit[i];
+        }
         if (T >= Tmax) break;
     }
+    if (save_state) {
+        if (!incremental) {
+            fprintf(stderr, "--save-state needs --incremental; nothing written\n");
+        } else {
+            const double tsv = now_s();
+            const int64_t kvpp   = (int64_t)c.n_heads * (c.qk_nope + c.v_head);
+            const int64_t ropepp = (int64_t)c.qk_rope;
+            if (k3_state_save(save_state, &c, seq, T, ks, w.kvc, w.ropec,
+                              w.n_bound, w.n_mla, w.kv_cap, w.cached,
+                              (int64_t)kper, kvpp, ropepp) == 0) {
+                const double bytes = (double)sizeof(K3StateHdr) + (double)T * sizeof(int)
+                    + (double)kper * w.n_bound * sizeof(float)
+                    + (double)w.cached * (kvpp + ropepp) * w.n_mla * sizeof(float);
+                char sb[32]; human(bytes, sb, sizeof sb);
+                printf("wrote %s (%s, %d positions) in %.2f s\n",
+                       save_state, sb, w.cached, now_s() - tsv);
+            }
+        }
+    }
+
+    if (dw.trunk && hyb_rounds > 0) {
+        printf("\nhybrid decode: %ld rounds, %ld drafted, %ld accepted (%.1f%%), "
+               "mean accepted run %.2f\n",
+               hyb_rounds, hyb_drafted, hyb_accepted,
+               hyb_drafted ? 100.0 * hyb_accepted / hyb_drafted : 0.0,
+               (double)hyb_accepted / hyb_rounds);
+        k3_trunk_close(&trunk_d);
+        free(dw.lay); free(dks); free(dsnap); free(dw.kvc); free(dw.ropec);
+    }
+    free(spec_snap);
     printf("--------------------------------------------------------------------\n");
     printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total, t_total / nout);
 

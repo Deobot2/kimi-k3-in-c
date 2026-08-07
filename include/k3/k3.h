@@ -262,7 +262,12 @@ void k3_attn_res(float *out, const float *src, const float *fold,
  * A weight matrix is therefore a tagged pointer. K3_WF32 is zero, so a struct that has
  * been memset keeps the fp32 behaviour every existing fixture and the oracle rely on.
  */
-enum { K3_WF32 = 0, K3_WBF16 = 1 };
+/* K3_WI8 is a per-row int8 weight matrix used ONLY by the hybrid draft model, whose job
+ * is to propose tokens that the exact bf16 model then verifies. Its output is therefore
+ * never emitted directly and it carries no exactness contract, which is what lets it use
+ * a fast, non-deterministic kernel. Each row is stored inline as [f32 scale][int8 * in],
+ * so a matrix stays a single tagged pointer. Never tagged on the exact model. */
+enum { K3_WF32 = 0, K3_WBF16 = 1, K3_WI8 = 2 };
 
 /* bf16 -> f32 is a pure left shift: bf16 IS the top 16 bits of an f32. No rounding,
  * no table, no exponent rebias. */
@@ -275,17 +280,27 @@ static inline float k3_bf16f(uint16_t h)
 
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out);
 
+/* Per-row int8 matmul for the draft model. W is `out` rows of [f32 scale][int8 * in].
+ * No determinism contract (see K3_WI8): uses the fastest AVX2 form available. */
+void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out);
+
 /* The one call every trunk matmul goes through. Dispatch is a predictable branch on a
  * per-layer flag, outside the inner loops, so it costs nothing measurable. */
 static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
                           int in, int out)
 {
-    if (wdt == K3_WBF16) k3_matmul_bf16(y, x, (const uint16_t *)W, in, out);
-    else                 k3_matmul(y, x, (const float *)W, in, out);
+    if (wdt == K3_WBF16)     k3_matmul_bf16(y, x, (const uint16_t *)W, in, out);
+    else if (wdt == K3_WI8)  k3_matmul_q8(y, x, W, in, out);
+    else                     k3_matmul(y, x, (const float *)W, in, out);
 }
 
-/* Byte stride of one weight element, for pointer arithmetic on tagged matrices. */
+/* Byte stride of one row for a per-row int8 matrix: the f32 scale plus `in` int8 weights.
+ * bf16 and fp32 are per-element and take the element form. */
 static inline size_t k3_wsz(int wdt) { return wdt == K3_WBF16 ? 2u : 4u; }
+static inline size_t k3_row_bytes(int wdt, int in)
+{
+    return wdt == K3_WI8 ? (size_t)4 + (size_t)in : (size_t)in * k3_wsz(wdt);
+}
 
 /* ZERO-INITIALISE EVERY WEIGHT STRUCT BEFORE FILLING IT. K3MoeW holds an optional
  * expert source, which is a function pointer; K3LayerW and K3MlaW hold pointers whose
@@ -332,6 +347,10 @@ typedef struct K3ExpertSrc {
      * ZERO THIS FIELD. It is a function pointer in a struct that callers build on the
      * stack; an uninitialised one is a jump to garbage. See the warning below. */
     int (*getmany)(struct K3ExpertSrc *self, int layer, const int *experts, int n);
+    /* OPTIONAL: 1 if the expert is already resident (get() would read no disk), filling
+     * out when non-NULL. The draft model's cache-only routing uses this to propose tokens
+     * with zero expert I/O. May be NULL; callers must cope. */
+    int (*resident)(struct K3ExpertSrc *self, int layer, int expert, K3ExpertQ *out);
     void *ctx;
 } K3ExpertSrc;
 
@@ -353,6 +372,11 @@ typedef struct {
      * zero, so every existing caller keeps the resident path unchanged. */
     struct K3ExpertSrc *src;
     int          layer;
+    /* Draft-only: when 1, route among ONLY the experts already resident in the cache and
+     * renormalise the combining weights over them, so a draft token reads zero new expert
+     * bytes. Never set on the exact model, whose output is authoritative; the draft merely
+     * proposes and the exact model verifies. */
+    int          cache_only;
 } K3MoeW;
 
 size_t k3_moe_scratch(const K3Cfg *c);
@@ -393,6 +417,13 @@ extern long k3_expert_drops;
 /* idx and wt must each hold topk entries. */
 void   k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
               int T, int *idx, float *wt, float *scratch);
+
+/* Batched MoE for prefill over a chunk of T tokens: fetches each unique routed expert
+ * from disk ONCE and reuses it across the chunk, cutting prefill expert I/O ~3-4x, with
+ * per-token output bit-identical to k3_moe. Streamed source only (w->src != NULL); falls
+ * back to k3_moe for the resident path or T <= 1. */
+void   k3_moe_prefill(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
+                      int T, int *idx, float *wt, float *scratch);
 
 /* Kimi Delta Attention, one full layer, one sequence, no cache.
  * Verified against modeling_kimi_linear.py:543-663 and fla/ops/kda/naive.py.

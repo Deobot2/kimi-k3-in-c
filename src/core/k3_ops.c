@@ -247,16 +247,23 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
 #endif
     for (int o = 0; o < out; o++) {
         const float *row = W + (size_t)o * in;
-        double a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+        /* Sixteen accumulators, EXPLICITLY fused products. fma() in double is the
+         * same IEEE operation as _mm256_fmadd_pd per lane, so the scalar and vector
+         * paths stay bit-identical while the dependent-add latency chain that made
+         * one accumulator ~10x slower than the machine's floor disappears. The
+         * reduction pairs lanes exactly the way the vector path's (v0+v1)+(v2+v3)
+         * then cross-lane tree does; change one and you must change the other. */
+        double a[16] = {0};
         int i = 0;
-        for (; i + 3 < in; i += 4) {
-            a0 += (double)row[i    ] * (double)x[i    ];
-            a1 += (double)row[i + 1] * (double)x[i + 1];
-            a2 += (double)row[i + 2] * (double)x[i + 2];
-            a3 += (double)row[i + 3] * (double)x[i + 3];
-        }
-        double acc = (a0 + a1) + (a2 + a3);
-        for (; i < in; i++) acc += (double)row[i] * (double)x[i];
+        for (; i + 15 < in; i += 16)
+            for (int l = 0; l < 16; l++)
+                a[l] = fma((double)row[i + l], (double)x[i + l], a[l]);
+        double b0 = (a[0] + a[4]) + (a[8]  + a[12]);
+        double b1 = (a[1] + a[5]) + (a[9]  + a[13]);
+        double b2 = (a[2] + a[6]) + (a[10] + a[14]);
+        double b3 = (a[3] + a[7]) + (a[11] + a[15]);
+        double acc = (b0 + b1) + (b2 + b3);
+        for (; i < in; i++) acc = fma((double)row[i], (double)x[i], acc);
         y[o] = (float)acc;
     }
 }
@@ -547,6 +554,22 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
         k3_router(idx, wt, xt, w->gate, w->bias, E, c->n_experts, c->topk,
                   c->moe_renorm, c->routed_scale);
 
+        int nk = c->topk;
+        /* Draft cache-only routing: keep only the top-k experts already resident, and
+         * renormalise their weights so the mixture still sums as intended. This makes a
+         * draft token read ZERO new expert bytes. It is an approximation, which is exactly
+         * what a draft is; the exact model verifies every proposed token. */
+        if (w->cache_only && w->src && w->src->resident) {
+            int m = 0; float wsum = 0.0f;
+            for (int j = 0; j < c->topk; j++) {
+                if (w->src->resident(w->src, w->layer, idx[j], NULL)) {
+                    idx[m] = idx[j]; wt[m] = wt[j]; wsum += wt[j]; m++;
+                }
+            }
+            nk = m;
+            if (wsum > 0.0f) for (int j = 0; j < nk; j++) wt[j] /= wsum;
+        }
+
         /* 2. down-project into the latent space */
         k3_mmw(z, xt, w->down, w->wdt, E, L);
 
@@ -557,20 +580,24 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
          * again: a queue depth of one against a drive that needs depth to reach its
          * rated bandwidth. getmany is optional and may be NULL, in which case nothing
          * changes and the loop reads them one at a time exactly as before. */
-        if (w->src && w->src->getmany) w->src->getmany(w->src, w->layer, idx, c->topk);
-        for (int j = 0; j < c->topk; j++) {
+        if (!w->cache_only && w->src && w->src->getmany)
+            w->src->getmany(w->src, w->layer, idx, nk);
+        for (int j = 0; j < nk; j++) {
             if (w->src) {
-                /* Streamed: the expert stays MXFP4 and the matmul reads nibbles. */
+                /* Streamed: the expert stays MXFP4 and the matmul reads nibbles. In
+                 * cache-only mode every idx[j] is known resident, so resident() serves it
+                 * with no disk read; otherwise get() may read it. */
                 K3ExpertQ q;
-                if (w->src->get(w->src, w->layer, idx[j], &q) != 0) {
-                    /* Never drop an expert silently. A bare `continue` here is
-                     * invisible from the outside: one transient short read or EIO
-                     * leaves this token's routed output missing 1/16 of its weighted
-                     * sum, the run completes, prints a plausible token, and reports
-                     * success. Wrong output that looks right is the worst failure this
-                     * engine can produce, so the drop is counted in the global
-                     * k3_expert_drops and every caller MUST fail the run on a non-zero
-                     * count (src/cli/k3_run.c does; see docs/API.md). */
+                int miss = w->cache_only
+                    ? !w->src->resident(w->src, w->layer, idx[j], &q)
+                    : (w->src->get(w->src, w->layer, idx[j], &q) != 0);
+                if (miss) {
+                    /* A cache-only draft filtered to resident experts already, so a miss
+                     * here is a benign race at worst; skip it, since the draft is
+                     * approximate by construction and the exact model verifies. On the
+                     * exact path a miss is the unacceptable silent-corruption case: count
+                     * it in k3_expert_drops so the caller fails the run (see docs/API.md). */
+                    if (w->cache_only) continue;
                     k3_expert_drops++;
                     fprintf(stderr, "EXPERT DROP: layer %d expert %d failed to load; "
                                     "this token is CORRUPT\n", w->layer, idx[j]);
@@ -614,6 +641,148 @@ size_t k3_moe_scratch(const K3Cfg *c)
          + (size_t)c->latent              /* edn                */
          + (size_t)3 * SI                 /* sgu (2*SI) + sact  */
          + (size_t)c->hidden;             /* sdn                */
+}
+
+/* Batched MoE for PREFILL over a chunk of T tokens, streamed experts only.
+ *
+ * k3_moe walks the top-k for each token independently, so across a T-token chunk it
+ * fetches an expert once per token that routes to it. Under near-uniform routing that is
+ * mostly waste: measured on the released trace, a 32-token chunk touches only ~2.7x fewer
+ * unique experts than 16*32 draws, so reading each unique expert ONCE and reusing it for
+ * every token in the chunk cuts prefill expert bytes ~3-4x. Prefill is where that matters,
+ * because decode feeds one token at a time and has nothing to batch.
+ *
+ * Exactness is preserved to the last bit. Per token the arithmetic is identical to
+ * k3_moe: the routed latent contributions are accumulated in the ORIGINAL top-k order
+ * (j = 0..k-1) from a per-(token, slot) buffer, then normalised, up-projected and given
+ * the shared expert exactly as before. Only the ORDER in which experts are fetched from
+ * disk changes, and that touches no floating-point result.
+ *
+ * out/x are [T][E], idx/wt scratch are topk-wide (reused per token), scratch is one
+ * k3_moe_scratch. This path requires w->src (streamed); the resident path stays on
+ * k3_moe, which is what the oracle gates exercise. */
+static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
+                              const K3Cfg *c, int T, float *scratch);
+
+void k3_moe_prefill(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
+                    int T, int *idx, float *wt, float *scratch)
+{
+    /* K3_NO_BATCH_PREFILL forces the per-token path, so one binary can produce both the
+     * batched and the reference token streams for a bit-identity A/B. */
+    static int no_batch = -1;
+    if (no_batch < 0) no_batch = getenv("K3_NO_BATCH_PREFILL") ? 1 : 0;
+    /* cache_only renormalises per token over the resident subset, which the per-token
+     * path already does; the draft's prompt prefill is one-time, so defer rather than
+     * duplicate the renorm in the batch. */
+    if (!w->src || T <= 1 || no_batch || w->cache_only) {
+        k3_moe(out, x, w, c, T, idx, wt, scratch);
+        return;
+    }
+    /* Fixed sub-chunks bound the contribution buffer (14.7 MB at 64 tokens) no matter
+     * how long the prompt is; a 32k prefill would otherwise want 7.3 GB of it. Most of
+     * the dedup is already captured at this width: the unique-expert count grows far
+     * slower than the request count under near-uniform routing. */
+    const int CHUNK = 64;
+    for (int t0 = 0; t0 < T; t0 += CHUNK) {
+        const int n = (T - t0) < CHUNK ? (T - t0) : CHUNK;
+        if (n == 1) { k3_moe(out + (size_t)t0 * c->hidden, x + (size_t)t0 * c->hidden,
+                             w, c, 1, idx, wt, scratch); continue; }
+        moe_prefill_chunk(out + (size_t)t0 * c->hidden, x + (size_t)t0 * c->hidden,
+                          w, c, n, scratch);
+    }
+}
+
+static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
+                              const K3Cfg *c, int T, float *scratch)
+{
+    const int E = c->hidden, Ll = c->latent, I = c->moe_inter;
+    const int SI = I * c->n_shared, K = c->topk;
+
+    /* Per-token routing decisions and latent inputs, plus a contribution buffer holding
+     * every routed expert's latent output for every token: [T][K][Ll]. At T=32, K=16,
+     * Ll=3584 that is ~7.3 MB, trivial beside the tens of GB already reserved. */
+    int   *ridx = (int *)  malloc((size_t)T * K * sizeof(int));
+    float *rwt  = (float *)malloc((size_t)T * K * sizeof(float));
+    float *zz   = (float *)malloc((size_t)T * Ll * sizeof(float));
+    float *contrib = (float *)malloc((size_t)T * K * Ll * sizeof(float));
+    if (!ridx || !rwt || !zz || !contrib)
+        k3_fatal_oom("MoE prefill batch", (size_t)T * K * Ll * sizeof(float));
+
+    /* 1. route every token and down-project it, and collect the batch's unique experts. */
+    int  *uniq = (int *)malloc((size_t)T * K * sizeof(int));
+    char *seen = (char *)calloc((size_t)c->n_experts, 1);
+    if (!uniq || !seen) k3_fatal_oom("MoE prefill index", (size_t)c->n_experts);
+    int nu = 0;
+    for (int t = 0; t < T; t++) {
+        const float *xt = x + (size_t)t * E;
+        int   *it = ridx + (size_t)t * K;
+        float *wtt = rwt + (size_t)t * K;
+        k3_router(it, wtt, xt, w->gate, w->bias, E, c->n_experts, K,
+                  c->moe_renorm, c->routed_scale);
+        k3_mmw(zz + (size_t)t * Ll, xt, w->down, w->wdt, E, Ll);
+        for (int j = 0; j < K; j++) {
+            const int e = it[j];
+            if (e >= 0 && e < c->n_experts && !seen[e]) { seen[e] = 1; uniq[nu++] = e; }
+        }
+    }
+
+    /* 2. expert-major: fetch each unique expert ONCE, apply it to every (token, slot)
+     * that selected it. gu/act/edn are reused per (expert, token). */
+    float *gu  = scratch;                 /* [2*I] */
+    float *act = gu + 2 * I;              /* [I]   */
+    float *edn = act + I;                 /* [Ll]  */
+    if (w->src->getmany) w->src->getmany(w->src, w->layer, uniq, nu);
+    for (int u = 0; u < nu; u++) {
+        const int e = uniq[u];
+        K3ExpertQ q;
+        if (w->src->get(w->src, w->layer, e, &q) != 0) {
+            k3_expert_drops++;
+            fprintf(stderr, "EXPERT DROP: layer %d expert %d failed to load; "
+                            "this chunk is CORRUPT\n", w->layer, e);
+            continue;
+        }
+        for (int t = 0; t < T; t++) {
+            const int   *it = ridx + (size_t)t * K;
+            const float *zt = zz  + (size_t)t * Ll;
+            for (int j = 0; j < K; j++) {
+                if (it[j] != e) continue;
+                k3_matmul_mxfp4(gu,     zt, q.p1, q.s1, Ll, I, K3_MXFP4_GROUP);
+                k3_matmul_mxfp4(gu + I, zt, q.p3, q.s3, Ll, I, K3_MXFP4_GROUP);
+                k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
+                k3_matmul_mxfp4(edn, act, q.p2, q.s2, I, Ll, K3_MXFP4_GROUP);
+                memcpy(contrib + ((size_t)t * K + j) * Ll, edn, (size_t)Ll * sizeof(float));
+            }
+        }
+    }
+
+    /* 3. per token, sum contributions in the ORIGINAL top-k order, then the tail of the
+     * MoE exactly as k3_moe does it, so every float matches the per-token path. */
+    for (int t = 0; t < T; t++) {
+        const float *xt = x + (size_t)t * E;
+        float *ot = out + (size_t)t * E;
+        const float *wtt = rwt + (size_t)t * K;
+        /* Reuse this token's now-dead down-projection slot as the aggregate. */
+        float *acc = zz + (size_t)t * Ll;
+        for (int i = 0; i < Ll; i++) acc[i] = 0.0f;
+        for (int j = 0; j < K; j++) {
+            const float wj = wtt[j];
+            const float *cb = contrib + ((size_t)t * K + j) * Ll;
+            for (int i = 0; i < Ll; i++) acc[i] += wj * cb[i];
+        }
+        if (c->latent_norm) k3_rmsnorm(acc, acc, w->latent_norm, Ll, c->rms_eps);
+        k3_mmw(ot, acc, w->up, w->wdt, Ll, E);
+
+        float *sgu  = gu;                 /* [2*SI] */
+        float *sact = sgu + 2 * SI;       /* [SI]   */
+        float *sdn  = sact + SI;          /* [E]    */
+        k3_mmw(sgu,      xt, w->sh1, w->wdt, E, SI);
+        k3_mmw(sgu + SI, xt, w->sh3, w->wdt, E, SI);
+        k3_situ_glu(sact, sgu, SI, c->situ_b1, c->situ_b2);
+        k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
+        for (int i = 0; i < E; i++) ot[i] += sdn[i];
+    }
+
+    free(ridx); free(rwt); free(zz); free(contrib); free(uniq); free(seen);
 }
 
 /* --------------------------------------------------------- KDA full layer ---- */
@@ -694,13 +863,26 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
         S = Sown;
     }
     const float qscale = 1.0f / sqrtf((float)D);
-    for (int t = 0; t < T; t++)
-        for (int h = 0; h < H; h++) {
+    /* Heads are independent: each reads and writes only its own S block, its own D-wide
+     * slice of q/k/v/al/o, and its own beta column. The recurrence is sequential in t
+     * WITHIN a head, so the loops nest head-outer here and each head walks its own t in
+     * order; per-head arithmetic is untouched and the results are bit-identical to the
+     * serial form (gated by test_ops' kda fixtures under 1 vs N threads). The recurrence
+     * is 0.4% of FLOPs but, serial, it is a majority of non-matmul wall time at high
+     * core counts. wr is a full P-wide work row, so wr + h*D gives each head a private
+     * slice with no new allocation. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int h = 0; h < H; h++) {
+        float *wh = wr + (size_t)h * D;
+        for (int t = 0; t < T; t++) {
             const size_t off = (size_t)t * P + (size_t)h * D;
-            for (int i = 0; i < D; i++) wr[i] = q[off + i] * qscale;
-            k3_kda_step(S + (size_t)h * D * D, o + off, wr, k + off, v + off,
+            for (int i = 0; i < D; i++) wh[i] = q[off + i] * qscale;
+            k3_kda_step(S + (size_t)h * D * D, o + off, wh, k + off, v + off,
                         al + off, bt[(size_t)t * H + h], D, D);
         }
+    }
 
     /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection */
     for (int t = 0; t < T; t++) {
@@ -814,7 +996,10 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
 
     if (w->moe) {
         int   idx[K3_MAX_TOPK]; float wt[K3_MAX_TOPK];
-        k3_moe(tmp, hin, w->moe, c, T, idx, wt, sub);
+        /* Prefill batches (T > 1, streamed source) fetch each unique expert once for
+         * the whole chunk; decode (T == 1) and the resident path fall straight through
+         * to k3_moe inside, byte-identical. */
+        k3_moe_prefill(tmp, hin, w->moe, c, T, idx, wt, sub);
     } else {
         for (int t = 0; t < T; t++) {
             k3_mmw(dgu, hin + (size_t)t * E, w->dense_gate, w->wdt, E, c->dense_inter);
@@ -889,34 +1074,111 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
         double acc;
 #if defined(__AVX2__)
         {
-            __m256d v = _mm256_setzero_pd();
-            for (; i + 3 < in; i += 4) {
-                /* bf16 -> f32 is a 16-bit left shift, so widen the four u16 to u32,
-                 * shift, and reinterpret. No table, no rounding. */
-                const __m128i h  = _mm_loadl_epi64((const __m128i *)(row + i));
-                const __m128i b32 = _mm_slli_epi32(_mm_cvtepu16_epi32(h), 16);
-                const __m256d wd = _mm256_cvtps_pd(_mm_castsi128_ps(b32));
-                const __m256d xd = _mm256_cvtps_pd(_mm_loadu_ps(x + i));
-                v = _mm256_add_pd(v, _mm256_mul_pd(wd, xd));   /* NOT fmadd: see above */
+            /* Four vector accumulators, fused. _mm256_fmadd_pd per lane is the same
+             * IEEE operation as scalar fma() in double, and the reduction below is
+             * lane-for-lane the tree k3_matmul's sixteen scalar accumulators use, so
+             * the two kernels remain BITWISE identical (test_ops asserts it). The old
+             * one-accumulator mul+add form serialized on add latency at 4 elements
+             * per ~4 cycles; this runs the memory-bound side of the roof instead. */
+            __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
+            __m256d v2 = _mm256_setzero_pd(), v3 = _mm256_setzero_pd();
+            for (; i + 15 < in; i += 16) {
+                /* bf16 -> f32 is a 16-bit left shift, so widen u16 to u32, shift,
+                 * and reinterpret. No table, no rounding. */
+                const __m128i h0 = _mm_loadl_epi64((const __m128i *)(row + i));
+                const __m128i h1 = _mm_loadl_epi64((const __m128i *)(row + i + 4));
+                const __m128i h2 = _mm_loadl_epi64((const __m128i *)(row + i + 8));
+                const __m128i h3 = _mm_loadl_epi64((const __m128i *)(row + i + 12));
+                v0 = _mm256_fmadd_pd(
+                    _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h0), 16))),
+                    _mm256_cvtps_pd(_mm_loadu_ps(x + i)), v0);
+                v1 = _mm256_fmadd_pd(
+                    _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h1), 16))),
+                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 4)), v1);
+                v2 = _mm256_fmadd_pd(
+                    _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h2), 16))),
+                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 8)), v2);
+                v3 = _mm256_fmadd_pd(
+                    _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h3), 16))),
+                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 12)), v3);
             }
+            /* (v0+v1)+(v2+v3) lanewise, then the same cross-lane pairing as scalar */
+            const __m256d vt = _mm256_add_pd(_mm256_add_pd(v0, v1),
+                                             _mm256_add_pd(v2, v3));
             double a[4];
-            _mm256_storeu_pd(a, v);
+            _mm256_storeu_pd(a, vt);
             acc = (a[0] + a[1]) + (a[2] + a[3]);
         }
 #else
         {
-            double a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+            double a[16] = {0};
+            for (; i + 15 < in; i += 16)
+                for (int l = 0; l < 16; l++)
+                    a[l] = fma((double)k3_bf16f(row[i + l]), (double)x[i + l], a[l]);
+            double b0 = (a[0] + a[4]) + (a[8]  + a[12]);
+            double b1 = (a[1] + a[5]) + (a[9]  + a[13]);
+            double b2 = (a[2] + a[6]) + (a[10] + a[14]);
+            double b3 = (a[3] + a[7]) + (a[11] + a[15]);
+            acc = (b0 + b1) + (b2 + b3);
+        }
+#endif
+        for (; i < in; i++) acc = fma((double)k3_bf16f(row[i]), (double)x[i], acc);
+        y[o] = (float)acc;
+    }
+}
+
+/* Per-row int8 matmul for the draft model: each row is [f32 scale][int8 * in]. The int8
+ * weights are widened to float, dotted with the fp32 activation, and the row's scale is
+ * applied once at the end. Unlike the trunk kernels this carries NO cross-path
+ * determinism contract (K3_WI8 is draft-only, and the exact model decides every emitted
+ * token), so it accumulates in float with fused products and the natural AVX2 reduction,
+ * which is what makes it fast. */
+void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
+{
+    const unsigned char *base = (const unsigned char *)W;
+    const size_t rowb = (size_t)4 + (size_t)in;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out > 64)
+#endif
+    for (int o = 0; o < out; o++) {
+        const unsigned char *row = base + (size_t)o * rowb;
+        float scale;
+        memcpy(&scale, row, 4);
+        const int8_t *w = (const int8_t *)(row + 4);
+        int i = 0;
+        float acc;
+#if defined(__AVX2__)
+        {
+            __m256 v0 = _mm256_setzero_ps(), v1 = _mm256_setzero_ps();
+            for (; i + 15 < in; i += 16) {
+                const __m128i b0 = _mm_loadl_epi64((const __m128i *)(w + i));
+                const __m128i b1 = _mm_loadl_epi64((const __m128i *)(w + i + 8));
+                v0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b0)),
+                                     _mm256_loadu_ps(x + i), v0);
+                v1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b1)),
+                                     _mm256_loadu_ps(x + i + 8), v1);
+            }
+            __m256 vs = _mm256_add_ps(v0, v1);
+            __m128 lo = _mm_add_ps(_mm256_castps256_ps128(vs),
+                                   _mm256_extractf128_ps(vs, 1));
+            lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+            lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 1));
+            acc = _mm_cvtss_f32(lo);
+        }
+#else
+        {
+            float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
             for (; i + 3 < in; i += 4) {
-                a0 += (double)k3_bf16f(row[i    ]) * (double)x[i    ];
-                a1 += (double)k3_bf16f(row[i + 1]) * (double)x[i + 1];
-                a2 += (double)k3_bf16f(row[i + 2]) * (double)x[i + 2];
-                a3 += (double)k3_bf16f(row[i + 3]) * (double)x[i + 3];
+                a0 += (float)w[i]     * x[i];
+                a1 += (float)w[i + 1] * x[i + 1];
+                a2 += (float)w[i + 2] * x[i + 2];
+                a3 += (float)w[i + 3] * x[i + 3];
             }
             acc = (a0 + a1) + (a2 + a3);
         }
 #endif
-        for (; i < in; i++) acc += (double)k3_bf16f(row[i]) * (double)x[i];
-        y[o] = (float)acc;
+        for (; i < in; i++) acc += (float)w[i] * x[i];
+        y[o] = acc * scale;
     }
 }
 
@@ -1027,30 +1289,39 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
              *
              * The lane split changes the summation order. See the accuracy contract on
              * the function above for why that is bounded at ~1e-16 relative. */
-            double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+            /* Two fused vector accumulators over the 32-element group, element i to
+             * accumulator (i/4)%2, lanewise-summed then cross-lane paired; the scalar
+             * path is the identical partition with fma(), which is the same IEEE
+             * operation, so both paths stay bit-identical. Same reasoning as the
+             * fp32/bf16 kernels above; the group is short, so two accumulators
+             * suffice to break the add-latency chain. */
+            double sub;
             int i = 0;
 #if defined(__AVX2__)
             {
-                __m256d v = _mm256_setzero_pd();
-                for (; i + 3 < n; i += 4) {
-                    const __m256d wd = _mm256_cvtps_pd(_mm_loadu_ps(wf + i));
-                    const __m256d xd = _mm256_cvtps_pd(_mm_loadu_ps(xg + i));
-                    v = _mm256_add_pd(v, _mm256_mul_pd(wd, xd));  /* not fmadd */
+                __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
+                for (; i + 7 < n; i += 8) {
+                    v0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(wf + i)),
+                                         _mm256_cvtps_pd(_mm_loadu_ps(xg + i)), v0);
+                    v1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(wf + i + 4)),
+                                         _mm256_cvtps_pd(_mm_loadu_ps(xg + i + 4)), v1);
                 }
                 double a[4];
-                _mm256_storeu_pd(a, v);
-                s0 = a[0]; s1 = a[1]; s2 = a[2]; s3 = a[3];
+                _mm256_storeu_pd(a, _mm256_add_pd(v0, v1));
+                sub = (a[0] + a[1]) + (a[2] + a[3]);
             }
 #else
-            for (; i + 3 < n; i += 4) {
-                s0 += (double)wf[i    ] * (double)xg[i    ];
-                s1 += (double)wf[i + 1] * (double)xg[i + 1];
-                s2 += (double)wf[i + 2] * (double)xg[i + 2];
-                s3 += (double)wf[i + 3] * (double)xg[i + 3];
+            {
+                double s[8] = {0};
+                for (; i + 7 < n; i += 8)
+                    for (int l = 0; l < 8; l++)
+                        s[l] = fma((double)wf[i + l], (double)xg[i + l], s[l]);
+                double b0 = s[0] + s[4], b1 = s[1] + s[5];
+                double b2 = s[2] + s[6], b3 = s[3] + s[7];
+                sub = (b0 + b1) + (b2 + b3);
             }
 #endif
-            double sub = (s0 + s1) + (s2 + s3);
-            for (; i < n; i++) sub += (double)wf[i] * (double)xg[i];
+            for (; i < n; i++) sub = fma((double)wf[i], (double)xg[i], sub);
             acc += sub * (double)K3_E8M0[sb];
         }
         y[r] = (float)acc;

@@ -11,7 +11,7 @@
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="License"></a>
 <a href="Makefile"><img src="https://img.shields.io/badge/C99-portable-lightgrey?style=flat-square" alt="C99"></a>
 <a href="#requirements"><img src="https://img.shields.io/badge/platform-Linux%20x86--64-lightgrey?style=flat-square" alt="Platform"></a>
-<a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-0.1.0-brightgreen?style=flat-square" alt="Version"></a>
+<a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-1.0.0-brightgreen?style=flat-square" alt="Version"></a>
 </p>
 
 <table>
@@ -23,6 +23,43 @@
 <td align="center"><b>0</b><br><sub>GPUs</sub></td>
 </tr>
 </table>
+
+<p><b>The same 2.78-trillion-parameter model, the same answer, on whatever machine you own.</b><br>More memory only buys speed:</p>
+
+<table>
+<tr>
+<th align="left">the machine you have</th>
+<th align="right">RAM</th>
+<th align="right">time per token</th>
+<th align="left">what is going on</th>
+</tr>
+<tr>
+<td align="left">an ordinary laptop</td>
+<td align="right">8 GB</td>
+<td align="right"><b>26.5 s</b></td>
+<td>the whole model streams off the disk on every step</td>
+</tr>
+<tr>
+<td align="left">a high-end laptop</td>
+<td align="right">32 GB</td>
+<td align="right"><b>24.2 s</b></td>
+<td>some of the model now sits in memory</td>
+</tr>
+<tr>
+<td align="left">a desktop</td>
+<td align="right">64 GB</td>
+<td align="right"><b>19.8 s</b></td>
+<td>more of it sits in memory</td>
+</tr>
+<tr>
+<td align="left">a heavy workstation</td>
+<td align="right">128 GB+</td>
+<td align="right"><b>5.6 s</b></td>
+<td>the model fits entirely in memory, the disk wait is gone</td>
+</tr>
+</table>
+
+<sub>Same short prompt at every size, and the output is <b>byte-identical</b> from the smallest machine to the largest; only the clock changes. One machine, 124 cores, fast NVMe drive: the first three rows still read the model from disk each step, so a slower drive is slower there, while the 128 GB+ row keeps everything in memory and no longer waits on the disk. On that same machine v1.0.0 made the math per token about <b>8&times;</b> lighter, a follow-up question in a chat <b>3.9&times;</b> faster, and long prompts about <b>half</b> as costly. (A token is roughly a short word-piece; the two runnable demos below are the original captures on a slower drive, so their clock reads a little higher.) Full data in <a href="docs/data/">docs/data/</a>.</sub>
 
 <hr>
 
@@ -480,10 +517,10 @@ The boundaries come from the measured ladder, and the doctor keys on `MemAvailab
 than `MemTotal`:
 
 ```bash
-if   [ "$AVAIL_GB" -ge 192 ]; then PRESET=server;      EXPECT="~19-21 s/token"
-elif [ "$AVAIL_GB" -ge  96 ]; then PRESET=workstation; EXPECT="~24 s/token"
-elif [ "$AVAIL_GB" -ge  32 ]; then PRESET=desktop;     EXPECT="~28-31 s/token"
-elif [ "$AVAIL_GB" -ge  10 ]; then PRESET=laptop;      EXPECT="~32 s/token"
+if   [ "$AVAIL_GB" -ge 192 ]; then PRESET=server;      EXPECT="~6 s/token"
+elif [ "$AVAIL_GB" -ge  96 ]; then PRESET=workstation; EXPECT="~6-20 s/token"
+elif [ "$AVAIL_GB" -ge  32 ]; then PRESET=desktop;     EXPECT="~24 s/token"
+elif [ "$AVAIL_GB" -ge  10 ]; then PRESET=laptop;      EXPECT="~27 s/token"
 else PRESET=""; fi
 ```
 
