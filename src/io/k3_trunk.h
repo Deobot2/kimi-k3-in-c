@@ -152,6 +152,15 @@ typedef struct {
     double       load_seconds;
 } K3Trunk;
 
+/* Read ONLY the manifest: total packed bytes, layer count, and whether the weights were
+ * quantised. Cheap -- it parses trunk.json and opens nothing else -- so a caller can size
+ * its budgets against the trunk it is actually about to stream rather than against a
+ * constant. --preset auto uses it, which is the difference between assuming a 108.81 GB
+ * bf16 trunk and noticing a 29.81 GB quantised one that fits entirely in RAM.
+ *
+ * Any out-parameter may be NULL. Returns 0 on success. */
+int  k3_trunk_probe(const char *dir, int64_t *total_bytes, int *n_layers, int *quantised);
+
 /* budget_bytes sizes the slot array. The largest layers are pinned, as many as the
  * budget allows after a small streaming ring. ring_want asks for that many ring slots
  * (0 selects the default of 2); it is a request, and the budget wins. Returns 0. */

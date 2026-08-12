@@ -1,6 +1,7 @@
 /* k3_cache.c - see k3_cache.h. */
 #define _POSIX_C_SOURCE 200809L
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -708,10 +709,41 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
     c->s_head = c->s_tail = c->m_head = c->m_tail = -1;
     c->free_head = -1;
     for (int i = c->nslot - 1; i >= 0; i--) { c->q_next[i] = c->free_head; c->free_head = i; }
-    /* 10% small queue, the ratio the S3-FIFO paper reports as insensitive across
-     * workloads, with a floor so a tiny cache still has a small queue at all. */
-    c->s_target = c->nslot / 10;
-    if (c->s_target < 1) c->s_target = 1;
+    /* THE SMALL QUEUE'S SHARE, and why it is not the paper's flat 10%.
+     *
+     * S3-FIFO's small queue is an admission filter: an object must be touched while it
+     * sits there or it is evicted without ever reaching the main queue. That is the
+     * right trade only when the main queue is big enough to be worth protecting.
+     *
+     * One token touches topk experts in each MoE layer -- 1,472 slots, 25.8 GB, on the
+     * released model. Below that the cache cannot hold a single token's working set, so
+     * NOTHING survives to be reused across tokens and the filter has nothing to protect;
+     * all it does is evict objects before their second touch. Measured on the recorded
+     * trace (tools/sim_cache.py against tests/fixtures/expert_trace.bin), a flat 10%
+     * small queue is WORSE than the LRU it replaced everywhere below that point --
+     * 32.92% against 36.24% at 227 slots -- and better everywhere above it, 42.68%
+     * against 36.24% at 1,823 slots. The crossover sits exactly at one working set:
+     *
+     *     cap/WS   0.15    0.62    1.24    2.48    4.96
+     *     LRU     36.24%  36.24%  36.24%  36.24%  49.19%
+     *     10%     32.92%  36.11%  42.68%  49.97%  73.73%
+     *     50%     36.21%  36.24%  36.24%  38.37%  69.68%
+     *
+     * So the share is chosen by that ratio rather than fixed. Below one working set the
+     * queue is half the cache, which degenerates S3-FIFO to roughly plain FIFO and ties
+     * LRU instead of losing to it; above it, the paper's 10% and its full benefit.
+     *
+     * This is the one parameter here that was measured rather than argued, because it
+     * is the one where the argument gave the wrong answer. */
+    {
+        int moe_layers = 0;
+        for (int L = 0; L < cfg->n_layers; L++) if (!k3_is_dense(cfg, L)) moe_layers++;
+        if (moe_layers < 1) moe_layers = 1;
+        const int64_t ws = (int64_t)cfg->topk * moe_layers;
+        c->s_target = (c->nslot >= ws) ? c->nslot / 10 : c->nslot / 2;
+        if (c->s_target < 1) c->s_target = 1;
+        c->working_set = (int32_t)(ws > INT32_MAX ? INT32_MAX : ws);
+    }
 
     pthread_mutex_init(&c->mu, NULL);
     pthread_cond_init(&c->cv, NULL);

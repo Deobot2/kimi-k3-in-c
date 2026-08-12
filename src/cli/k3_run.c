@@ -451,8 +451,12 @@ static void usage(FILE *f)
 "\n"
 "memory:\n"
 "  --preset NAME         auto | laptop | desktop | workstation | server | max\n"
-"                        auto sizes both budgets from this machine's free RAM,\n"
-"                        trunk-first; also spelled --trunk-gb auto\n"
+"                        auto sizes both budgets from this machine's free RAM and from\n"
+"                        the trunk manifest, trunk-first: it reads how big the trunk\n"
+"                        actually is (a quantised one may fit entirely), computes the\n"
+"                        fixed costs from the config, and gives the expert cache either\n"
+"                        the floor or a whole working set, never a useless amount in\n"
+"                        between. Also spelled --trunk-gb auto\n"
 "  --list-presets        show each preset's split and expected speed\n"
 "  --trunk DIR           packed trunk directory; enables streaming (see scripts/)\n"
 "                        an MXFP4 trunk from tools/mxfp4_trunk.py is ~29 GB instead of\n"
@@ -813,67 +817,6 @@ int main(int argc, char **argv)
         }
     }
 
-    /* ---- auto budget ----
-     * RAM-first: per token the engine re-reads the ENTIRE streamed trunk but only
-     * ~25.8 GB of experts, and steady-state expert caching yields nothing until the
-     * arena is tens of GB. Measured: a gigabyte pinned in the trunk is worth roughly
-     * 70x a gigabyte of expert cache at the margin. So auto gives the trunk everything
-     * this machine has, minus a safety margin, and the cache gets real memory only
-     * after the whole 110 GB trunk would be resident. */
-    if (budget_auto) {
-        const double avail = mem_available_bytes();
-        if (avail <= 0.0) {
-            fprintf(stderr, "--preset auto needs /proc/meminfo; pass explicit "
-                            "--trunk-gb/--cache-gb on this platform\n");
-            return 2;
-        }
-        /* Fixed costs outside both budgets: embeddings + lm_head 4.70 GB, safetensors
-         * index, recurrent state 0.63 GB, KV cache and scratch. Reserve them plus a
-         * 2 GB + 2% margin so auto never invites the OOM killer. */
-        const double reserve = 2.0 + 0.02 * (avail / 1e9) + 4.70 + 1.70;
-        double usable = avail / 1e9 - reserve;
-        const double slot_min = 2.5;   /* one ring slot + headroom; refuse below */
-        const double cache_min = 0.5;  /* topk+1 expert slots is ~0.3 GB */
-        if (usable < slot_min + cache_min) {
-            fprintf(stderr, "auto: only %.1f GB usable after the %.1f GB reserve; "
-                            "below the %.1f GB floor. Pass explicit budgets.\n",
-                    usable, reserve, slot_min + cache_min);
-            return 2;
-        }
-        const double trunk_full = 111.0;   /* full packed trunk + widen headroom */
-        if (usable - cache_min >= trunk_full) {
-            /* Full residency: per-token trunk reads disappear entirely. This is the
-             * configuration auto exists for. */
-            trunk_gb = trunk_full;
-            cache_gb = usable - trunk_full;
-        } else {
-            /* Partial pinning has WEAK returns and real hazards, both measured on the
-             * released checkpoint: pinning 51 of 109 GB ran 14% SLOWER than pinning
-             * nothing (48.2 vs 42.1 s/token) because peak RSS at ~90% of RAM put the
-             * kernel into reclaim and the device served the remaining tail of the
-             * packed trunk a third slower, while a moderate pin stayed neutral to
-             * mildly positive (40.1 s/token at 25 GB, device throughput unharmed).
-             * So below full residency, auto pins only while the whole process stays
-             * comfortably clear of the RAM ceiling. */
-            double memtotal = 0.0;
-            FILE *mf = fopen("/proc/meminfo", "r");
-            if (mf) {
-                char ln[256];
-                while (fgets(ln, sizeof ln, mf))
-                    if (!strncmp(ln, "MemTotal:", 9)) { memtotal = atof(ln + 9) * 1024.0; break; }
-                fclose(mf);
-            }
-            const double rss_ceiling = memtotal > 0.0 ? 0.55 * memtotal / 1e9
-                                                      : usable;   /* no /proc: keep old cap */
-            double cap = rss_ceiling - reserve - cache_min;
-            if (cap < slot_min) cap = slot_min;
-            trunk_gb = usable - cache_min;
-            if (trunk_gb > cap) trunk_gb = cap;
-            cache_gb = cache_min;
-        }
-        printf("auto budget: %.1f GB available, %.1f GB reserved -> trunk %.1f GB / "
-               "expert cache %.1f GB\n", avail / 1e9, reserve, trunk_gb, cache_gb);
-    }
 
     /* fa is sized for the released 24 MLA layers with generous headroom; k3_cfg_load
      * refuses a config that would overrun it rather than truncating the layer map. */
@@ -1045,7 +988,11 @@ int main(int argc, char **argv)
     printf("  prompt   : %d tokens, generating %d\n", np, gen);
     /* Echo the preset so a captured log is self-describing: a timing figure is
      * meaningless without the budget that produced it. */
-    if (preset_name)
+    /* Named presets are fixed numbers and can be echoed here. `auto` is not decided
+     * until the checkpoint and the trunk manifest have been read, several steps below,
+     * so echoing it here printed the DEFAULTS and called them the preset. It prints its
+     * own line, with the reasoning, once it actually knows. */
+    if (preset_name && strcmp(preset_name, "auto") != 0)
         printf("  preset   : %s (trunk %.1f GB / expert cache %.1f GB)\n",
                preset_name, trunk_gb, cache_gb);
     printf("\n");
@@ -1054,6 +1001,169 @@ int main(int argc, char **argv)
     double t0 = now_s();
     if (k3_st_open(&st, dir) != 0) return 1;
     printf("indexed %d tensors from %d shards in %.2f s\n", st.nt, st.nshard, now_s() - t0);
+
+    /* ---- auto budget ----------------------------------------------------------------
+     * RAM-first, and now sized against the trunk actually being streamed rather than
+     * against a constant. Per token the engine re-reads the ENTIRE trunk but only
+     * ~25.8 GB of experts, so a gigabyte pinned in the trunk is worth roughly 70x a
+     * gigabyte of expert cache at the margin. Auto therefore fills the trunk first, and
+     * feeds the cache only with what is genuinely left over.
+     *
+     * Three things it now computes instead of assuming, each of which was a constant
+     * that stopped being true:
+     *
+     *   THE TRUNK'S SIZE. This was hardcoded at 111 GB, the bf16 trunk plus headroom. A
+     *   quantised trunk (tools/mxfp4_trunk.py) is 29.81 GB and fits entirely in RAM on a
+     *   machine where auto would previously have concluded it could not, and given up on
+     *   full residency -- which is the one configuration where per-token trunk I/O stops
+     *   happening rather than merely getting faster. k3_trunk_probe reads the manifest.
+     *
+     *   THE FIXED COSTS. embed + lm_head was hardcoded at 4.70 GB and the recurrent state
+     *   at 1.70 GB. Both follow from the config, and both are wrong for any model that is
+     *   not the released one. The KV cache was not counted at all, which is fine at
+     *   2.37 MB/position for a short run and is not fine for a long one.
+     *
+     *   WHERE THE EXPERT CACHE STARTS PAYING. Below one token's working set -- topk
+     *   experts in each MoE layer, 25.8 GB on the released model -- the hit rate does not
+     *   move with capacity at all: measured flat from 4 GB to 24 GB on the recorded trace
+     *   (tools/sim_cache.py). So a cache of 8 GB buys exactly what a cache of 0.5 GB buys,
+     *   and the difference belongs in the trunk. Auto now gives the cache either the
+     *   minimum or at least a whole working set, and never a useless amount in between. */
+    if (budget_auto) {
+        const double avail = mem_available_bytes();
+        if (avail <= 0.0) {
+            fprintf(stderr, "--preset auto needs /proc/meminfo; pass explicit "
+                            "--trunk-gb/--cache-gb on this platform\n");
+            return 2;
+        }
+        const int64_t E64 = c.hidden;
+        const int Tm = np + gen + 1;
+        const int Pp = c.kda_heads * c.kda_head_dim;
+        const int mb_ = c.n_layers / c.attn_res_block + 2;
+
+        /* Everything that lives outside both budgets, from the config rather than from
+         * memory of one checkpoint. */
+        const double w_model = 2.0 * (double)c.vocab * E64 * 2 + 3.0 * E64 * 4;
+        const double w_state = (double)((size_t)Pp * c.kda_head_dim
+                             + (size_t)3 * Pp * (c.conv_k - 1)) * c.n_layers * 4;
+        const double w_buf = ((double)Tm * E64 + (double)Tm * mb_ * E64
+                            + (double)k3_layer_scratch(&c, Tm) + (double)c.vocab) * 4;
+        int n_mla_ = 0, n_moe_ = 0;
+        for (int L = 0; L < c.n_layers; L++) {
+            if (k3_is_mla(&c, L)) n_mla_++;
+            if (!k3_is_dense(&c, L)) n_moe_++;
+        }
+        const int kv_pos = (kv_window > 0 && kv_window < Tm) ? kv_window : Tm;
+        const double w_kv = !incremental ? 0.0
+            : mla_latent ? (double)kv_pos * n_mla_ * (c.kv_lora + c.qk_rope) * 4
+                         : (double)Tm * n_mla_
+                           * ((double)c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope) * 4;
+
+        /* 2 GB + 2% margin on top, so auto never invites the OOM killer. */
+        const double reserve = (w_model + w_state + w_buf + w_kv) / 1e9
+                             + 2.0 + 0.02 * (avail / 1e9);
+        double usable = avail / 1e9 - reserve;
+        const double cache_min = 0.5;   /* topk+1 expert slots is ~0.3 GB */
+
+        /* What full residency would actually cost, from the manifest. */
+        double trunk_full = 111.0;      /* no manifest: assume the released bf16 trunk */
+        int quantised = 0;
+        if (trunk_dir) {
+            int64_t packed = 0; int nlay = 0;
+            if (k3_trunk_probe(trunk_dir, &packed, &nlay, &quantised) == 0 && packed > 0)
+                trunk_full = ((double)packed
+                            + (double)nlay * (double)k3_bind_widen_bytes(&c)) / 1e9 + 0.5;
+        }
+        const double slot_min = 2.5;    /* one ring slot + headroom; refuse below */
+        if (usable < slot_min + cache_min) {
+            fprintf(stderr, "auto: only %.1f GB usable after the %.1f GB reserve; "
+                            "below the %.1f GB floor. Pass explicit budgets.\n",
+                    usable, reserve, slot_min + cache_min);
+            return 2;
+        }
+
+        /* One token's expert working set, the threshold below which cache capacity does
+         * not move the hit rate. Measured from the checkpoint, not assumed. */
+        int64_t ebytes = 17547264;
+        {
+            K3ExpertRef pr;
+            for (int L = 0; L < c.n_layers; L++) {
+                if (k3_is_dense(&c, L)) continue;
+                if (k3_expert_ref(&st, L, 0, &pr) == 0) { ebytes = pr.nbytes; break; }
+            }
+        }
+        const double ws_gb = (double)c.topk * n_moe_ * (double)ebytes / 1e9;
+
+        const char *why;
+        if (usable - cache_min >= trunk_full) {
+            /* Full residency: per-token trunk reads disappear entirely. This is the
+             * configuration auto exists for, and a quantised trunk reaches it on
+             * hardware a bf16 one never could. */
+            trunk_gb = trunk_full;
+            cache_gb = usable - trunk_full;
+            why = "trunk fully resident: no per-token trunk read at all";
+        } else {
+            /* Partial pinning has WEAK returns and real hazards, both measured on the
+             * released checkpoint: pinning 51 of 109 GB ran 14% SLOWER than pinning
+             * nothing (48.2 vs 42.1 s/token) because peak RSS at ~90% of RAM put the
+             * kernel into reclaim and the device served the remaining tail of the packed
+             * trunk a third slower, while a moderate pin stayed neutral to mildly
+             * positive (40.1 s/token at 25 GB). So below full residency, auto pins only
+             * while the whole process stays comfortably clear of the RAM ceiling. */
+            double memtotal = 0.0;
+            FILE *mf = fopen("/proc/meminfo", "r");
+            if (mf) {
+                char ln[256];
+                while (fgets(ln, sizeof ln, mf))
+                    if (!strncmp(ln, "MemTotal:", 9)) { memtotal = atof(ln + 9) * 1024.0; break; }
+                fclose(mf);
+            }
+            const double rss_ceiling = memtotal > 0.0 ? 0.55 * memtotal / 1e9 : usable;
+            double cap = rss_ceiling - reserve - cache_min;
+            if (cap < slot_min) cap = slot_min;
+
+            /* Spend on the cache ONLY if a whole working set is affordable; otherwise
+             * every gigabyte is worth more in the trunk, and the leftover the trunk
+             * cannot use goes to the cache regardless because it has nowhere better. */
+            if (usable - cap >= ws_gb) {
+                trunk_gb = cap;
+                cache_gb = usable - cap;
+                why = "trunk at its safe pin ceiling, and the rest clears one expert "
+                      "working set";
+            } else {
+                trunk_gb = usable - cache_min;
+                if (trunk_gb > cap) trunk_gb = cap;
+                cache_gb = cache_min;
+                /* Whatever the RAM ceiling stopped the trunk taking is LEFT
+                 * UNALLOCATED, deliberately. Handing it to the cache instead would
+                 * spend it where the measurement says it buys nothing -- below one
+                 * working set the hit rate does not move with capacity -- while
+                 * pushing peak RSS back through the ceiling the cap exists to keep
+                 * clear of. That ceiling is not a guess: pinning to ~90% of RAM ran
+                 * 14% SLOWER than pinning nothing, because reclaim cost the device a
+                 * third of its throughput. Idle RAM is the cheaper outcome. */
+                why = "cache at its floor and the trunk at the RAM ceiling: below one "
+                      "working set, cache capacity does not move the hit rate";
+            }
+        }
+        printf("auto budget: %.1f GB available, %.1f GB reserved (model %.1f + state %.1f "
+               "+ KV %.2f + buffers %.2f)\n"
+               "             -> trunk %.1f GB / expert cache %.1f GB\n"
+               "             %s\n",
+               avail / 1e9, reserve, w_model / 1e9, w_state / 1e9, w_kv / 1e9,
+               w_buf / 1e9, trunk_gb, cache_gb, why);
+        printf("             trunk needs %.1f GB to be fully resident%s; one expert "
+               "working set is %.1f GB\n",
+               trunk_full, quantised ? " (QUANTISED trunk)" : "", ws_gb);
+        {
+            const double idle = usable - trunk_gb - cache_gb;
+            if (idle > 0.5)
+                printf("             %.1f GB deliberately left unallocated: peak RSS near "
+                       "the RAM ceiling puts the\n"
+                       "             kernel into reclaim, which measured 14%% SLOWER than "
+                       "pinning less\n", idle);
+        }
+    }
 
     /* ---- how much will this take? Report BEFORE allocating, so a box that cannot
      * hold it fails with a number rather than an OOM kill. ---- */
