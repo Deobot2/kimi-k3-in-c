@@ -166,6 +166,31 @@ static jval *json_parse(const char *text, char **arena_out) {
     return v;
 }
 
+/* Release a tree returned by json_parse.
+ *
+ * There is no single buffer to drop: j_dup gives every string its own allocation on
+ * purpose, because an arena that reallocs would move the buffer and invalidate every
+ * pointer already handed out. So the tree is walked. `arena_out` is a vestige of that
+ * earlier design and is always NULL today; freeing it is harmless and freeing the tree
+ * is what actually reclaims anything.
+ *
+ * EVERY POINTER TAKEN OUT OF THE TREE DIES HERE, key strings included. k3_trunk holds
+ * all 2,600-odd tensor names that way, so it frees the tree last, after the structures
+ * that point into it.
+ *
+ * `static inline` rather than plain `static`: most translation units that include this
+ * header parse without ever freeing, and an unused plain static would warn in each of
+ * them under -Wall. */
+static inline void json_free(jval *v) {
+    if (!v) return;
+    for (int i = 0; i < v->len; i++) {
+        if (v->kids) json_free(v->kids[i]);
+        if (v->keys) free(v->keys[i]);
+    }
+    free(v->kids); free(v->keys); free(v->str);
+    free(v);
+}
+
 static jval *json_get(jval *o, const char *key) {
     if (!o || o->t != J_OBJ) return NULL;
     for (int i = 0; i < o->len; i++) if (strcmp(o->keys[i], key) == 0) return o->kids[i];

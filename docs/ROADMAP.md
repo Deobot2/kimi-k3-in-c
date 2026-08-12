@@ -8,7 +8,10 @@ Prefill currently runs as a single forward pass over the whole prompt, and atten
 the 24 MLA layers is quadratic in sequence length. The practical effect: the context
 ceiling is 32k tokens, but a 21k-token prompt does not complete in reasonable time.
 
-Raising the ceiling was necessary and is done. This is the part that makes it usable.
+Raising the ceiling was necessary and is done. `--mla-latent` has now removed the
+*memory* half of the problem — 131k positions cost 7.25 GB instead of 310 GB — which
+makes the remaining half purely about prefill cost. This is the part that makes it
+usable.
 
 ## 2. Re-run the published campaign under the replicating harness
 
@@ -18,11 +21,23 @@ already default to 3 repeats and report mean, sd and spread. What remains is re-
 the 12 ladder rungs and the 12 splits under it and replacing the single-sample tables in
 docs/data/ with replicated ones.
 
+**This is now the most urgent item on the list, not the second.** Five changes landed
+that each claim a speed or memory effect — largest-first pinning, a deeper ring, io_uring
+reads, S3-FIFO, speculative expert prefetch — and every one of them is argued from
+mechanism and gated for correctness, not measured for effect on the released checkpoint.
+Each is A/B-able on a single binary by design (`K3_PIN_PREFIX`, `--trunk-ring`,
+`K3_NOURING`, `K3_CACHE_POLICY=lru`, `K3_NOSPEC`), which is exactly what the harness
+needs and exactly what has not yet been run.
+
 ## 3. Thread scaling
 
 `OMP_NUM_THREADS` has never been swept on this engine. The workload is I/O bound at low
 memory budgets, so the useful thread count is probably well below the core count, and
 on memory-bound workloads throughput often *declines* past a point. Unknown here.
+
+Two background threads now exist as well — the trunk reader and the expert-cache
+speculator — so the sweep should cover their interaction with the OpenMP pool rather
+than assuming the pool has the machine to itself.
 
 ## 4. SIMD in the KDA recurrence
 
@@ -30,6 +45,11 @@ The bf16 trunk matmul and the MXFP4 expert matmul already have hand-written AVX2
 (`src/core/k3_ops.c`), each written to reproduce the scalar reduction order exactly. The
 KDA recurrence does not: it is still plain scalar C, and it is the largest remaining
 un-vectorised kernel on the non-I/O path.
+
+`k3_matmul_tr`, added for the latent KV cache's query absorption, is the second: it is a
+strided column sweep with a double accumulator per output and no vector path at all. It
+runs 96 times per MLA layer per token, so it is small next to the recurrence but it is
+new and it is scalar.
 
 ## 5. Sampling
 
@@ -55,10 +75,17 @@ would be served.
 
 ## Explicitly not planned
 
-**A precision dial for the trunk.** The trunk is streamed losslessly rather than
-quantised, and that is a design decision, not an omission. Post-hoc int4 measures ~17%
-mean relative weight error on K3 attention tensors against ~1% for int8; streaming
-costs time, which more memory buys back, while rounding costs accuracy, which nothing
-buys back.
+**A precision dial for the trunk, as a default.** The trunk streams losslessly and always
+will: post-hoc int4 measures ~17% mean relative weight error on K3 attention tensors
+against ~1% for int8, streaming costs time which more memory buys back, and rounding
+costs accuracy which nothing buys back.
+
+What *does* exist is `tools/mxfp4_trunk.py`, which writes a quantised trunk into its own
+container behind its own flag, because 29 GB is fully resident on a 64 GB desktop and
+that removes the per-token trunk read rather than speeding it up. It is a fork of the
+contract, not a setting: the engine announces it in a banner, every bit-identity gate in
+the suite is void against it, and `--ppl` is what replaces them. See
+[notes/compressed-trunk.md](notes/compressed-trunk.md). Anyone who needs the released
+model's exact behaviour should stream bf16, which is what the default does.
 
 **GPU support.** Out of scope for this project.

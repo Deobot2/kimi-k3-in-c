@@ -221,6 +221,103 @@ void   k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
 void   k3_mla(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
               int T, float *scratch);
 
+/* ---------------------------------------------------- the MLA KV cache, two ways ----
+ * Context is the ONLY thing in this engine that grows without bound, and it grows in
+ * exactly 24 places: the MLA layers. Everything else -- trunk, experts, the KDA
+ * recurrent matrices -- is fixed regardless of how long the conversation gets. So the
+ * layout of this one cache decides the context ceiling on any given machine.
+ *
+ * K3_KV_EXPANDED   what k3_mla_cached stores: per-head k and v, already expanded
+ *                  through kv_b, plus the shared rope row.
+ *                  96 heads x 256 floats + 64 = 98,368 B per position per layer,
+ *                  2.37 MB per position across the 24 -- so 131,072 positions is
+ *                  310 GB and the model's advertised 1M context is 2.5 TB.
+ *
+ * K3_KV_LATENT     the 576 floats kv_a actually emitted (512 latent + the 64 rope
+ *                  slots), before kv_b ever runs. 2,304 B per position per layer,
+ *                  55,296 B per position across the 24: a 42.9x reduction, which
+ *                  turns 131,072 positions from 310 GB into 7.25 GB.
+ *
+ * WHY THE LATENT FORM IS NOT SIMPLY SLOWER, WHICH IS THE OBVIOUS OBJECTION
+ *   Re-expanding every cached position through kv_b each step would be: kv_b is
+ *   24576x512, so an O(T) sweep of 12.6M-MAC matmuls per layer per token. That is the
+ *   reason k3_mla_cached stores the expanded form and says so at its definition.
+ *
+ *   WEIGHT ABSORPTION removes the re-expansion entirely rather than paying for it.
+ *   kv_b's per-head blocks are two matrices stacked: W_UK[h] maps the latent to the
+ *   head's nope key, W_UV[h] maps it to the head's value. Both can be moved to the
+ *   OTHER side of their dot product:
+ *
+ *       q_h . (W_UK[h] c)        ==   (W_UK[h]^T q_h) . c
+ *       W_UV[h] (sum_s p_s c_s)  ==   sum_s p_s (W_UV[h] c_s)
+ *
+ *   The left-hand forms are what k3_mla_cached computes and they need the expanded k
+ *   and v. The right-hand forms need only the cached latent: project the query into
+ *   latent space ONCE per token per head, score it against the stored 576 directly,
+ *   and apply W_UV once to the latent-space attention sum. Per-head k and v are never
+ *   materialised at any point.
+ *
+ *   It costs FLOPs: a score is 576 MACs instead of 192, and the weighted sum is 512
+ *   wide instead of 128, so attention arithmetic is about 3.4x. This engine spends
+ *   40-77% of every token waiting on a disk (docs/PERFORMANCE.md), so it has FLOPs to
+ *   spare and no bytes to spare, which is the whole trade.
+ *
+ * WHY W_UV IS APPLIED PER HEAD RATHER THAN FOLDED INTO o_proj
+ *   Folding W_UV into o_proj is algebraically valid for an ungated MLA and is the
+ *   textbook second half of absorption. K3's MLA is GATED: sigmoid(g_proj(x))
+ *   multiplies the attention output ELEMENTWISE, per head and per value channel,
+ *   BEFORE o_proj (see the note on k3_mla). An elementwise factor cannot be pushed
+ *   through a matmul, so the fold would have to be undone by the gate. Applying W_UV
+ *   per head is also the cheaper of the two: 96 x 128 x 512 = 6.3M MACs against
+ *   7168 x 49152 = 352M for the folded projection.
+ *
+ * EXACTNESS. Absorption REASSOCIATES matmuls, so this path is NOT bit-identical to
+ *   k3_mla_cached and cannot be. It is a different summation order over the same
+ *   values, which is why it gets its own gate (the mla_latent case in test_ops and
+ *   GATE 4 in the full-model oracle) rather than being folded into the existing ones.
+ *   Both gates check agreement to a stated tolerance and, at the token level, exact
+ *   equality of the decoded ids.
+ *
+ * THE WINDOW is the second, separate dial, and it is the one that is NOT exact.
+ *   window > 0 keeps only the most recent `window - sinks` positions plus the first
+ *   `sinks`, so the cache stops growing with context altogether. Attention then sees a
+ *   local span rather than the whole prefix, which CHANGES THE OUTPUT. It is off by
+ *   default and the engine says so on stdout when it is on. See docs/TUNING.md for why
+ *   the exact form of this trade is not implementable here: reconstructing an evicted
+ *   MLA latent requires the layer's input at that position, which depends on every
+ *   preceding attention, so the only exact recompute is a full forward replay -- which
+ *   is precisely what the engine's default non-incremental mode already does.
+ */
+enum { K3_KV_EXPANDED = 0, K3_KV_LATENT = 1 };
+
+typedef struct {
+    /* EXPANDED mode. [cap][n_heads*(qk_nope+v_head)] and [cap][qk_rope]. */
+    float *kv, *rope;
+    /* LATENT mode. [slots][kv_lora + qk_rope], post-norm on the kv_lora part only,
+     * exactly the vector k3_mla_cached derives its keys and values from. */
+    float *lat;
+    int    cached;      /* positions already written                                */
+    int    cap;         /* capacity in POSITIONS (expanded), or in SLOTS (latent)   */
+    int    window;      /* 0 = unbounded. Otherwise total retained positions.       */
+    int    sinks;       /* of the window, positions 0..sinks-1 are never evicted    */
+    int    mode;        /* K3_KV_EXPANDED or K3_KV_LATENT                           */
+} K3KvCache;
+
+/* Latent slot holding absolute position p, or -1 when p has been evicted. With no
+ * window this is the identity, so the two forms share one code path. */
+int    k3_kv_slot(const K3KvCache *kv, int p);
+/* Lowest absolute position still resident in the rolling region at position p. */
+int    k3_kv_first(const K3KvCache *kv, int p);
+
+size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span);
+void   k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
+                     int T, float *scratch, const K3KvCache *kv);
+
+/* y[in] = sum over `rows` of W[row][in] * x[row]: the TRANSPOSED product, which is what
+ * pushing W_UK to the query side needs. W stays row-major and is never transposed in
+ * memory; only the traversal changes. */
+void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int rows);
+
 /* MoE routing, one token. modeling_kimi_linear.py:703-759.
  *
  *   logits = W x                      float32, no bias, W is [n_experts, hidden]
@@ -267,7 +364,19 @@ void k3_attn_res(float *out, const float *src, const float *fold,
  * never emitted directly and it carries no exactness contract, which is what lets it use
  * a fast, non-deterministic kernel. Each row is stored inline as [f32 scale][int8 * in],
  * so a matrix stays a single tagged pointer. Never tagged on the exact model. */
-enum { K3_WF32 = 0, K3_WBF16 = 1, K3_WI8 = 2 };
+/* K3_WMX4 is a whole-trunk MXFP4 weight matrix, produced by tools/mxfp4_trunk.py and
+ * selected with --trunk-quant. Rows are stored as [packed nibbles][E8M0 scales], the
+ * same OCP MX FP4 the routed experts already ship in, so it reuses their kernel.
+ *
+ * UNLIKE EVERY OTHER WEIGHT TYPE HERE, THIS ONE LOSES INFORMATION. bf16 -> fp32 is a
+ * shift and MXFP4 experts are the checkpoint's own bytes; a quantised trunk is not.
+ * The technical report keeps the trunk in higher precision on purpose (4.1.4), and this
+ * engine's own measurement on 31 real attention tensors put post-hoc int4 at 17.4% mean
+ * relative weight error against 0.96% for int8. So a run with a quantised trunk is NOT
+ * the released model and cannot be gated by bit-identity: `k3 --ppl` measures
+ * perplexity on a held-out id sequence instead, and that is the gate it has to pass.
+ * See docs/notes/compressed-trunk.md. */
+enum { K3_WF32 = 0, K3_WBF16 = 1, K3_WI8 = 2, K3_WMX4 = 3 };
 
 /* bf16 -> f32 is a pure left shift: bf16 IS the top 16 bits of an f32. No rounding,
  * no table, no exponent rebias. */
@@ -284,14 +393,21 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
  * No determinism contract (see K3_WI8): uses the fastest AVX2 form available. */
 void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out);
 
+/* MXFP4 matmul over a trunk matrix. W is `out` rows of
+ *     [packed nibbles, in/2 bytes][E8M0 scales, in/32 bytes]
+ * and each row goes through the SAME per-row kernel the routed experts use, so the two
+ * cannot drift apart in nibble order, scale handling or reduction order. */
+void k3_matmul_mx4(float *y, const float *x, const void *W, int in, int out);
+
 /* The one call every trunk matmul goes through. Dispatch is a predictable branch on a
  * per-layer flag, outside the inner loops, so it costs nothing measurable. */
 static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
                           int in, int out)
 {
-    if (wdt == K3_WBF16)     k3_matmul_bf16(y, x, (const uint16_t *)W, in, out);
-    else if (wdt == K3_WI8)  k3_matmul_q8(y, x, W, in, out);
-    else                     k3_matmul(y, x, (const float *)W, in, out);
+    if (wdt == K3_WBF16)      k3_matmul_bf16(y, x, (const uint16_t *)W, in, out);
+    else if (wdt == K3_WI8)   k3_matmul_q8(y, x, W, in, out);
+    else if (wdt == K3_WMX4)  k3_matmul_mx4(y, x, W, in, out);
+    else                      k3_matmul(y, x, (const float *)W, in, out);
 }
 
 /* Byte stride of one row for a per-row int8 matrix: the f32 scale plus `in` int8 weights.
@@ -299,7 +415,11 @@ static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
 static inline size_t k3_wsz(int wdt) { return wdt == K3_WBF16 ? 2u : 4u; }
 static inline size_t k3_row_bytes(int wdt, int in)
 {
-    return wdt == K3_WI8 ? (size_t)4 + (size_t)in : (size_t)in * k3_wsz(wdt);
+    if (wdt == K3_WI8)  return (size_t)4 + (size_t)in;
+    /* MXFP4: cols/2 nibble bytes plus one E8M0 byte per 32 elements. Every matmul input
+     * width in this model is a multiple of 32, which the packer checks. */
+    if (wdt == K3_WMX4) return (size_t)in / 2u + (size_t)in / 32u;
+    return (size_t)in * k3_wsz(wdt);
 }
 
 /* ZERO-INITIALISE EVERY WEIGHT STRUCT BEFORE FILLING IT. K3MoeW holds an optional
@@ -351,6 +471,18 @@ typedef struct K3ExpertSrc {
      * out when non-NULL. The draft model's cache-only routing uses this to propose tokens
      * with zero expert I/O. May be NULL; callers must cope. */
     int (*resident)(struct K3ExpertSrc *self, int layer, int expert, K3ExpertQ *out);
+    /* OPTIONAL: called when the MoE ENTERS a layer, before the router has run on the
+     * current hidden state. The source may use it to start reads for whatever it expects
+     * this layer to want -- the cache guesses the previous token's top-k, because about
+     * 90% of expert requests in a real trace are repeats.
+     *
+     * It must NOT block: the whole point is that the reads overlap the router and the
+     * down-projection, which are the only substantial arithmetic between entering the
+     * layer and needing the experts. A source with nothing to say leaves it NULL.
+     *
+     * ZERO THIS FIELD, like getmany and resident. It is a function pointer in a struct
+     * callers build on the stack. */
+    void (*speculate)(struct K3ExpertSrc *self, int layer);
     void *ctx;
 } K3ExpertSrc;
 
@@ -405,6 +537,10 @@ extern long k3_expert_drops;
  * figures side by side, when it will not fit in available memory. Reaching the model's
  * full 1M context is a hardware question, not an engine limit.
  *
+ * --mla-latent caches the 576-float latent instead, at 55,296 B per position, and the
+ * same ceilings become 226 MB / 905 MB / 1.81 GB / 7.25 GB / 58.0 GB. The 1M context the
+ * model advertises stops being a hardware question at that point.
+ *
  * Note that long prompts are also bounded in practice by prefill cost: attention in the
  * MLA layers is quadratic in sequence length, and prefill is not yet chunked. See
  * docs/ROADMAP.md. */
@@ -413,6 +549,9 @@ extern long k3_expert_drops;
 
 /* Bytes of MLA KV cache per position, measured on the released checkpoint. */
 #define K3_KV_BYTES_PER_POS 2370000.0
+/* The same figure for the latent layout: 24 layers x (512 + 64) floats. Exact, not
+ * rounded, because unlike the expanded figure it has no per-head term to approximate. */
+#define K3_KV_LATENT_BYTES_PER_POS 55296.0
 
 /* idx and wt must each hold topk entries. */
 void   k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
@@ -506,6 +645,10 @@ typedef struct {
 } K3LayerW;
 
 size_t k3_layer_scratch(const K3Cfg *c, int T);
+/* Scratch for a layer that will run with a specific KV layout over a span of `span`
+ * attended positions. k3_layer_scratch is this with an EXPANDED cache and span == T;
+ * the latent layout needs more, so a latent run MUST size with this. */
+size_t k3_layer_scratch_kv(const K3Cfg *c, int T, int span, int mode);
 void   k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
                         const K3LayerW *w, const K3Cfg *c, int layer_idx,
                         int T, float *state, float *scratch);
@@ -518,6 +661,13 @@ void   k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
                             const K3LayerW *w, const K3Cfg *c, int layer_idx,
                             int T, float *state, float *scratch,
                             float *kvc, float *ropec, int cached, int cap);
+
+/* The same, with the cache described by a K3KvCache so either layout can be selected.
+ * kv = NULL is full recompute; k3_decoder_layer_inc is this with an EXPANDED cache. */
+void   k3_decoder_layer_kv(float *h, float *block_residual, int *n_blocks,
+                           const K3LayerW *w, const K3Cfg *c, int layer_idx,
+                           int T, float *state, float *scratch,
+                           const K3KvCache *kv);
 
 /* ---------------------------------------------------------------- MXFP4 ---- */
 /* Dequantise OCP MX FP4, the format Kimi K3 ships its routed experts in.

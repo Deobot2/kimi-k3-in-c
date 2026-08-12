@@ -5,6 +5,8 @@
 1. Run `./scripts/k3-doctor.sh` and use the preset it names.
 2. If you tune by hand: **fill the trunk before you feed the expert cache.**
 3. Use `--incremental` unless you are validating against full recompute.
+4. Add `--mla-latent` unless you need bit-identity with the expanded KV cache. It makes
+   context cost 55.3 KB per position instead of 2.37 MB.
 
 Everything below is why.
 
@@ -56,6 +58,31 @@ the way to 1,344, and the bytes read per token do not move by a single decimal.
 It does eventually engage. Somewhere around 36 GB of arena, retention jumps to ~30% and
 bytes/token fall from 25.83 to 18.11. But by then you could have pinned most of the trunk
 for the same memory and gone faster.
+
+### What changed, and what did not
+
+The paragraph above says *LRU* is defeated by flat usage, and that is the more precise
+claim. Flat is not uniform, and the difference is what a frequency-aware policy lives on.
+The offline simulator put 25.5 points between LRU and Belady's optimum at 64 GB (36.24%
+against 61.74%) — the largest single gap in this project's measurements, and an argument
+that the lever is the policy rather than the size.
+
+The engine therefore runs **S3-FIFO**, not LRU: a small FIFO takes every admission so
+one-hit wonders leave without polluting the cache, a main FIFO holds what proved itself,
+and a ghost queue of recently evicted keys lets a prompt return skip probation. There is
+also a **speculative prefetch**: about 90% of expert requests in a real trace are repeats,
+so on entering layer L the cache starts reads for what layer L wanted for the previous
+token, before the router has run.
+
+Neither changes the advice above. The trunk is still re-read in full every token and the
+experts still are not, so trunk-first still wins by a wide margin. What they change is
+what a gigabyte of expert cache is worth once you have given the trunk everything.
+
+Both are A/B-able on one binary, which is the only honest way to attribute a difference:
+
+    K3_CACHE_POLICY=lru   # the old policy
+    K3_NOSPEC=1           # no speculative prefetch
+    K3_NOPREFETCH=1       # no batch prefetch either
 
 ## Presets
 
@@ -117,3 +144,59 @@ This has not been swept systematically on this engine see [ROADMAP.md](ROADMAP.m
 The measured run-to-run spread on an identical configuration is **33%**. Differences
 smaller than that are not effects. Run each arm at least three times.
 [BENCHMARKING.md](BENCHMARKING.md) has the procedure.
+
+## Context, and the two dials that bound it
+
+The MLA KV cache is the only thing in this engine that grows with the conversation.
+Everything else — trunk, experts, the KDA recurrent matrices — is fixed.
+
+| positions | expanded (default) | `--mla-latent` |
+|---:|---:|---:|
+| 4,096 | 9.7 GB | 226 MB |
+| 16,384 | 38.8 GB | 905 MB |
+| 32,768 | 77.7 GB | 1.81 GB |
+| 131,072 | 310.6 GB | 7.25 GB |
+| 1,048,576 | 2,485 GB | 58.0 GB |
+
+`--mla-latent` caches the 576 floats `kv_a` emitted instead of the per-head keys and
+values `kv_b` would expand them into, and uses **weight absorption** so the expansion
+never has to happen: `W_UK` moves onto the query and `W_UV` past the attention sum. See
+the long note in `include/k3/k3.h`.
+
+It costs about 3.4× the attention arithmetic, which this engine can afford — it spends
+40–77% of a token waiting on a disk. What it also costs is **bit-identity**: reassociating
+two matmuls changes the last few ulps, so a latent run is not byte-comparable with an
+expanded one. It is gated instead by `mla_latent` in `test_ops` (against the same torch
+reference, at a stated multiple of the fixture tolerance) and by GATE 4 of the oracle,
+which requires the same decoded ids.
+
+`--kv-window N` caps the cache at N positions plus `--kv-sinks S` permanent early ones.
+**This is local attention and it changes the output.** It is off by default, the engine
+says so on stdout when it is on, and it exists for the case where the alternative is not
+running at all.
+
+There is no exact version of that trade. Reconstructing an evicted MLA latent needs the
+layer's input at that position, which depends on every preceding attention, so the only
+exact recompute is a full forward replay of the prefix — which is precisely what the
+engine's default non-`--incremental` mode already does. If you want to spend compute to
+avoid KV memory *exactly*, drop `--incremental`; that is the knob, and it already existed.
+
+## Reads, and how deep they go
+
+`--trunk-ring N` (default 2) sets how many layers can be in flight. One slot is the layer
+being computed on; the rest are reads running ahead. Two overlaps one read with one
+layer's compute, which is enough only while the two take about the same time — and they
+do not, so a third slot lets the reader stay a layer further ahead. It costs one more
+slot of RAM (2.37 GB at the floor) and the budget still wins if it does not fit.
+
+Reads themselves use **io_uring** where the platform has it, splitting each layer into
+8 MB requests with up to 16 outstanding, because an NVMe device does not reach its rated
+bandwidth at queue depth one — which is what a `pread` loop is. `K3_NOURING=1` forces
+`pread`; `K3_SQPOLL=1` asks the kernel to poll submissions from its own thread, which
+costs a spinning core and is off by default.
+
+Pinning is **largest-first**. Which layers you pin is byte-neutral for the traffic it
+avoids, but not for the ring: the uniform slot has to hold the largest layer still
+streaming, and layers here range to 2.34 GB against a 1.17 GB mean. Taking the fattest
+out of the ring first shrinks the slot, which frees budget, which pins more.
+`K3_PIN_PREFIX=1` restores the old prefix order for comparison.

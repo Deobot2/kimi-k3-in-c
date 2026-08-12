@@ -162,7 +162,7 @@ component at a time.
 - [9. Picking 16 experts of 896](#9-picking-16-experts-of-896)
 - [10. Packing the trunk: 93 layers, one read each](#10-packing-the-trunk-93-layers-one-read-each)
 - [11. Reduction four: streaming the trunk turns a floor into a dial](#11-reduction-four-streaming-the-trunk-turns-a-floor-into-a-dial)
-- [12. An LRU cache for the experts](#12-an-lru-cache-for-the-experts)
+- [12. A cache for the experts](#12-a-cache-for-the-experts)
 - [13. How big should that cache be? Ask the trace](#13-how-big-should-that-cache-be-ask-the-trace)
 
 **[Part III: Validation](#part-iii-validation)**
@@ -403,7 +403,8 @@ printf 'La capitale de la France est' > /tmp/p.txt
 | `--preset` | `NAME` | none | `laptop` · `desktop` · `workstation` · `server` · `max`. Sets both budgets below |
 | `--trunk` | `DIR` | off | the packed trunk directory from step 5. **This is what enables streaming.** Without it the trunk loads fully resident, around 113.5 GB |
 | `--trunk-gb` | `X` | 16 | budget for pinned layers plus the streaming ring |
-| `--cache-gb` | `X` | 64 | budget for the routed-expert LRU cache |
+| `--trunk-ring` | `N` | 2 | ring slots. One is the layer being computed on, the rest are reads in flight. A third costs one more slot of RAM and lets the reader run a layer further ahead |
+| `--cache-gb` | `X` | 64 | budget for the routed-expert cache |
 
 `--preset` and the two `-gb` flags set the same two numbers, so a preset is just a
 shorthand. Order matters if you mix them: a later flag wins, so
@@ -419,12 +420,22 @@ shorthand. Order matters if you mix them: a later flag wins, so
 |---|---|---|---|
 | `--gen` | `N` | 8 | tokens to generate. Ceiling 4096; prompts may be up to 32768 tokens |
 | `--incremental` | none | off | carry the KV cache and the recurrent state between tokens instead of re-running the whole prefix |
+| `--mla-latent` | none | off | cache the 576-float MLA latent instead of expanded per-head k and v: **55.3 KB per position instead of 2.37 MB**. Needs `--incremental` |
+| `--kv-window` | `N` | 0 | cap the latent cache at N positions. **This is local attention and it changes the output.** Needs `--mla-latent` |
+| `--kv-sinks` | `S` | 4 | of the window, keep the first S positions permanently |
 | `--tok` | `DIR` | none | directory holding `tiktoken.model` and `tokenizer_config.json` |
 
 **Pass `--incremental` for any generation of length.** Without it every step re-runs the
 entire prefix, which is *O(T²)*; with it, step 0 pays for the prompt and every later step
 costs the same fixed amount. Both paths are gated on producing identical tokens, so this
 is a pure speed choice.
+
+**Pass `--mla-latent` too, unless you need bit-identity with the expanded cache.** It is
+the difference between 310 GB and 7.25 GB at 131k context. What it costs is exactness of
+a specific kind: weight absorption reassociates two matmuls, so a latent run agrees with
+an expanded one to within a few ulps rather than to the bit. The decoded tokens are gated
+to be identical (oracle GATE 4); the float vectors are gated to a stated tolerance
+(`mla_latent` in `test_ops`).
 
 ### Diagnostic options
 
@@ -435,6 +446,23 @@ is a pure speed choice.
 | `--out` | `FILE` | JSON results (default `k3_run.json`) |
 | `--dump-logits` | `PATH` | float32 logits for the first step, for elementwise comparison |
 | `--dump-cache-trace` | `DIR` | writes `expert_hist.json` and `expert_trace.bin`, which `tools/sim_cache.py` replays |
+| `--tf-check` | none | teacher-forced agreement over the `--ids` sequence in one sweep |
+| `--ppl` | none | perplexity over the `--ids` sequence in one sweep. This is the gate for a quantised trunk, which cannot be byte-compared against anything |
+
+Two environment switches exist so a decision can be A/B'd on **one binary**, which is the
+only way to attribute a timing difference to the decision rather than to the compiler, the
+layout, or the weather:
+
+| | |
+|---|---|
+| `K3_CACHE_POLICY=lru` | expert cache uses LRU instead of S3-FIFO |
+| `K3_NOSPEC=1` | no speculative expert prefetch |
+| `K3_NOPREFETCH=1` | no batch expert prefetch either |
+| `K3_PIN_PREFIX=1` | pin trunk layers as a prefix instead of largest-first |
+| `K3_NOURING=1` | trunk reads use `pread` instead of io_uring |
+| `K3_SQPOLL=1` | ask the kernel to poll io_uring submissions from its own thread |
+| `K3_NOHUGE=1` | 4 KB pages instead of 2 MB hugepages for the arenas |
+| `K3_NO_BATCH_PREFILL=1` | per-token prefill instead of the chunk-union batch |
 
 ### Exit codes
 
@@ -575,7 +603,9 @@ skip the tokenizer entirely, pass token ids with `--ids`.
 `O_DIRECT` reads at queue depth 1 and 16, which `dd` does not. Network volumes run several
 times slower than local NVMe; keep `~/k3trunk` local.
 
-**The run refused to start over the KV cache.** Context costs about 2.37 MB per position
+**The run refused to start over the KV cache.** Try `--mla-latent` first: it costs 55.3 KB
+per position instead, which is 42.9× less, and is usually the whole answer. Otherwise,
+context costs about 2.37 MB per position
 regardless of budget, and the engine computes that up front rather than discovering it an
 hour in. Shorten the request, or drop `--incremental`, which carries no KV cache at all.
 
@@ -748,8 +778,10 @@ src/
   core/k3_ops.c     # every numeric kernel: RMSNorm, KDA, MLA, MoE, MXFP4 matmul
   io/k3_st.c        # safetensors reader, hand-written JSON scan, O_DIRECT reads
   io/k3_load.c      # locating one expert's bytes inside a shard
-  io/k3_trunk.c     # streaming the dense trunk, pinned prefix plus a ring slot
-  cache/k3_cache.c  # the routed-expert LRU cache and its batch prefetch
+  io/k3_trunk.c     # streaming the dense trunk: largest-first pinning plus a ring
+  io/k3_uring.c     # io_uring reads, so the ring is not stuck at queue depth one
+  cache/k3_cache.c  # the routed-expert S3-FIFO cache, its batch prefetch and
+                    # its speculative reader
   model/k3_bind.c   # binding checkpoint tensor names to kernel arguments
   tokenizer/k3_tok.h# byte-level BPE loaded from tiktoken.model
   cli/k3_run.c      # the k3 binary: memory plan, decode loop, reporting
@@ -1808,6 +1840,68 @@ a hardcoded constant that does not exist.
 
 That is reduction three. Context costs 2.37 MB per position instead of 125.
 
+### And then reduction three again, harder
+
+2.37 MB per position is a good number next to 125. It is a bad number in absolute terms:
+it is the *only* thing in this engine that grows with the conversation, so it is what
+decides the context ceiling on any given machine. 131,072 positions is 310 GB. The model
+advertises a million.
+
+The comment on `k3_mla_cached` explains why it stores the expanded form, and the reasoning
+is correct as far as it goes:
+
+> The obvious saving is to cache the 576-float compressed latent and re-expand it through
+> `kv_b` each step, which is 42× smaller. It is also far slower: `kv_b` is 24576×512, so
+> re-expanding every cached position costs an O(T) sweep of 12.6M-MAC matmuls per layer per
+> token.
+
+The move that breaks that trade is **weight absorption**, and it turns on the observation
+that `kv_b`'s per-head block is two matrices stacked — `W_UK` mapping the latent to the
+head's nope key, `W_UV` mapping it to the head's value — and that both can be moved to the
+other side of their dot product:
+
+```
+    q_h · (W_UK[h] c)         ==   (W_UK[h]ᵀ q_h) · c
+    W_UV[h] (Σ_s p_s c_s)     ==   Σ_s p_s (W_UV[h] c_s)
+```
+
+The left-hand forms are what the expanded cache computes, and they need the expanded keys
+and values. The right-hand forms need only the cached 576: project the query into latent
+space once per head per token, score it against the stored latent directly, and apply
+`W_UV` once to the latent-space attention sum. Per-head keys and values are never
+materialised at any point — not stored, not recomputed, not formed.
+
+`--mla-latent`:
+
+| positions | expanded | latent |
+|---:|---:|---:|
+| 4,096 | 9.7 GB | 226 MB |
+| 32,768 | 77.7 GB | 1.81 GB |
+| 131,072 | 310.6 GB | **7.25 GB** |
+| 1,048,576 | 2,485 GB | **58.0 GB** |
+
+It costs FLOPs: a score is 576 multiply-adds instead of 192, and the weighted sum is 512
+wide instead of 128, so attention arithmetic is about 3.4×. This engine spends 40–77% of
+every token waiting on a disk. It has FLOPs to spare and no bytes to spare, and that is the
+entire trade.
+
+One piece of the textbook version does **not** apply here. Absorption normally folds
+`W_UV` into `o_proj` as well, so the output projection consumes the latent-space sum
+directly. K3's MLA is *gated*: `sigmoid(g_proj(x))` multiplies the attention output
+elementwise, per head and per value channel, **before** `o_proj`. An elementwise factor
+cannot be pushed through a matmul, so the fold would have to be undone by the gate.
+Applying `W_UV` per head is also 56× cheaper than the folded projection would have been —
+96 × 128 × 512 against 7168 × 49152 — so the constraint costs nothing.
+
+What it *does* cost is bit-identity. Reassociating two matmuls changes the last few ulps,
+so a latent run is not byte-comparable with an expanded one and cannot be. It gets its own
+gates rather than being folded into the existing ones: `mla_latent`, `mla_lat_inc` and
+`mla_lat_window` in `test_ops`, against the same torch reference the expanded path is held
+to and at a stated multiple of the fixture tolerance; and GATE 4 of the full-model oracle,
+which requires the same decoded token ids. Absorption is a rearrangement, and a
+rearrangement that changed a decoded token would be an error in the algebra rather than
+rounding.
+
 ## 8. Attention residuals: layers that look back
 
 One more structural piece, unusual enough to be worth a section even though it costs no
@@ -2213,9 +2307,9 @@ where to keep it.
 
 ![Pinned layers cost nothing to read, everything else comes through one ring slot](docs/images/trunk-stream.png)
 
-The design is a pinned prefix plus one rotating slot. Whatever fits in the budget gets
-pinned permanently, and the rest cycles through a single ring buffer. Critically, it is a
-**prefix** and not a cache.
+The design is a pinned SET of layers plus a small rotating ring. Whatever fits in the
+budget gets pinned permanently, and the rest cycles through the ring. Critically, the
+pinned set is *chosen*, not *cached*.
 
 The engine walks layers 0 through 92 in the same order on every token. That is a cyclic
 scan, and a cyclic scan is the pathological case for least-recently-used eviction: by the
@@ -2223,9 +2317,13 @@ time layer 0 comes round again it is the least recently used thing in the cache,
 always just been evicted.
 
 An LRU of 90 slots over a 93-layer cycle achieves a hit rate of **exactly zero**. Pinning
-the first N layers instead gives a deterministic hit rate of N/93, which for N = 90 is 96.8
+N layers outright instead gives a deterministic hit rate of N/93, which for N = 90 is 96.8
 percent. The obvious data structure is not merely suboptimal here; it is wrong in the worst
 possible direction, returning zero where the trivial approach returns almost one.
+
+(The expert cache is the opposite situation — its reuse is data-dependent rather than
+cyclic — which is why it gets a real replacement policy, and why that policy is not LRU
+either. [Section 12](#12-a-cache-for-the-experts) is where that argument lives.)
 
 ```c
 /* Pinned count and slot size are mutually dependent, so iterate to a fixed point. */
@@ -2248,6 +2346,59 @@ for (int pass = 0; pass < 4; pass++) {
     slot = k3_align_up(need, K3_TRUNK_ALIGN);
 }
 ```
+
+### Which layers to pin
+
+The loop above pins a **prefix**: layers 0, 1, 2, and so on until the budget runs out. For
+the bytes it avoids, that choice is neutral — pinning any set totalling *B* bytes removes
+exactly *B* bytes of per-token traffic, whichever layers they happen to be.
+
+It is not neutral for the ring. Look at what the loop computes next: `need` is the largest
+run **still not pinned**, and that is what the uniform ring slot has to hold. Layers here
+run from 1.15 GB to 2.34 GB against a 1.17 GB mean, and the 2.34 GB one is layer 0 — the
+single dense layer, with its 33792-wide MLP. A prefix pins that one *first*. So from the
+moment anything is pinned at all, the budget is still paying for a slot sized to a layer
+that no longer uses the ring: about 1.17 GB, wasted at every budget above the floor.
+
+Sorting the candidates by size, descending, fixes both halves at once. Dropping the largest
+survivor is what shrinks the slot, the smaller slot frees budget, the freed budget pins
+more, and the fixed-point loop that was already there resolves the circularity. The
+selection also keeps trying smaller layers after a large one no longer fits, so the budget
+is filled rather than merely walked.
+
+The effect is largest exactly where it matters most. At the laptop preset the trunk budget
+is 3.0 GB and a 2.34 GB slot is most of it — the difference between a ring that leaves
+nothing over and one that does. `K3_PIN_PREFIX=1` restores the old order on the same
+binary, which is the only honest way to attribute a timing difference to this decision
+rather than to the compiler or the weather.
+
+### Reading deeper than one at a time
+
+The reader thread hands layer L+1 to the device while the main thread computes on layer L,
+and with two ring slots that is where it stops: one read overlapped with one layer of
+compute. That is enough only while the two take about the same time, and they do not. A
+trunk read is 62.40 s of a 135.8 s token on the reference machine, so the reader spends
+part of every layer idle, waiting to be allowed to start the next one. `--trunk-ring 3`
+gives it a slot to run further ahead in, at the cost of one more slot of RAM.
+
+The reads themselves were shallower still. `pread` is a queue depth of one — issue, wait,
+issue — and an NVMe device does not reach its rated bandwidth at depth one; that is why
+`tools/devbw.py` probes at QD16. `src/io/k3_uring.c` splits each layer run into 8 MB
+requests and keeps up to sixteen outstanding, through raw `io_uring` syscalls rather than a
+liburing dependency, falling back to `pread` wherever io_uring is unavailable, refused, or
+turned off with `K3_NOURING=1`. No output bit depends on which path runs: these are reads
+of the same bytes from the same offsets into the same buffer.
+
+Running more than one read at a time makes two rules load-bearing that a two-slot ring
+could leave informal, and both are now enforced in one place. A slot being **read into** is
+never handed out again. And the slot the caller is **currently computing on** is never
+evicted — without that, the prefetcher wraps the ring and preads the next layer straight
+over the weights the main thread is multiplying. The read succeeds, no pointer changes, and
+the run finishes with fluent, wrong tokens. That failure was measured on the released
+checkpoint the first time a single-slot ring was given a reader thread, and
+`tests/unit/test_trunk.c` now exists so it cannot come back unnoticed: a synthetic trunk
+whose every layer is filled with a byte pattern derived from its own index, walked exactly
+the way `forward()` walks it, checked after every fetch.
 
 There is a memory detail that matters a lot. `O_DIRECT` reads pin their destination pages,
 and a 2.37 GB slot on 4 KB pages is about 578,000 pages, pinned and unpinned 93 times per
@@ -2440,7 +2591,7 @@ static int load_run(K3Trunk *tr, int L, unsigned char *dst)
 }
 ```
 
-## 12. An LRU cache for the experts
+## 12. A cache for the experts
 
 Now the other side of the read path: 1,472 expert fetches per token, each 17.56 MB, drawn
 from a 1.45 TB pool.
@@ -2469,6 +2620,10 @@ Three details in twelve lines. `INFLIGHT` slots are skipped entirely rather than
 candidates, so a slot cannot be claimed twice. `EMPTY` returns immediately, because a free
 slot is always better than evicting a live one. And pinned slots are skipped *after* the
 empty test, so pinning never blocks the cheap path.
+
+That is LRU, and it is what the engine ran first. The measurement later in this section
+is what replaced it — hold the question until the Belady table, because the argument only
+works once the numbers are on the page.
 
 ![Reserve serially, read in parallel, then publish only what arrived](docs/images/cache-3phase.png)
 
@@ -2634,6 +2789,46 @@ the workload.
 At 64 GB there is a **25.5 point gap** between what LRU achieves and what an optimal policy
 would achieve at exactly the same memory, which says the promising direction is a better
 replacement policy rather than more RAM.
+
+### Acting on that
+
+The engine no longer runs LRU. Two changes came out of this table.
+
+**S3-FIFO instead of LRU.** The shape of this workload — near-uniform popularity, a long
+tail of one-hit wonders, weak long-range reuse — is the shape LRU handles worst, because
+LRU keeps whatever was touched most recently whether or not it will ever be touched again.
+K3's router is *trained* to flatten expert usage, so there is no hot subset for recency to
+find. But flat is not uniform, and the gap above is the part LRU throws away.
+
+S3-FIFO puts every admission into a small FIFO, promotes only what gets touched while it
+is there, and keeps a ghost queue of keys recently evicted from the small queue so an
+expert that comes back promotes straight into the main queue. Uniform object size makes it
+the friendliest possible case: every expert is exactly 17,547,264 bytes, so a slot is a
+slot and no cost-aware weighting is needed, and the ghost queue can be exact rather than a
+sketch because 82,432 keys is 82 KB.
+
+**Speculative prefetch, from the line above the table.** *90.0% of requests are repeats.*
+When decode reaches layer L for token *t*, layer L's top-16 for token *t−1* is already
+known, and by that line it is a good guess. So the cache issues those reads on a
+background thread the moment the layer is entered, before the router has even run on the
+current hidden state. A right guess turns a blocking 17.55 MB read into a warm hit; a
+wrong one spends bandwidth on a machine that is idle waiting for the disk 40–77% of the
+time. The two compose neatly: an expert fetched on a guess nobody uses lands in the small
+FIFO and leaves from there, which is exactly where a wrong guess belongs.
+
+Both are switchable on one binary, because comparing two builds compares two binaries
+while comparing one decision compares one decision:
+
+```bash
+K3_CACHE_POLICY=lru ./bin/k3 ...    # the old policy
+K3_NOSPEC=1         ./bin/k3 ...    # no speculation
+```
+
+**Neither has been measured on the released checkpoint yet**, and this section will not
+pretend otherwise. `tools/sim_cache.py` now reports an S3-FIFO column beside LRU and
+Belady, so replaying the same trace prints the achieved figure next to the ceiling; the
+table above predates that column and has not been regenerated. Re-running the campaign is
+[item 2 on the roadmap](docs/ROADMAP.md).
 
 ```text
 CAVEAT, and it matters

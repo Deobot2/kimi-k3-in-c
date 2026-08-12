@@ -331,7 +331,7 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
 
     size_t w = 0;
     int narrowed_all = 1;
-    int i8_seen = 0;
+    int i8_seen = 0, mx4_seen = 0;
     for (int i = 0; i < p.n; i++) {
         Req *q = &p.r[i];
         int64_t off = 0, nb = 0; int dt = 0;
@@ -385,6 +385,28 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
             w += (size_t)take * 4;
             continue;
         }
+        /* A quantised trunk (tools/mxfp4_trunk.py, selected with --trunk-quant). Rows
+         * carry their own E8M0 scales inline, so the matrix is one tagged pointer and
+         * k3_matmul_mx4 consumes it directly -- the same arrangement K3_WI8 uses, and
+         * for the same reason.
+         *
+         * The element-count check below does not apply and is deliberately skipped: a
+         * row is cols*17/32 bytes, so the byte count does not determine rows and cols
+         * separately. The packer owns the shape, and it only ever quantises the tensors
+         * the engine asked for NARROW -- so a tensor reaching here with narrow == 0 is a
+         * packer that quantised something it should not have, which is an error rather
+         * than something to work around silently. */
+        if (dt == K3_DT_MX4) {
+            if (!q->narrow) {
+                fprintf(stderr, "k3_bind_mem: %s is MXFP4 but the engine reads it "
+                                "elementwise as fp32; repack without quantising it\n",
+                        q->name);
+                return -1;
+            }
+            *q->dest = run + off;
+            mx4_seen = 1;
+            continue;
+        }
         const int esz = (dt == K3_DT_F32) ? 4 : (dt == K3_DT_U8 ? 1 : 2);
         const int64_t have = nb / esz;
         if (q->want >= 0 && have != q->want) {
@@ -424,16 +446,28 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
         w += (size_t)q->take * 4;
     }
 
-    if (!narrowed_all && !i8_seen) {
+    if (!narrowed_all && !i8_seen && !mx4_seen) {
         /* A large matrix was not BF16 in the packed run. The tag is per struct, so this
          * cannot be described; refuse rather than read fp32 bytes as bf16. */
         fprintf(stderr, "k3_bind_mem: layer %d has a non-BF16 large tensor\n", L);
         return -1;
     }
+    if (i8_seen + mx4_seen + (narrowed_all ? 1 : 0) > 1 && (i8_seen || mx4_seen)) {
+        /* MIXED FORMATS IN ONE LAYER. The dtype tag lives on the STRUCT, not the field,
+         * so a layer holding both bf16 and MXFP4 matmul weights cannot be described --
+         * whichever tag is chosen, the other format is read as the wrong bytes and the
+         * model runs and is wrong. A packer that quantised only some of a layer's narrow
+         * tensors produces exactly this, so it is refused with the layer named. */
+        fprintf(stderr, "k3_bind_mem: layer %d mixes weight formats (%s%s%s); a packed "
+                        "trunk must quantise ALL of a layer's matmul weights or none\n",
+                L, narrowed_all ? "BF16 " : "", i8_seen ? "I8R " : "",
+                mx4_seen ? "MX4" : "");
+        return -1;
+    }
 
-    /* An int8 draft trunk has every matmul weight as I8R (norms stay f32), so one tag
-     * describes the layer. The two formats are never mixed within a packed trunk. */
-    const int lw = i8_seen ? K3_WI8 : K3_WBF16;
+    /* An int8 or MXFP4 trunk has every matmul weight in that format (norms stay f32), so
+     * one tag describes the layer. The formats are never mixed within a packed trunk. */
+    const int lw = mx4_seen ? K3_WMX4 : (i8_seen ? K3_WI8 : K3_WBF16);
     b->kda.wdt = b->mla.wdt = b->moe.wdt = b->lay.wdt = lw;
     b->lay.kda = is_mla ? NULL : &b->kda;
     b->lay.mla = is_mla ? &b->mla : NULL;

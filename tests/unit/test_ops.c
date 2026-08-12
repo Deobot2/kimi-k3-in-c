@@ -126,6 +126,30 @@ static void report(const char *name, const float *got, const float *want, int n)
     }
 }
 
+/* Same, at a MULTIPLE of the fixture tolerance, for paths that are deliberately not
+ * bit-identical to the reference. The multiplier is printed rather than hidden, so a
+ * relaxed bar can never be mistaken for the exact one every other case here holds to,
+ * and so tightening or loosening it is a visible edit rather than a silent drift. */
+static void report_x(const char *name, const float *got, const float *want, int n,
+                     double tolx)
+{
+    double worst = 0.0; int at = -1;
+    for (int i = 0; i < n; i++) {
+        const double a = fabs((double)got[i] - (double)want[i]);
+        const double tol = tolx * (ATOL + RTOL * fabs((double)want[i]));
+        if (a / tol > worst) { worst = a / tol; at = i; }
+    }
+    if (worst <= 1.0) {
+        printf("  PASS  %-14s n=%-6d worst=%.2fx tol (bar is %.0fx the fixture tol)\n",
+               name, n, worst, tolx);
+        g_pass++;
+    } else {
+        printf("  FAIL  %-14s n=%-6d worst=%.2fx tol at i=%d  got %.7f want %.7f\n",
+               name, n, worst, at, got[at], want[at]);
+        g_fail++;
+    }
+}
+
 /* ----------------------------------------------------------------- tests ---- */
 static void t_rmsnorm(const char *dir)
 {
@@ -448,6 +472,65 @@ static void t_mla(const char *dir)
             printf("        H=%d qh=%d (nope %d + rope %d) v=%d kv_lora=%d scale=%.6f\n",
                    c.n_heads, c.qk_nope + c.qk_rope, c.qk_nope, c.qk_rope,
                    c.v_head, c.kv_lora, 1.0 / sqrt((double)(c.qk_nope + c.qk_rope)));
+
+            /* ---- THE LATENT CACHE, gated separately because it CANNOT match bit for
+             * bit and pretending otherwise would be the lie.
+             *
+             * Weight absorption moves W_UK to the query side and W_UV past the
+             * attention sum, which reassociates two matmuls: the same values are
+             * multiplied and added in a different order, so the result differs in the
+             * last few ulps by construction. Three things are checked here, and each
+             * one catches a different class of mistake that the reference comparison
+             * alone would not:
+             *
+             *   mla_latent      absorption against the torch reference. Catches a
+             *                   transposed W_UK, a head stride read as qk_nope instead
+             *                   of qk_nope+v_head, or the rope slots scored from the
+             *                   wrong half of the cached 576.
+             *   mla_lat_inc     the same weights fed ONE POSITION AT A TIME through the
+             *                   cache, compared against the batched call. Catches slot
+             *                   indexing and anything that only shows up once `cached`
+             *                   is non-zero, which is every real decode step.
+             *   mla_lat_window  a window WIDE ENOUGH TO HOLD EVERYTHING must change
+             *                   nothing at all. Catches the modular slot arithmetic and
+             *                   the sink span, on the one configuration where the
+             *                   windowed and unwindowed answers are required to agree.
+             *                   (A narrow window legitimately differs: it is local
+             *                   attention. That is not a thing a fixture can gate, so
+             *                   it is not gated here.)
+             * ---- */
+            const int kvw = c.kv_lora + c.qk_rope;
+            float *lat = (float *)calloc((size_t)T * kvw, sizeof(float));
+            float *y2  = (float *)malloc((size_t)T * c.hidden * sizeof(float));
+            float *sc2 = (float *)malloc(k3_mla_scratch_latent(&c, T, T) * sizeof(float));
+            if (lat && y2 && sc2) {
+                K3KvCache kv; memset(&kv, 0, sizeof kv);
+                kv.mode = K3_KV_LATENT; kv.lat = lat; kv.cap = T;
+                k3_mla_latent(y2, x, &w, &c, T, sc2, &kv);
+                report_x("mla_latent", y2, eo, n_out, 8.0);
+
+                memset(lat, 0, (size_t)T * kvw * sizeof(float));
+                memset(&kv, 0, sizeof kv);
+                kv.mode = K3_KV_LATENT; kv.lat = lat; kv.cap = T;
+                for (int t = 0; t < T; t++) {
+                    k3_mla_latent(y2 + (size_t)t * c.hidden, x + (size_t)t * c.hidden,
+                                  &w, &c, 1, sc2, &kv);
+                    kv.cached = t + 1;
+                }
+                report_x("mla_lat_inc", y2, eo, n_out, 8.0);
+
+                memset(lat, 0, (size_t)T * kvw * sizeof(float));
+                memset(&kv, 0, sizeof kv);
+                kv.mode = K3_KV_LATENT; kv.lat = lat; kv.cap = T;
+                kv.window = T; kv.sinks = 1;
+                for (int t = 0; t < T; t++) {
+                    k3_mla_latent(y2 + (size_t)t * c.hidden, x + (size_t)t * c.hidden,
+                                  &w, &c, 1, sc2, &kv);
+                    kv.cached = t + 1;
+                }
+                report_x("mla_lat_window", y2, eo, n_out, 8.0);
+            }
+            free(lat); free(y2); free(sc2);
         }
         free(scratch); free(y);
     }
@@ -789,6 +872,88 @@ static void t_mxfp4(const char *dir)
             printf("  FAIL  mxfp4          %d of %d elements differ, worst %.7g at %d "
                    "(got %.7f want %.7f)\n", bad, ne_, worst, at, y[at], ef[at]);
             g_fail++;
+        }
+        /* ---- the QUANTISED TRUNK container, on the same bytes ----
+         *
+         * A routed expert stores its nibbles and its E8M0 scales in two separate
+         * contiguous planes. A quantised trunk (tools/mxfp4_trunk.py) interleaves them
+         * per row instead -- [nibbles][scales], [nibbles][scales], ... -- so that one
+         * tagged pointer describes the whole matrix, which is what k3_mmw needs.
+         *
+         * Same values, different addresses. That makes the two kernels comparable
+         * EXACTLY rather than approximately: k3_matmul_mx4 and k3_matmul_mxfp4 run the
+         * identical per-row code on the identical bytes, so any difference is a stride
+         * error in the interleaved layout and nothing else. A tolerance here would hide
+         * exactly the bug worth catching, which is a row read half from its own scales
+         * and half from the next row's nibbles.
+         *
+         * The fixture's `in` is pcols*2 and is a multiple of 32 on real checkpoint
+         * geometry, which is the same requirement the packer enforces. */
+        const int in = pcols * 2;
+        if (in % grp == 0 && grp == K3_MXFP4_GROUP) {
+            const size_t rb = (size_t)in / 2u + (size_t)in / 32u;
+            unsigned char *W = (unsigned char *)malloc(rb * (size_t)rows);
+            float *x  = (float *)malloc((size_t)in * sizeof(float));
+            float *ya = (float *)malloc((size_t)rows * sizeof(float));
+            float *yb = (float *)malloc((size_t)rows * sizeof(float));
+            if (W && x && ya && yb) {
+                const int ngrp = in / grp;
+                for (int rr = 0; rr < rows; rr++) {
+                    memcpy(W + (size_t)rr * rb, P + (size_t)rr * pcols, (size_t)pcols);
+                    memcpy(W + (size_t)rr * rb + pcols, S + (size_t)rr * ngrp,
+                           (size_t)ngrp);
+                }
+                unsigned sd = 0x5EEDu;
+                for (int i = 0; i < in; i++) {
+                    sd = sd * 1664525u + 1013904223u;
+                    x[i] = (float)((int)(sd >> 16) - 32768) / 32768.0f;
+                }
+                k3_matmul_mxfp4(ya, x, P, S, in, rows, grp);
+                k3_matmul_mx4(yb, x, W, in, rows);
+                int bad4 = 0;
+                for (int i = 0; i < rows; i++) if (ya[i] != yb[i]) bad4++;
+                if (bad4 == 0) {
+                    printf("  PASS  mxfp4_trunk    %d rows, interleaved rows "
+                           "bit-identical to split planes\n", rows);
+                    g_pass++;
+                } else {
+                    printf("  FAIL  mxfp4_trunk    %d of %d rows differ\n", bad4, rows);
+                    g_fail++;
+                }
+
+                /* ---- and the TRANSPOSED read of the same matrix ----
+                 * k3_matmul_tr walks a column downwards where every other MXFP4 path
+                 * walks a row forwards, so it selects nibbles and looks up group scales
+                 * by its own arithmetic. Getting that wrong yields finite, plausible
+                 * numbers -- and it is on the --mla-latent path, which is where a
+                 * quantised trunk and the absorbed query projection meet.
+                 *
+                 * Checked against the dequantised matrix through k3_matmul, not against
+                 * itself. Exact equality is not available here (the fp32 reference sums
+                 * a column in one order and the MXFP4 path scales per group), so the bar
+                 * is the fixture tolerance scaled for a 3584-term reduction. */
+                float *deq = (float *)malloc((size_t)rows * in * sizeof(float));
+                float *xr  = (float *)malloc((size_t)rows * sizeof(float));
+                float *yt  = (float *)malloc((size_t)in * sizeof(float));
+                float *yt2 = (float *)malloc((size_t)in * sizeof(float));
+                float *deqT = (float *)malloc((size_t)rows * in * sizeof(float));
+                if (deq && xr && yt && yt2 && deqT) {
+                    k3_mxfp4_dequant(deq, P, S, rows, pcols, grp);
+                    for (int rr = 0; rr < rows; rr++) {
+                        sd = sd * 1664525u + 1013904223u;
+                        xr[rr] = (float)((int)(sd >> 16) - 32768) / 32768.0f;
+                    }
+                    /* the transpose, so k3_matmul computes the same product */
+                    for (int rr = 0; rr < rows; rr++)
+                        for (int j = 0; j < in; j++)
+                            deqT[(size_t)j * rows + rr] = deq[(size_t)rr * in + j];
+                    k3_matmul(yt, xr, deqT, rows, in);
+                    k3_matmul_tr(yt2, xr, W, K3_WMX4, in, rows);
+                    report_x("mxfp4_tr", yt2, yt, in, 16.0);
+                }
+                free(deq); free(xr); free(yt); free(yt2); free(deqT);
+            }
+            free(W); free(x); free(ya); free(yb);
         }
         free(P); free(S); free(y);
     }
