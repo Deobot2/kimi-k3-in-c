@@ -232,6 +232,11 @@ int main(int argc, char **argv)
             ck(0, "speculation enabled", "cache refused to start the thread");
             k3_cache_free(&cache);
         } else {
+            /* Its own heading. Without one these lines print under whatever the last
+             * policy heading was -- which is "lru", and this section runs the DEFAULT
+             * policy, so the output said the opposite of what it tested. */
+            printf("\n-- speculative prefetch, %d slots, %s --\n", cache.nslot,
+                   cache.policy == K3_POLICY_LRU ? "lru" : "s3fifo");
             int bad = 0, reqs = 0;
             for (int tok = 0; tok < 24; tok++) {
                 /* Overlapping sets, the way real routing repeats: three of the four
