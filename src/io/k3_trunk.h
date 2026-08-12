@@ -111,8 +111,12 @@ typedef struct {
     int          n_layers;
     K3TrunkLayer *lay;
 
-    /* Backs every K3TrunkTensor.name, so it must outlive the whole struct. Owned here
-     * and freed by k3_trunk_close; do not free the parser arena separately. */
+    /* The parsed manifest. Every K3TrunkTensor.name points INTO it -- json_free drops
+     * those strings -- so it must outlive the whole struct and is released last by
+     * k3_trunk_close. json_arena is the parser's vestigial arena pointer, always NULL
+     * today; it is kept and freed so that a future parser change cannot silently leak
+     * through here. */
+    void          *json_root;
     char          *json_arena;
 
     /* Pinned layers get exact-size allocations; only the streaming ring is uniform.

@@ -978,6 +978,23 @@ int main(int argc, char **argv)
                 kv_sinks, kv_window);
         return 2;
     }
+    if (kv_window > 0 && (spec_n > 0 || draft_dir)) {
+        /* REFUSED, and this is a correctness limit rather than a policy.
+         *
+         * Speculation writes drafted positions into the cache and then, on a partial
+         * acceptance, REWINDS and replays only the accepted prefix. In an unbounded
+         * cache the rejected rows sit past `cached` and are simply never read. In a
+         * windowed one the slots wrap: a rejected position p lands in the slot of
+         * position p - R, and p - R is exactly the oldest position the replay still has
+         * to attend over. The replay would then read a rejected draft's latent as
+         * history -- not the approximation the window openly is, but a corruption on top
+         * of it, and one that depends on how many drafts happened to be rejected. */
+        fprintf(stderr,
+            "--kv-window cannot be combined with --spec or --draft-trunk.\n"
+            "  A rejected draft's rows wrap onto positions the replay still needs, so\n"
+            "  the rewind would read them as history. Drop one of the two.\n");
+        return 2;
+    }
     if (incremental) {
         const int npos = np + gen + 1;
         const double per_pos = mla_latent ? K3_KV_LATENT_BYTES_PER_POS

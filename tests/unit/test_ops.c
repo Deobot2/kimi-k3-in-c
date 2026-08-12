@@ -920,6 +920,38 @@ static void t_mxfp4(const char *dir)
                     printf("  FAIL  mxfp4_trunk    %d of %d rows differ\n", bad4, rows);
                     g_fail++;
                 }
+
+                /* ---- and the TRANSPOSED read of the same matrix ----
+                 * k3_matmul_tr walks a column downwards where every other MXFP4 path
+                 * walks a row forwards, so it selects nibbles and looks up group scales
+                 * by its own arithmetic. Getting that wrong yields finite, plausible
+                 * numbers -- and it is on the --mla-latent path, which is where a
+                 * quantised trunk and the absorbed query projection meet.
+                 *
+                 * Checked against the dequantised matrix through k3_matmul, not against
+                 * itself. Exact equality is not available here (the fp32 reference sums
+                 * a column in one order and the MXFP4 path scales per group), so the bar
+                 * is the fixture tolerance scaled for a 3584-term reduction. */
+                float *deq = (float *)malloc((size_t)rows * in * sizeof(float));
+                float *xr  = (float *)malloc((size_t)rows * sizeof(float));
+                float *yt  = (float *)malloc((size_t)in * sizeof(float));
+                float *yt2 = (float *)malloc((size_t)in * sizeof(float));
+                float *deqT = (float *)malloc((size_t)rows * in * sizeof(float));
+                if (deq && xr && yt && yt2 && deqT) {
+                    k3_mxfp4_dequant(deq, P, S, rows, pcols, grp);
+                    for (int rr = 0; rr < rows; rr++) {
+                        sd = sd * 1664525u + 1013904223u;
+                        xr[rr] = (float)((int)(sd >> 16) - 32768) / 32768.0f;
+                    }
+                    /* the transpose, so k3_matmul computes the same product */
+                    for (int rr = 0; rr < rows; rr++)
+                        for (int j = 0; j < in; j++)
+                            deqT[(size_t)j * rows + rr] = deq[(size_t)rr * in + j];
+                    k3_matmul(yt, xr, deqT, rows, in);
+                    k3_matmul_tr(yt2, xr, W, K3_WMX4, in, rows);
+                    report_x("mxfp4_tr", yt2, yt, in, 16.0);
+                }
+                free(deq); free(xr); free(yt); free(yt2); free(deqT);
             }
             free(W); free(x); free(ya); free(yb);
         }

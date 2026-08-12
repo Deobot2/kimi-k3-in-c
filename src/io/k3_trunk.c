@@ -143,6 +143,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
     char *arena = NULL;
     jval *root = json_parse(txt, &arena);
     tr->json_arena = arena;
+    tr->json_root = root;
     if (!root) { fprintf(stderr, "k3_trunk: %s is not valid JSON\n", p); free(txt); return -1; }
 
     jval *jl = json_get(root, "layers");
@@ -488,7 +489,13 @@ void k3_trunk_close(K3Trunk *tr)
     if (tr->pin) { for (int i = 0; i < tr->npin; i++) free(tr->pin[i]); free(tr->pin); }
     free(tr->arena); free(tr->layer_of); free(tr->slot_of); free(tr->pin_of);
     if (tr->lay) { for (int i = 0; i < tr->n_layers; i++) free(tr->lay[i].t); free(tr->lay); }
-    free(tr->json_arena);   /* every K3TrunkTensor.name points into this */
+    /* LAST: every K3TrunkTensor.name points into the parsed manifest, so the structures
+     * holding those pointers have to be gone first. Opening two trunks -- which the
+     * hybrid draft path does, and which tests/unit/test_trunk.c does repeatedly -- used
+     * to leak the whole manifest each time, because the parser had no free function and
+     * the arena pointer this once relied on is always NULL. */
+    json_free((jval *)tr->json_root);
+    free(tr->json_arena);
     memset(tr, 0, sizeof *tr);
     tr->fd = -1;            /* see k3_trunk_open: 0 is stdin, not "closed" */
 }

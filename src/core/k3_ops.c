@@ -47,6 +47,16 @@
  * This is deliberately NOT how streamed experts are handled: an expert that fails to
  * load is recoverable in principle, so it is counted in k3_expert_drops and the decision
  * is left to the caller. Memory exhaustion inside a kernel is not recoverable. */
+/* OCP MX E2M1: index by the 4-bit code; bit 3 is the sign. Exactly sixteen values.
+ *
+ * Defined here rather than beside the MXFP4 kernels at the bottom of the file because
+ * two unrelated places need it: those kernels, and k3_matmul_tr's transposed sweep over
+ * a quantised trunk. One table, so the two cannot disagree about what a nibble means. */
+static const float K3_E2M1[16] = {
+    0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+
 static void k3_fatal_oom(const char *what, size_t bytes)
 {
     fprintf(stderr,
@@ -597,6 +607,37 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
             double acc = 0.0;
             for (int r = 0; r < rows; r++)
                 acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
+            y[j] = (float)acc;
+        }
+    } else if (wdt == K3_WMX4) {
+        /* A quantised trunk. Column j of row r is the nibble at byte j/2 of that row,
+         * scaled by the E8M0 exponent of the group j/32 -- so the transposed sweep needs
+         * both a nibble select and a per-group scale lookup, where the bf16 case needed
+         * neither. Written out rather than routed through mxfp4_rowdot because that
+         * kernel walks a row forwards and this walks a column downwards; sharing it
+         * would mean expanding every row to floats to use one element of each.
+         *
+         * This exists so --mla-latent composes with a quantised trunk. Without it the
+         * absorbed query projection would read MXFP4 bytes as fp32 -- finite, plausible,
+         * and a completely different model. */
+        const size_t stride = k3_row_bytes(K3_WMX4, in);
+        const size_t pn = (size_t)in / 2u;
+        const unsigned char *base = (const unsigned char *)W;
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static) if (in > 64)
+#endif
+        for (int j = 0; j < in; j++) {
+            const size_t byte = (size_t)j >> 1;
+            const int    odd  = j & 1;
+            const size_t grp  = (size_t)j / K3_MXFP4_GROUP;
+            double acc = 0.0;
+            for (int r = 0; r < rows; r++) {
+                const unsigned char *row = base + (size_t)r * stride;
+                const unsigned char sb = row[pn + grp];
+                if (sb == 255) continue;              /* NaN scale: contributes nothing */
+                const unsigned char nib = odd ? (row[byte] >> 4) : (row[byte] & 0x0F);
+                acc += (double)x[r] * (double)K3_E2M1[nib] * (double)ldexpf(1.0f, (int)sb - 127);
+            }
             y[j] = (float)acc;
         }
     } else if (wdt == K3_WI8) {
@@ -1306,11 +1347,8 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
 }
 
 /* ---------------------------------------------------------------- MXFP4 ---- */
-/* OCP MX E2M1: index by the 4-bit code; bit 3 is the sign. */
-static const float K3_E2M1[16] = {
-    0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
-   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
-};
+/* K3_E2M1 lives near the top of this file: k3_matmul_tr needs it too, for the
+ * transposed sweep over a quantised trunk, and that is defined well before here. */
 
 #if defined(__AVX2__)
 #include <immintrin.h>
