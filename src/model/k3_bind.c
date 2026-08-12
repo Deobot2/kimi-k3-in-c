@@ -331,7 +331,15 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
 
     size_t w = 0;
     int narrowed_all = 1;
-    int i8_seen = 0, mx4_seen = 0;
+    /* Which formats a narrow (matmul) tensor was ACTUALLY bound in. bf16_seen has to be
+     * counted positively rather than inferred from narrowed_all: that flag starts at 1
+     * and is only ever cleared, so it means "no narrow tensor was an unknown format",
+     * not "a bf16 tensor was seen". Reading it as the latter made the mixed-format
+     * refusal below fire on every correctly packed MXFP4 trunk -- all its narrow tensors
+     * took the MX4 exit, nothing cleared the flag, and the layer was reported as mixing
+     * BF16 with MX4 when it contained no bf16 matmul weight at all. */
+    int bf16_seen = 0, i8_seen = 0, mx4_seen = 0;
+    const char *bf16_name = NULL;
     for (int i = 0; i < p.n; i++) {
         Req *q = &p.r[i];
         int64_t off = 0, nb = 0; int dt = 0;
@@ -422,7 +430,11 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
 
         if (q->narrow) {
             if (dt != K3_DT_BF16) { narrowed_all = 0; }   /* handled below */
-            else { *q->dest = run + off; continue; }
+            else {
+                *q->dest = run + off;
+                if (!bf16_seen) { bf16_seen = 1; bf16_name = q->name; }
+                continue;
+            }
         }
 
         /* Wanted as fp32. If it is already F32 on disk, point at it; a prefix take
@@ -452,16 +464,23 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
         fprintf(stderr, "k3_bind_mem: layer %d has a non-BF16 large tensor\n", L);
         return -1;
     }
-    if (i8_seen + mx4_seen + (narrowed_all ? 1 : 0) > 1 && (i8_seen || mx4_seen)) {
+    if (bf16_seen + i8_seen + mx4_seen > 1) {
         /* MIXED FORMATS IN ONE LAYER. The dtype tag lives on the STRUCT, not the field,
          * so a layer holding both bf16 and MXFP4 matmul weights cannot be described --
          * whichever tag is chosen, the other format is read as the wrong bytes and the
          * model runs and is wrong. A packer that quantised only some of a layer's narrow
-         * tensors produces exactly this, so it is refused with the layer named. */
+         * tensors produces exactly this.
+         *
+         * The bf16 tensor is NAMED, because that is the actionable half: it says which
+         * tensor the packer skipped, and therefore which rule in it was wrong. "layer 0
+         * mixes formats" on its own leaves the reader to diff two containers by hand. */
         fprintf(stderr, "k3_bind_mem: layer %d mixes weight formats (%s%s%s); a packed "
-                        "trunk must quantise ALL of a layer's matmul weights or none\n",
-                L, narrowed_all ? "BF16 " : "", i8_seen ? "I8R " : "",
+                        "trunk must quantise ALL of a layer's matmul weights or none.\n",
+                L, bf16_seen ? "BF16 " : "", i8_seen ? "I8R " : "",
                 mx4_seen ? "MX4" : "");
+        if (bf16_seen && bf16_name)
+            fprintf(stderr, "             the first bf16 matmul weight here is %s; the "
+                            "packer skipped it\n", bf16_name);
         return -1;
     }
 

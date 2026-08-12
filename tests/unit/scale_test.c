@@ -144,18 +144,30 @@ int main(void)
     printf("\nper-sequence state, FIXED regardless of context:\n");
     printf("  KDA recurrent : %s at bf16\n", b1);
     printf("  ShortConv     : %s at bf16\n", b2);
-    /* What the engine ACTUALLY caches, which is not the compressed latent. Re-expanding
-     * the 576-float latent through kv_b for every cached position would cost an O(T)
-     * sweep of 24576x512 matmuls per layer per token, so k3_mla_cached stores the
-     * EXPANDED per-head keys and values plus the shared rope slot, in fp32. That is 42x
-     * the latent, and quoting the latent figure here understated the cost by the same
-     * factor. */
+    /* BOTH KV layouts, because the engine now has both and quoting one would misstate
+     * the context ceiling by a factor of 43.
+     *
+     * EXPANDED is the default: k3_mla_cached stores per-head keys and values already put
+     * through kv_b, plus the shared rope slot, in fp32. It does that because re-expanding
+     * the latent for every cached position would cost an O(T) sweep of 24576x512 matmuls
+     * per layer per token.
+     *
+     * LATENT (--mla-latent) stores the 576 floats kv_a emitted and never expands them at
+     * all: weight absorption moves W_UK onto the query and W_UV past the attention sum,
+     * so the sweep the paragraph above rules out simply does not happen. Not
+     * bit-identical to the expanded path -- see the note in k3.h -- which is why it has
+     * its own fixtures rather than sharing the existing ones. */
     const double kv_tok = ((double)c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope) * 24 * 4;
+    const double kv_lat = ((double)c.kv_lora + c.qk_rope) * 24 * 4;
     human(kv_tok, b1, sizeof b1);
-    printf("  MLA KV        : %s per position (24 MLA layers, EXPANDED k and v, fp32)\n", b1);
+    human(kv_lat, b2, sizeof b2);
+    printf("  MLA KV        : %s per position EXPANDED (24 MLA layers, k and v, fp32)\n"
+           "                  %s per position LATENT   (--mla-latent, %.1fx smaller)\n",
+           b1, b2, kv_tok / kv_lat);
     for (long ctx = 8192; ctx <= 1048576; ctx *= 16) {
         human(kv_tok * (double)ctx, b1, sizeof b1);
-        printf("                  %s at %ld context\n", b1, ctx);
+        human(kv_lat * (double)ctx, b2, sizeof b2);
+        printf("                  %10s / %-10s at %ld context\n", b1, b2, ctx);
     }
 
     /* ---------- 5. actually run one full-width KDA layer ---------- */
