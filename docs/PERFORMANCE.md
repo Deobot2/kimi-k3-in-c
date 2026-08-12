@@ -94,6 +94,28 @@ saturates at 192 GB, which is where the working set finally fits. Belady's optim
 policy climbs steadily over the same range, so the flatness is LRU's, not the workload's:
 there is exploitable locality, and LRU cannot reach it.
 
+**That gap is why the engine no longer runs LRU.** 25.5 points at 64 GB is the largest
+single number in this project's measurements, and it says the lever is the replacement
+policy rather than the capacity. The cache now runs S3-FIFO (small FIFO + main FIFO +
+ghost queue), which is the standard answer to exactly this shape of access pattern:
+near-uniform popularity with many one-hit wonders and weak long-range reuse. Uniform
+object size — every expert is exactly 17,547,264 bytes — makes it the friendliest
+possible case, since no cost-aware weighting is needed.
+
+`tools/sim_cache.py` now reports an **S3-FIFO** column beside LRU and Belady, so
+regenerating the table above prints the achieved figure next to the ceiling. The table
+here has NOT been regenerated: it is from the published trace and the S3-FIFO column did
+not exist when it was made. Re-running it is item 2 on the roadmap, along with the rest
+of the campaign, and until then the honest statement is that S3-FIFO is expected to close
+part of that gap and has not been measured on this trace.
+
+A second change targets the same gap from the other side. About 90% of requests in this
+trace are repeats, and when decode reaches layer L for token t, layer L's top-16 for
+token t−1 is already known. The cache issues reads for that set on a background thread
+the moment the layer is entered, before the router has run, so a right guess converts a
+blocking 17.55 MB read into a warm hit and a wrong one spends bandwidth the engine is not
+otherwise using. Both are A/B-able on one binary (`K3_CACHE_POLICY=lru`, `K3_NOSPEC=1`).
+
 Two things to hold onto:
 
 - **This x-axis is cache size; the ladder's is total budget.** The ladder's 8 GB row has

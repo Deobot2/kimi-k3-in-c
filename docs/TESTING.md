@@ -17,7 +17,22 @@ the routing bias fails; the SiTU-GLU fixture drives the activation to its exact
 analytic cap.
 
 **`test_cache`**, the streaming expert cache: prefetch, eviction, and mixed batch/serial
-access. Uses a synthetic shard of structurally faithful experts, a few KB.
+access. Uses a synthetic shard of structurally faithful experts, a few KB. The whole
+battery runs under **both** replacement policies, because the policy decides which slot is
+reused and when — exactly the axis along which a slot-recycling bug hides under one
+setting and appears under the other. A final section drives the speculative prefetch
+thread the way `k3_moe` does, with enough churn between rounds that the guessed set has
+actually been evicted, so the background reader is genuinely racing the caller.
+
+**`test_trunk`**, the streaming trunk, which until now was unreachable without a 108.81 GB
+checkpoint. It writes a synthetic `trunk.bin`/`trunk.json` whose every layer is filled
+with a byte pattern derived from its own index, then walks the layers the way `forward()`
+does — fetch L, hint L+1, compute — and checks after every fetch that the bytes really are
+layer L's. That is the check that cannot be made against real weights, which all look like
+noise, and the failure it catches is the one that produces fluent wrong tokens rather than
+a crash. It covers ring depths 1, 2 and 3, the io_uring and `pread` paths, and the
+largest-first pinning choice (including that it pins at least as many bytes as prefix
+pinning at the same budget).
 
 **`test_st`**, the safetensors reader: dtype widening, offsets, tail bytes, escaped
 tensor names, and a tensor deliberately containing non-finite values.
@@ -70,8 +85,21 @@ architecture exactly:
 - greedy decode: every generated token matches
 - incremental decode: same tokens as full recompute, with KV cache and carried
   recurrent state
+- **latent KV**: same tokens again, with the 576-float latent cache and weight
+  absorption instead of expanded per-head keys and values
+- **latent window**: same tokens once more, with a window wide enough to hold the whole
+  sequence — the one configuration where windowing is required to change nothing
 
-All three must be *exact*. There is no tolerance on token identity.
+All five must be *exact*. There is no tolerance on token identity.
+
+The latent gates deserve a note, because they are the only place in the suite where
+"exact" and "bit-identical" come apart. Absorption reassociates two matmuls, so the
+latent path cannot match the expanded one to the bit and does not claim to; the numeric
+comparison lives in `test_ops` (`mla_latent`, `mla_lat_inc`, `mla_lat_window`, against the
+same torch reference at a stated multiple of the fixture tolerance). What the oracle adds
+is the only thing that finally matters: the same integers out. A rearrangement that
+changed a decoded token would be an error in the algebra, not rounding — the tiny model's
+logit gaps are far wider than a few ulps.
 
 ## Checkpoint-dependent tests
 
