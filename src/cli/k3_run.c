@@ -455,6 +455,10 @@ static void usage(FILE *f)
 "                        trunk-first; also spelled --trunk-gb auto\n"
 "  --list-presets        show each preset's split and expected speed\n"
 "  --trunk DIR           packed trunk directory; enables streaming (see scripts/)\n"
+"                        an MXFP4 trunk from tools/mxfp4_trunk.py is ~29 GB instead of\n"
+"                        108.81 GB and is detected from its manifest. IT IS NOT THE\n"
+"                        RELEASED MODEL: every bit-identity gate is void against it,\n"
+"                        and --ppl is what replaces them\n"
 "  --trunk-gb X          trunk ring / pinned-layer budget\n"
 "  --trunk-ring N        streaming ring slots (default 2). One slot is the layer being\n"
 "                        computed on, the rest are reads in flight. A third slot lets\n"
@@ -493,6 +497,10 @@ static void usage(FILE *f)
 "  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
 "\n"
 "diagnostics:\n"
+"  --ppl                 perplexity over the --ids sequence in one teacher-forced\n"
+"                        sweep. THE gate for a quantised trunk, which cannot be\n"
+"                        byte-compared against anything: run it on the bf16 trunk and\n"
+"                        on the quantised one and compare\n"
 "  --config PATH         model config; defaults to <model_dir>/config.json\n"
 "  --layers N            bind only the first N layers (partial shard sets)\n"
 "  --dump-logits PATH    write float32 logits for the first step\n"
@@ -598,9 +606,14 @@ static double mem_available_bytes(void)
  * full vector either way. The extra cost is one lm_head matmul per additional position,
  * pure RAM-resident compute; measured, an extra verified position costs ~22% of a serial
  * token at streamed-trunk budgets, which is the entire economics of --spec. */
+/* nll: when non-NULL, accumulate the negative log-likelihood the model assigns to the
+ * id the sequence ACTUALLY continues with at each position, summed over positions
+ * 0..T-2, and count them. That is perplexity's numerator, and it is the gate that
+ * replaces bit-identity when the trunk is quantised: a quantised model cannot be
+ * byte-compared against anything, but it can be asked how surprised it is. */
 static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, int T,
                    float *logits_last, float *scratch, float *h, float *br, float *kstate,
-                   int *arg_all)
+                   int *arg_all, double *nll, long *nll_n)
 {
     const int E = c->hidden;
     const int maxb = c->n_layers / c->attn_res_block + 2;
@@ -663,11 +676,24 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     }
 
     float *nrm = scratch;
-    if (arg_all) {
+    if (arg_all || nll) {
         for (int t = 0; t < T; t++) {
             k3_rmsnorm(nrm, h + (size_t)t * E, w->mb.norm, E, c->rms_eps);
             k3_mmw(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
-            arg_all[t] = argmax_(logits_last, c->vocab);
+            if (arg_all) arg_all[t] = argmax_(logits_last, c->vocab);
+            if (nll && t + 1 < T) {
+                /* log-softmax the stable way: subtract the max before exponentiating.
+                 * A 163,840-wide vocabulary with logits in the tens overflows expf()
+                 * without it, and the result would be inf rather than wrong-by-a-little. */
+                float m = logits_last[0];
+                for (int i = 1; i < c->vocab; i++)
+                    if (logits_last[i] > m) m = logits_last[i];
+                double z = 0.0;
+                for (int i = 0; i < c->vocab; i++) z += exp((double)logits_last[i] - m);
+                const int tgt = ids[t + 1];
+                *nll -= ((double)logits_last[tgt] - m) - log(z);
+                if (nll_n) (*nll_n)++;
+            }
         }
         /* logits_last now holds the FINAL position's vector, same as the plain path. */
         return 0;
@@ -707,7 +733,7 @@ int main(int argc, char **argv)
     double cache_gb = 64.0, trunk_gb = 16.0;
     int budget_auto = 0;
     int spec_n = 0;
-    int tf_check = 0;
+    int tf_check = 0, want_ppl = 0;
     const char *draft_dir = NULL;
     double draft_gb = 6.0;
     const char *load_state = NULL, *save_state = NULL;
@@ -728,6 +754,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
         else if (!strcmp(argv[i], "--spec") && i + 1 < argc) spec_n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tf-check")) tf_check = 1;
+        else if (!strcmp(argv[i], "--ppl")) want_ppl = 1;
         else if (!strcmp(argv[i], "--load-state") && i + 1 < argc) load_state = argv[++i];
         else if (!strcmp(argv[i], "--save-state") && i + 1 < argc) save_state = argv[++i];
         else if (!strcmp(argv[i], "--draft-trunk") && i + 1 < argc) draft_dir = argv[++i];
@@ -1370,6 +1397,44 @@ int main(int argc, char **argv)
         }
     }
 
+    /* --ppl: perplexity over the whole --ids sequence in ONE teacher-forced sweep.
+     *
+     * THIS IS THE GATE THAT REPLACES BIT-IDENTITY. Everything else in this project is
+     * validated by producing exactly the same bytes as a reference: the op fixtures, the
+     * oracle, the memory-ladder claim that output is identical at 8 GB and at 224 GB. A
+     * quantised trunk (tools/mxfp4_trunk.py, bound as K3_WMX4) breaks all of it by
+     * construction, because it is not the released model's weights any more.
+     *
+     * What can still be measured is how surprised the model is by real text. Run this
+     * against the bf16 trunk and against the quantised one on the SAME ids; the
+     * difference is the whole of what quantisation cost. A single number, but it is a
+     * number, which is more than "it still emits fluent text" ever was. */
+    if (want_ppl) {
+        if (np < 2) { fprintf(stderr, "--ppl needs at least 2 ids\n"); return 2; }
+        const double t0p = now_s();
+        double nll = 0.0; long npos = 0;
+        if (forward(&w, &c, &cache, seq, np, lg, sc, h, br, ks, NULL, &nll, &npos) != 0) {
+            fprintf(stderr, "forward failed in --ppl\n");
+            return 1;
+        }
+        const double mean = npos ? nll / (double)npos : 0.0;
+        printf("perplexity: %.4f over %ld positions (mean NLL %.4f nats) in %.1f s\n",
+               exp(mean), npos, mean, now_s() - t0p);
+        printf("  weights  : %s\n",
+               w.mb.wdt == K3_WBF16 ? "bf16 embed/lm_head"
+                                    : "fp32 embed/lm_head");
+        printf("  compare this against the SAME ids on a bf16 trunk. A quantised trunk\n"
+               "  cannot be byte-compared against anything, so this difference is the\n"
+               "  entire measurement. See docs/notes/compressed-trunk.md.\n");
+        FILE *pf = fopen(outp, "w");
+        if (pf) {
+            fprintf(pf, "{\"ppl_positions\":%ld,\"mean_nll\":%.6f,\"perplexity\":%.6f}\n",
+                    npos, mean, exp(mean));
+            fclose(pf);
+        }
+        return 0;
+    }
+
     /* --tf-check: teacher-forced agreement over the whole --ids sequence in ONE sweep.
      * Prediction i is the argmax after positions 0..i; it is compared to the id the
      * sequence actually continues with. This is the acceptance rate a draft model
@@ -1381,7 +1446,7 @@ int main(int argc, char **argv)
         int *arg = (int *)malloc((size_t)np * sizeof(int));
         if (!arg) { fprintf(stderr, "OOM for --tf-check\n"); return 1; }
         const double t0c = now_s();
-        if (forward(&w, &c, &cache, seq, np, lg, sc, h, br, ks, arg) != 0) {
+        if (forward(&w, &c, &cache, seq, np, lg, sc, h, br, ks, arg, NULL, NULL) != 0) {
             fprintf(stderr, "forward failed in --tf-check\n");
             return 1;
         }
@@ -1428,7 +1493,7 @@ int main(int argc, char **argv)
              * from a context one token short: fluent, plausible, and wrong. */
             const int base = w.cached;
             const int nT0 = T - base;
-            frc = forward(&w, &c, &cache, seq + base, nT0, lg, sc, h, br, ks, NULL);
+            frc = forward(&w, &c, &cache, seq + base, nT0, lg, sc, h, br, ks, NULL, NULL, NULL);
             if (frc == 0) { w.cached = base + nT0; emit[emitn++] = argmax_(lg, c.vocab); }
             /* The draft model must absorb the same context, or its first proposals
              * come from a shorter one; one draft sweep, paid once. Saved state does
@@ -1438,7 +1503,7 @@ int main(int argc, char **argv)
             if (dw.trunk && frc == 0) {
                 const int db = load_state ? 0 : base;
                 if (forward(&dw, &c, &cache, seq + db, base + nT0 - db, lg, sc, h, br,
-                            dks, NULL) == 0)
+                            dks, NULL, NULL, NULL) == 0)
                     dw.cached = base + nT0;
                 else frc = -1;
             }
@@ -1455,7 +1520,7 @@ int main(int argc, char **argv)
                     int prev = seq[base];
                     while (nd < spec_n) {
                         if (forward(&dw, &c, &cache, &prev, 1, lg, sc, h, br,
-                                    dks, NULL) != 0) break;
+                                    dks, NULL, NULL, NULL) != 0) break;
                         dw.cached += 1;
                         prev = argmax_(lg, c.vocab);
                         d[nd++] = prev;
@@ -1474,7 +1539,7 @@ int main(int argc, char **argv)
                 int arg[K3_SPEC_MAX + 1];
                 memcpy(spec_snap, ks, kper_f * (size_t)w.n_bound * sizeof(float));
                 for (int i = 0; i < nd; i++) seq[T + i] = d[i];
-                frc = forward(&w, &c, &cache, seq + base, nd + 1, lg, sc, h, br, ks, arg);
+                frc = forward(&w, &c, &cache, seq + base, nd + 1, lg, sc, h, br, ks, arg, NULL, NULL);
                 if (frc == 0) {
                     int m = 0;
                     while (m < nd && arg[m] == d[m]) m++;
@@ -1488,7 +1553,7 @@ int main(int argc, char **argv)
                         memcpy(ks, spec_snap, kper_f * (size_t)w.n_bound * sizeof(float));
                         w.cached = base;
                         frc = forward(&w, &c, &cache, seq + base, m + 1, lg, sc, h, br,
-                                      ks, NULL);
+                                      ks, NULL, NULL, NULL);
                         if (frc == 0) w.cached = base + m + 1;
                     }
                     /* Resync the draft model to the ACCEPTED sequence. On full
@@ -1501,13 +1566,13 @@ int main(int argc, char **argv)
                         if (m == nd) {
                             int last = d[nd - 1];
                             if (forward(&dw, &c, &cache, &last, 1, lg, sc, h, br,
-                                        dks, NULL) == 0) dw.cached += 1;
+                                        dks, NULL, NULL, NULL) == 0) dw.cached += 1;
                             else frc = -1;
                         } else {
                             memcpy(dks, dsnap, kper_f * (size_t)w.n_bound * sizeof(float));
                             dw.cached = base;
                             if (forward(&dw, &c, &cache, seq + base, m + 1, lg, sc,
-                                        h, br, dks, NULL) == 0) dw.cached = base + m + 1;
+                                        h, br, dks, NULL, NULL, NULL) == 0) dw.cached = base + m + 1;
                             else frc = -1;
                         }
                     }
@@ -1517,17 +1582,17 @@ int main(int argc, char **argv)
                     }
                 }
             } else {
-                frc = forward(&w, &c, &cache, seq + base, 1, lg, sc, h, br, ks, NULL);
+                frc = forward(&w, &c, &cache, seq + base, 1, lg, sc, h, br, ks, NULL, NULL, NULL);
                 if (frc == 0) { w.cached = base + 1; emit[emitn++] = argmax_(lg, c.vocab); }
                 /* keep the draft in lockstep through non-drafted steps */
                 if (dw.trunk && frc == 0) {
                     if (forward(&dw, &c, &cache, seq + base, 1, lg, sc, h, br,
-                                dks, NULL) == 0) dw.cached = base + 1;
+                                dks, NULL, NULL, NULL) == 0) dw.cached = base + 1;
                     else frc = -1;
                 }
             }
         } else {
-            frc = forward(&w, &c, &cache, seq, T, lg, sc, h, br, ks, NULL);
+            frc = forward(&w, &c, &cache, seq, T, lg, sc, h, br, ks, NULL, NULL, NULL);
             if (frc == 0) emit[emitn++] = argmax_(lg, c.vocab);
         }
         /* Abort the run rather than argmax a buffer the forward never wrote. */

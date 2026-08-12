@@ -14,6 +14,16 @@
  *
  *   Streaming costs zero error. The bytes are the checkpoint's own bytes.
  *
+ *   That is why streaming is the DEFAULT and always will be. It is not why quantising
+ *   is impossible: tools/mxfp4_trunk.py will write an MXFP4 trunk, ~29 GB against
+ *   108.81 GB, which makes the whole model resident on a 64 GB desktop and removes the
+ *   per-token trunk read entirely rather than merely speeding it up. What that costs is
+ *   the thing this repository is otherwise built on -- a run against it is not the
+ *   released model, cannot be byte-compared against anything, and voids every
+ *   bit-identity gate in the test suite. So it is a separate container with a flag on
+ *   it, the engine announces it on stdout, and `k3 --ppl` is the gate that replaces the
+ *   ones it invalidates. docs/notes/compressed-trunk.md is the procedure.
+ *
  * WHY IT IS AFFORDABLE
  *   Read bandwidth decides this, and it varies by an order of magnitude between a
  *   network volume and local NVMe. Measure the target device with tools/devbw.py
@@ -93,6 +103,11 @@ typedef struct {
 typedef struct {
     int          fd;
     int          direct;        /* 1 when the file was opened O_DIRECT */
+    /* 1 when trunk.json says its weights were quantised (tools/mxfp4_trunk.py). This is
+     * NOT a performance flag: it means the bytes are no longer the checkpoint's, so
+     * every bit-identity claim in this repository is void for the run. The engine says
+     * so on stdout rather than letting a log look like a normal run. */
+    int          quantised;
     int          n_layers;
     K3TrunkLayer *lay;
 

@@ -364,7 +364,19 @@ void k3_attn_res(float *out, const float *src, const float *fold,
  * never emitted directly and it carries no exactness contract, which is what lets it use
  * a fast, non-deterministic kernel. Each row is stored inline as [f32 scale][int8 * in],
  * so a matrix stays a single tagged pointer. Never tagged on the exact model. */
-enum { K3_WF32 = 0, K3_WBF16 = 1, K3_WI8 = 2 };
+/* K3_WMX4 is a whole-trunk MXFP4 weight matrix, produced by tools/mxfp4_trunk.py and
+ * selected with --trunk-quant. Rows are stored as [packed nibbles][E8M0 scales], the
+ * same OCP MX FP4 the routed experts already ship in, so it reuses their kernel.
+ *
+ * UNLIKE EVERY OTHER WEIGHT TYPE HERE, THIS ONE LOSES INFORMATION. bf16 -> fp32 is a
+ * shift and MXFP4 experts are the checkpoint's own bytes; a quantised trunk is not.
+ * The technical report keeps the trunk in higher precision on purpose (4.1.4), and this
+ * engine's own measurement on 31 real attention tensors put post-hoc int4 at 17.4% mean
+ * relative weight error against 0.96% for int8. So a run with a quantised trunk is NOT
+ * the released model and cannot be gated by bit-identity: `k3 --ppl` measures
+ * perplexity on a held-out id sequence instead, and that is the gate it has to pass.
+ * See docs/notes/compressed-trunk.md. */
+enum { K3_WF32 = 0, K3_WBF16 = 1, K3_WI8 = 2, K3_WMX4 = 3 };
 
 /* bf16 -> f32 is a pure left shift: bf16 IS the top 16 bits of an f32. No rounding,
  * no table, no exponent rebias. */
@@ -381,14 +393,21 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
  * No determinism contract (see K3_WI8): uses the fastest AVX2 form available. */
 void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out);
 
+/* MXFP4 matmul over a trunk matrix. W is `out` rows of
+ *     [packed nibbles, in/2 bytes][E8M0 scales, in/32 bytes]
+ * and each row goes through the SAME per-row kernel the routed experts use, so the two
+ * cannot drift apart in nibble order, scale handling or reduction order. */
+void k3_matmul_mx4(float *y, const float *x, const void *W, int in, int out);
+
 /* The one call every trunk matmul goes through. Dispatch is a predictable branch on a
  * per-layer flag, outside the inner loops, so it costs nothing measurable. */
 static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
                           int in, int out)
 {
-    if (wdt == K3_WBF16)     k3_matmul_bf16(y, x, (const uint16_t *)W, in, out);
-    else if (wdt == K3_WI8)  k3_matmul_q8(y, x, W, in, out);
-    else                     k3_matmul(y, x, (const float *)W, in, out);
+    if (wdt == K3_WBF16)      k3_matmul_bf16(y, x, (const uint16_t *)W, in, out);
+    else if (wdt == K3_WI8)   k3_matmul_q8(y, x, W, in, out);
+    else if (wdt == K3_WMX4)  k3_matmul_mx4(y, x, W, in, out);
+    else                      k3_matmul(y, x, (const float *)W, in, out);
 }
 
 /* Byte stride of one row for a per-row int8 matrix: the f32 scale plus `in` int8 weights.
@@ -396,7 +415,11 @@ static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
 static inline size_t k3_wsz(int wdt) { return wdt == K3_WBF16 ? 2u : 4u; }
 static inline size_t k3_row_bytes(int wdt, int in)
 {
-    return wdt == K3_WI8 ? (size_t)4 + (size_t)in : (size_t)in * k3_wsz(wdt);
+    if (wdt == K3_WI8)  return (size_t)4 + (size_t)in;
+    /* MXFP4: cols/2 nibble bytes plus one E8M0 byte per 32 elements. Every matmul input
+     * width in this model is a multiple of 32, which the packer checks. */
+    if (wdt == K3_WMX4) return (size_t)in / 2u + (size_t)in / 32u;
+    return (size_t)in * k3_wsz(wdt);
 }
 
 /* ZERO-INITIALISE EVERY WEIGHT STRUCT BEFORE FILLING IT. K3MoeW holds an optional

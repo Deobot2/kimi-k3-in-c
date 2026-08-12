@@ -1523,24 +1523,22 @@ static void k3_e8m0_init(void)
  * 1e-6 against dequantise-then-matmul on real checkpoint weights, gated by
  * tests/unit/test_expert.c. The margin is nine orders of magnitude.
  */
-void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
-                     const unsigned char *scales, int in, int rows, int group)
+/* ONE row of an MXFP4 matrix, dotted with x.
+ *
+ * Factored out so the two callers -- the routed experts, whose packed nibbles and E8M0
+ * scales live in separate contiguous planes, and a quantised trunk, whose rows carry
+ * their own scales inline -- share every arithmetic decision: nibble order, the NaN
+ * scale rule, the lane partition, the reduction order. They differ only in where the
+ * two byte pointers come from. Two copies of this loop would be two chances to get the
+ * nibble order right in one and wrong in the other, which is the failure mode the
+ * mxfp4 fixture exists for and which no statistic would reveal. */
+static double mxfp4_rowdot(const float *x, const unsigned char *pr,
+                           const unsigned char *sr, int in, int group)
 {
-    const int pcols = in / 2;                     /* two elements per byte */
     const int ngrp  = (in + group - 1) / group;
     const int gbyte = group / 2;
-
-    if (!k3_pair_ready)  k3_pair_init();
-    if (!k3_e8m0_ready)  k3_e8m0_init();
-
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (rows > 64)
-#endif
-    for (int r = 0; r < rows; r++) {
-        const unsigned char *pr = packed + (size_t)r * pcols;
-        const unsigned char *sr = scales + (size_t)r * ngrp;
-        double acc = 0.0;
-
+    double acc = 0.0;
+    {
         for (int g = 0; g < ngrp; g++) {
             const unsigned char sb = sr[g];
             if (sb == 255) continue;              /* NaN scale: contribute nothing */
@@ -1607,7 +1605,46 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
             for (; i < n; i++) sub = fma((double)wf[i], (double)xg[i], sub);
             acc += sub * (double)K3_E8M0[sb];
         }
-        y[r] = (float)acc;
+    }
+    return acc;
+}
+
+void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
+                     const unsigned char *scales, int in, int rows, int group)
+{
+    const int pcols = in / 2;                     /* two elements per byte */
+    const int ngrp  = (in + group - 1) / group;
+
+    if (!k3_pair_ready)  k3_pair_init();
+    if (!k3_e8m0_ready)  k3_e8m0_init();
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (rows > 64)
+#endif
+    for (int r = 0; r < rows; r++)
+        y[r] = (float)mxfp4_rowdot(x, packed + (size_t)r * pcols,
+                                   scales + (size_t)r * ngrp, in, group);
+}
+
+/* A quantised trunk matrix: `out` rows of [packed nibbles][E8M0 scales], each row
+ * self-contained so one tagged pointer describes the matrix, exactly as K3_WI8 does.
+ * The group is fixed at K3_MXFP4_GROUP because the packer writes it that way and the
+ * row stride depends on it; a different group would need a different container. */
+void k3_matmul_mx4(float *y, const float *x, const void *W, int in, int out)
+{
+    const size_t rb = k3_row_bytes(K3_WMX4, in);
+    const size_t pn = (size_t)in / 2u;
+    const unsigned char *base = (const unsigned char *)W;
+
+    if (!k3_pair_ready)  k3_pair_init();
+    if (!k3_e8m0_ready)  k3_e8m0_init();
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out > 64)
+#endif
+    for (int r = 0; r < out; r++) {
+        const unsigned char *row = base + (size_t)r * rb;
+        y[r] = (float)mxfp4_rowdot(x, row, row + pn, in, K3_MXFP4_GROUP);
     }
 }
 

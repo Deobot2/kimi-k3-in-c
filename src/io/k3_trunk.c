@@ -91,6 +91,7 @@ static int dt_of(const char *s)
     if (!strcmp(s, "U8"))   return K3_DT_U8;
     if (!strcmp(s, "F16"))  return K3_DT_F16;
     if (!strcmp(s, "I8R"))  return K3_DT_I8R;
+    if (!strcmp(s, "MX4"))  return K3_DT_MX4;
     return K3_DT_UNKNOWN;
 }
 
@@ -205,6 +206,18 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
             tr->direct = 0;
             tr->fd = open(p, O_RDONLY);
             if (tr->fd < 0) return -1;
+        }
+    }
+
+    {
+        jval *q = json_get(root, "quant");
+        if (q && q->t == J_STR) {
+            tr->quantised = 1;
+            printf("\n*** QUANTISED TRUNK (%s). The weights in %s are NOT the released\n"
+                   "*** checkpoint's bytes. Output is not comparable to any bit-identity\n"
+                   "*** reference and every such gate in this repository is void for this\n"
+                   "*** run. Measure it with --ppl instead; see\n"
+                   "*** docs/notes/compressed-trunk.md.\n\n", q->str, dir);
         }
     }
 

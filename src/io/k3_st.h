@@ -32,8 +32,12 @@
 
 /* K3_DT_I8R is the packed trunk's per-row int8 draft format: each row is [f32 scale]
  * [int8 * cols]. It only ever appears in a draft trunk written by tools/int8_trunk.py. */
+/* K3_DT_MX4 is the packed trunk's OCP MX FP4 form: each row is [packed nibbles,
+ * cols/2 bytes][E8M0 scales, cols/32 bytes], so a row is cols*17/32 bytes and the
+ * element count cannot be derived from the byte count alone. Only ever produced by
+ * tools/mxfp4_trunk.py, never by the released checkpoint. */
 typedef enum { K3_DT_UNKNOWN = 0, K3_DT_U8, K3_DT_BF16, K3_DT_F16, K3_DT_F32,
-               K3_DT_I8R } K3Dtype;
+               K3_DT_I8R, K3_DT_MX4 } K3Dtype;
 
 typedef struct {
     char     *name;

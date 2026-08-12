@@ -873,6 +873,56 @@ static void t_mxfp4(const char *dir)
                    "(got %.7f want %.7f)\n", bad, ne_, worst, at, y[at], ef[at]);
             g_fail++;
         }
+        /* ---- the QUANTISED TRUNK container, on the same bytes ----
+         *
+         * A routed expert stores its nibbles and its E8M0 scales in two separate
+         * contiguous planes. A quantised trunk (tools/mxfp4_trunk.py) interleaves them
+         * per row instead -- [nibbles][scales], [nibbles][scales], ... -- so that one
+         * tagged pointer describes the whole matrix, which is what k3_mmw needs.
+         *
+         * Same values, different addresses. That makes the two kernels comparable
+         * EXACTLY rather than approximately: k3_matmul_mx4 and k3_matmul_mxfp4 run the
+         * identical per-row code on the identical bytes, so any difference is a stride
+         * error in the interleaved layout and nothing else. A tolerance here would hide
+         * exactly the bug worth catching, which is a row read half from its own scales
+         * and half from the next row's nibbles.
+         *
+         * The fixture's `in` is pcols*2 and is a multiple of 32 on real checkpoint
+         * geometry, which is the same requirement the packer enforces. */
+        const int in = pcols * 2;
+        if (in % grp == 0 && grp == K3_MXFP4_GROUP) {
+            const size_t rb = (size_t)in / 2u + (size_t)in / 32u;
+            unsigned char *W = (unsigned char *)malloc(rb * (size_t)rows);
+            float *x  = (float *)malloc((size_t)in * sizeof(float));
+            float *ya = (float *)malloc((size_t)rows * sizeof(float));
+            float *yb = (float *)malloc((size_t)rows * sizeof(float));
+            if (W && x && ya && yb) {
+                const int ngrp = in / grp;
+                for (int rr = 0; rr < rows; rr++) {
+                    memcpy(W + (size_t)rr * rb, P + (size_t)rr * pcols, (size_t)pcols);
+                    memcpy(W + (size_t)rr * rb + pcols, S + (size_t)rr * ngrp,
+                           (size_t)ngrp);
+                }
+                unsigned sd = 0x5EEDu;
+                for (int i = 0; i < in; i++) {
+                    sd = sd * 1664525u + 1013904223u;
+                    x[i] = (float)((int)(sd >> 16) - 32768) / 32768.0f;
+                }
+                k3_matmul_mxfp4(ya, x, P, S, in, rows, grp);
+                k3_matmul_mx4(yb, x, W, in, rows);
+                int bad4 = 0;
+                for (int i = 0; i < rows; i++) if (ya[i] != yb[i]) bad4++;
+                if (bad4 == 0) {
+                    printf("  PASS  mxfp4_trunk    %d rows, interleaved rows "
+                           "bit-identical to split planes\n", rows);
+                    g_pass++;
+                } else {
+                    printf("  FAIL  mxfp4_trunk    %d of %d rows differ\n", bad4, rows);
+                    g_fail++;
+                }
+            }
+            free(W); free(x); free(ya); free(yb);
+        }
         free(P); free(S); free(y);
     }
     free(pf); free(sf); free(ef); free(txt); free(ar);
