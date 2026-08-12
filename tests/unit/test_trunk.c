@@ -15,7 +15,7 @@
  * reused underneath the caller changes the pattern, so the check that cannot be made
  * against real weights (they all look like noise) is trivial against these.
  *
- * FOUR THINGS ARE GATED
+ * FIVE THINGS ARE GATED
  *   1. the pinned set is chosen LARGEST FIRST, and the ring slot is therefore sized to
  *      the largest UNPINNED layer rather than the largest layer;
  *   2. largest-first pins at least as many bytes as prefix pinning at the same budget,
@@ -23,7 +23,10 @@
  *   3. a fetched layer's bytes survive an arbitrary number of prefetch hints landing in
  *      other slots, at ring depths 1, 2 and 3;
  *   4. the io_uring and pread paths return identical bytes, so the fast path cannot
- *      quietly differ from the portable one.
+ *      quietly differ from the portable one;
+ *   5. a packed run's WEIGHT FORMAT is worked out correctly -- all bf16, all MXFP4, and
+ *      a mixture refused. See the note above t_formats: that logic shipped wrong and
+ *      rejected every quantised trunk ever built, and nothing here could see it.
  *
  * usage: test_trunk <scratch_dir>
  */
@@ -35,6 +38,7 @@
 #include <string.h>
 
 #include "k3.h"
+#include "k3_bind.h"
 #include "k3_trunk.h"
 
 static int g_fail = 0;
@@ -139,6 +143,153 @@ static void run_case(const char *dir, const K3Cfg *c, const int64_t *len,
     k3_trunk_close(&tr);
 }
 
+/* ---------------------------------------------------------- weight formats ----
+ * A packed trunk can hold its matmul weights as bf16, as per-row int8 (the draft
+ * container) or as MXFP4 (tools/mxfp4_trunk.py). The format tag lives on the WEIGHT
+ * STRUCT, not on each tensor, so a layer must be entirely one of them -- and the binder
+ * has to work out which, from the dtypes alone, with no manifest field to consult.
+ *
+ * That logic had no test, and it was wrong: the flag it read as "a bf16 tensor was seen"
+ * actually meant "no narrow tensor was an unknown format", which is true of a correctly
+ * packed MXFP4 trunk. Every such trunk was refused as mixed, at layer 0, before a single
+ * token. Nothing in the suite could see it, because binding from a packed run needs
+ * ~28 named tensors at consistent shapes and no fixture provided them.
+ *
+ * This does. The table below is exactly what plan_layer asks for on a KDA + MoE layer,
+ * at dimensions small enough to build in memory, and the run is assembled three ways.
+ */
+#define BPRE "language_model.model."
+
+typedef struct {
+    const char *name;
+    int rows, cols;      /* cols == 0 marks a 1D tensor of `rows` elements */
+    int narrow;          /* 1 = a matmul weight, so quantisable            */
+    int64_t off, nbytes;
+    int dtype;
+} BTensor;
+
+/* Tiny but structurally faithful: hidden 128, 4 KDA heads of 32, latent 64, 8 experts.
+ * Every narrow tensor's COLUMN count is a multiple of 32, which is the packer's
+ * requirement and is true of every narrow tensor in the released model. */
+static BTensor g_bt[] = {
+    { BPRE "layers.1.input_layernorm.weight",              128, 0, 0, 0, 0, 0 },
+    { BPRE "layers.1.post_attention_layernorm.weight",     128, 0, 0, 0, 0, 0 },
+    { BPRE "layers.1.self_attention_res_norm.weight",      128, 0, 0, 0, 0, 0 },
+    { BPRE "layers.1.self_attention_res_proj.weight",      128, 0, 0, 0, 0, 0 },
+    { BPRE "layers.1.mlp_res_norm.weight",                 128, 0, 0, 0, 0, 0 },
+    { BPRE "layers.1.mlp_res_proj.weight",                 128, 0, 0, 0, 0, 0 },
+    { BPRE "layers.1.self_attn.q_proj.weight",             128, 128, 1, 0, 0, 0 },
+    { BPRE "layers.1.self_attn.k_proj.weight",             128, 128, 1, 0, 0, 0 },
+    { BPRE "layers.1.self_attn.v_proj.weight",             128, 128, 1, 0, 0, 0 },
+    { BPRE "layers.1.self_attn.g_proj.weight",             128, 128, 1, 0, 0, 0 },
+    { BPRE "layers.1.self_attn.o_proj.weight",             128, 128, 1, 0, 0, 0 },
+    { BPRE "layers.1.self_attn.q_conv1d.weight",           512, 0, 0, 0, 0, 0 },
+    { BPRE "layers.1.self_attn.k_conv1d.weight",           512, 0, 0, 0, 0, 0 },
+    { BPRE "layers.1.self_attn.v_conv1d.weight",           512, 0, 0, 0, 0, 0 },
+    { BPRE "layers.1.self_attn.f_a_proj.weight",            32, 128, 1, 0, 0, 0 },
+    { BPRE "layers.1.self_attn.f_b_proj.weight",           128,  32, 1, 0, 0, 0 },
+    { BPRE "layers.1.self_attn.b_proj.weight",               4, 128, 1, 0, 0, 0 },
+    { BPRE "layers.1.self_attn.A_log",                      32, 0, 0, 0, 0, 0 },
+    { BPRE "layers.1.self_attn.dt_bias",                   128, 0, 0, 0, 0, 0 },
+    { BPRE "layers.1.self_attn.o_norm.weight",              32, 0, 0, 0, 0, 0 },
+    /* The router gate is 2D, bf16 and large, and the engine STILL wants it as fp32:
+     * k3_router walks it with its own inline matmul. It is the one tensor a size-based
+     * packer rule would wrongly take, so it is here with narrow = 0. */
+    { BPRE "layers.1.block_sparse_moe.gate.weight",       1024, 0, 0, 0, 0, 0 },
+    { BPRE "layers.1.block_sparse_moe.gate.e_score_correction_bias", 8, 0, 0, 0, 0, 0 },
+    { BPRE "layers.1.block_sparse_moe.routed_expert_down_proj.weight",  64, 128, 1, 0, 0, 0 },
+    { BPRE "layers.1.block_sparse_moe.routed_expert_up_proj.weight",   128,  64, 1, 0, 0, 0 },
+    { BPRE "layers.1.block_sparse_moe.routed_expert_norm.weight",       64, 0, 0, 0, 0, 0 },
+    { BPRE "layers.1.block_sparse_moe.shared_experts.gate_proj.weight", 64, 128, 1, 0, 0, 0 },
+    { BPRE "layers.1.block_sparse_moe.shared_experts.up_proj.weight",   64, 128, 1, 0, 0, 0 },
+    { BPRE "layers.1.block_sparse_moe.shared_experts.down_proj.weight",128,  64, 1, 0, 0, 0 },
+};
+enum { BT_N = (int)(sizeof g_bt / sizeof g_bt[0]) };
+
+static int bfind(void *ctx, const char *name, int64_t *off, int64_t *nb, int *dt)
+{
+    (void)ctx;
+    for (int i = 0; i < BT_N; i++)
+        if (!strcmp(g_bt[i].name, name)) {
+            *off = g_bt[i].off; *nb = g_bt[i].nbytes; *dt = g_bt[i].dtype;
+            return 0;
+        }
+    return -1;
+}
+
+/* Lay the run out. `fmt` is the dtype every NARROW tensor gets; `bf16_at` names one
+ * narrow tensor forced back to bf16, for the mixed case, or -1. */
+static int64_t blayout(int fmt, int bf16_at)
+{
+    int64_t at = 0;
+    int narrow_i = 0;
+    for (int i = 0; i < BT_N; i++) {
+        BTensor *t = &g_bt[i];
+        int64_t nb;
+        if (!t->narrow) {
+            t->dtype = K3_DT_F32;
+            nb = (int64_t)t->rows * 4;             /* wide tensors are fp32 on disk */
+        } else {
+            const int use = (narrow_i++ == bf16_at) ? K3_DT_BF16 : fmt;
+            t->dtype = use;
+            nb = (use == K3_DT_MX4)
+               ? (int64_t)t->rows * (t->cols / 2 + t->cols / 32)
+               : (int64_t)t->rows * t->cols * 2;
+        }
+        at = (at + 7) & ~(int64_t)7;
+        t->off = at; t->nbytes = nb;
+        at += nb;
+    }
+    return at;
+}
+
+static void bcfg(K3Cfg *c, int *fa)
+{
+    memset(c, 0, sizeof *c);
+    c->hidden = 128; c->n_layers = 13; c->vocab = 256; c->rms_eps = 1e-5f;
+    c->kda_heads = 4; c->kda_head_dim = 32; c->conv_k = 4; c->gate_lb = -5.0f;
+    c->n_experts = 8; c->topk = 2; c->n_shared = 2;
+    c->latent = 64; c->moe_inter = 32; c->routed_scale = 1.0f;
+    c->moe_renorm = 1; c->latent_norm = 1;
+    c->first_dense = 1; c->dense_inter = 64;
+    c->attn_res_block = 3;
+    c->situ_b1 = 4.0f; c->situ_b2 = 25.0f;
+    fa[0] = 4; fa[1] = 8; fa[2] = 12;      /* ONE-based: layer 1 is KDA, not MLA */
+    c->n_full_attn = 3; c->full_attn = fa;
+}
+
+static void t_formats(void)
+{
+    K3Cfg c; int fa[4]; bcfg(&c, fa);
+    const size_t widen_cap = k3_bind_widen_bytes(&c);
+
+    struct { int fmt; int bf16_at; int want_ok; int want_wdt; const char *label; } cases[] = {
+        { K3_DT_BF16, -1, 1, K3_WBF16, "bind: all bf16"          },
+        { K3_DT_MX4,  -1, 1, K3_WMX4,  "bind: all MXFP4"         },
+        { K3_DT_MX4,   0, 0, 0,        "bind: refuses mixed"     },
+    };
+
+    for (int k = 0; k < 3; k++) {
+        const int64_t n = blayout(cases[k].fmt, cases[k].bf16_at);
+        unsigned char *run = (unsigned char *)calloc((size_t)n, 1);
+        unsigned char *wid = (unsigned char *)calloc(widen_cap, 1);
+        K3LayerBind b;
+        K3MemSrc src; src.find = bfind; src.ctx = NULL;
+        if (!run || !wid) { ok(cases[k].label, 0, "alloc"); free(run); free(wid); continue; }
+        const int rc = k3_bind_layer_mem(&c, 1, &b, run, &src, wid, widen_cap, NULL);
+        if (cases[k].want_ok) {
+            ok(cases[k].label, rc == 0 && b.kda.wdt == cases[k].want_wdt,
+               "rc %d, layer tagged %d (want %d)", rc, b.kda.wdt, cases[k].want_wdt);
+        } else {
+            /* The refusal is the point: one bf16 matmul weight among MXFP4 ones cannot
+             * be described by a per-struct tag, and binding it anyway would read the
+             * other format's bytes and run a different model without saying so. */
+            ok(cases[k].label, rc != 0, "rc %d (must be non-zero)", rc);
+        }
+        free(run); free(wid);
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = argc > 1 ? argv[1] : ".";
@@ -201,6 +352,9 @@ int main(int argc, char **argv)
     run_case(dir, &c, len, budget, 3, "ring depth 3");
     /* And at the floor, where nothing is pinned and every layer streams. */
     run_case(dir, &c, len, 3 * biggest, 3, "floor, nothing pinned");
+
+    /* ---- 5: weight formats in a packed run ---- */
+    t_formats();
 
     /* ---- 4: io_uring and pread must agree ---- */
     {
