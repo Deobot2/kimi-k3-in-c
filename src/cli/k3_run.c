@@ -1547,6 +1547,20 @@ int main(int argc, char **argv)
         const double mean = npos ? nll / (double)npos : 0.0;
         printf("perplexity: %.4f over %ld positions (mean NLL %.4f nats) in %.1f s\n",
                exp(mean), npos, mean, now_s() - t0p);
+        /* SAY WHEN THE NUMBER IS TOO SMALL TO USE. Per-token NLL varies by whole nats
+         * between positions, so the standard error on a short sequence is large enough
+         * to swallow the effect this figure exists to measure -- a few points of
+         * perplexity between a bf16 trunk and a quantised one. A tool that prints four
+         * decimal places on twenty samples and says nothing is inviting the reader to
+         * believe all four. */
+        if (npos < 512)
+            printf("  CAUTION: %ld positions is too few to conclude anything. Per-token\n"
+                   "  NLL varies by whole nats, so the error on this mean is comparable\n"
+                   "  to the difference you are probably trying to measure. Use a few\n"
+                   "  thousand ids of held-out text before quoting it.\n", npos);
+        if (gen > 0)
+            printf("  NOTE: --gen %d was ignored. --ppl is one teacher-forced sweep over\n"
+                   "  the ids given; it generates nothing.\n", gen);
         printf("  weights  : %s\n",
                w.mb.wdt == K3_WBF16 ? "bf16 embed/lm_head"
                                     : "fp32 embed/lm_head");

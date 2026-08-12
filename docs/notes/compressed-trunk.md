@@ -97,6 +97,32 @@ difference between the two perplexities is the entire measurement.
 `--tf-check` is the companion figure: it reports how often the quantised model's greedy
 token agrees with the sequence, which is the acceptance rate a draft design stands on.
 
+## First measurement, on the released checkpoint
+
+One 21-token prompt, 20 scored positions, identical ids, same 22 GB trunk budget:
+
+| | bf16 trunk | MXFP4 trunk |
+|---|---|---|
+| perplexity | 97.40 | 110.05 |
+| mean NLL | 4.5788 nats | 4.7009 nats |
+| trunk on disk | 108.81 GB | 29.81 GB (3.65x) |
+| layers pinned at 22 GB | 14/93 | 56/93 |
+
+**+13.0% perplexity, +0.122 nats.** Directionally what the int4 weight-error measurement
+above predicts, and enough to say the default should stay lossless.
+
+**Twenty positions is not a measurement.** Per-token NLL varies by whole nats, so the
+error on this mean is comparable to the gap it reports. `--ppl` now says so when the
+sequence is short. Before quoting a figure, use a few thousand ids of held-out text.
+
+The sweep times in that run -- 144.8 s bf16 against 127.3 s quantised -- are **not** a
+speedup measurement either. `--ppl` is a single teacher-forced sweep, so the trunk is
+read ONCE while expert I/O is paid for every position, and the experts are identical
+between the two runs (they were already MXFP4). The 17.5 s difference is the trunk alone:
+89.6 GB streamed against 8.7 GB, which at ~4.6 GB/s effective is ~17.5 s. Decode pays the
+trunk PER TOKEN, which is the case quantisation exists for, so measure speed with `--gen`
+and not with `--ppl`.
+
 ## When to use it
 
 If you need the released model's exact behaviour, do not. Stream the bf16 trunk; that is
