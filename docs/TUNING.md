@@ -84,6 +84,27 @@ Both are A/B-able on one binary, which is the only honest way to attribute a dif
     K3_NOSPEC=1           # no speculative prefetch
     K3_NOPREFETCH=1       # no batch prefetch either
 
+### The one number that decides whether cache capacity is worth anything
+
+One token touches `topk` experts in each of the 92 MoE layers: **1,472 experts, 25.8 GB**.
+Below that the cache cannot hold a single token's working set, so nothing survives to be
+reused and **capacity does not move the hit rate at all** — measured flat from 4 GB to
+24 GB on the recorded trace:
+
+| cache | 4 GB | 8 GB | 16 GB | 24 GB | 32 GB | 64 GB | 128 GB |
+|---|---|---|---|---|---|---|---|
+| hit rate | 36.2% | 36.2% | 36.2% | 36.2% | **42.7%** | **50.0%** | **73.7%** |
+
+So an expert cache is worth either the floor (~0.5 GB) or more than 25.8 GB, and nothing
+in between. A 10 GB cache buys exactly what a 0.5 GB cache buys, and those 9.5 GB belong
+in the trunk. `--preset auto` now allocates on exactly that rule.
+
+It is also why the S3-FIFO small queue is not the paper's flat 10%: an admission filter
+only pays once the main queue is worth protecting, and below one working set it just
+evicts objects before their second touch. The engine sizes the small queue from
+`cfg->topk` and the MoE layer count for that reason; `tools/sim_cache.py` carries the
+table that decided it.
+
 ## Presets
 
 ```console

@@ -127,7 +127,9 @@ typedef struct {
     int32_t      free_head;
     int32_t      s_head, s_tail, s_len;
     int32_t      m_head, m_tail, m_len;
-    int32_t      s_target;        /* small queue's share of the slots, ~10%    */
+    int32_t      s_target;        /* small queue's share; see the note in the .c   */
+    int32_t      working_set;     /* topk * MoE layers: one token's expert set, and
+                                   * the threshold s_target is chosen against       */
     int32_t     *ghost;           /* [nghost] ring of recently evicted keys    */
     unsigned char *ghost_mark;    /* [n_layers*n_experts] membership, exact    */
     int32_t      nghost, ghost_at, ghost_len;

@@ -124,6 +124,38 @@ static int find_in_layer(void *ctx, const char *name,
     return -1;
 }
 
+int k3_trunk_probe(const char *dir, int64_t *total_bytes, int *n_layers, int *quantised)
+{
+    char p[1024];
+    snprintf(p, sizeof p, "%s/trunk.json", dir);
+    char *txt = slurp(p, NULL);
+    if (!txt) return -1;
+    char *arena = NULL;
+    jval *root = json_parse(txt, &arena);
+    free(txt);
+    if (!root) { free(arena); return -1; }
+
+    int rc = -1;
+    jval *jl = json_get(root, "layers");
+    if (jl && jl->t == J_ARR) {
+        int64_t total = 0;
+        for (int i = 0; i < jl->len; i++) {
+            jval *v = json_get(jl->kids[i], "nbytes");
+            if (v && v->t == J_NUM) total += (int64_t)v->num;
+        }
+        if (total_bytes) *total_bytes = total;
+        if (n_layers) *n_layers = jl->len;
+        if (quantised) {
+            jval *q = json_get(root, "quant");
+            *quantised = (q && q->t == J_STR) ? 1 : 0;
+        }
+        rc = 0;
+    }
+    json_free(root);
+    free(arena);
+    return rc;
+}
+
 int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_bytes,
                   int ring_want)
 {

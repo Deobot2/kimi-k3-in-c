@@ -79,7 +79,10 @@ def belady(trace, cap):
     return hits
 
 
-def s3fifo(trace, cap, small_frac=0.1):
+WORKING_SET = 16 * 92              # top-16 in each of 92 MoE layers, in slots
+
+
+def s3fifo(trace, cap, small_frac=None, working_set=WORKING_SET):
     """S3-FIFO, the policy src/cache/k3_cache.c actually implements.
 
     Kept here as well as in C for one reason: this is where the decision to replace LRU
@@ -95,7 +98,26 @@ def s3fifo(trace, cap, small_frac=0.1):
 
     Frequency is a saturating 2-bit counter, not a recency order -- which is what makes
     it cheaper than LRU as well as better on this trace.
+
+    THE SMALL QUEUE'S SHARE IS NOT THE PAPER'S FLAT 10%, and this table is why:
+
+        cap/WS   0.15    0.62    1.24    2.48    4.96
+        LRU     36.24%  36.24%  36.24%  36.24%  49.19%
+        10%     32.92%  36.11%  42.68%  49.97%  73.73%
+        50%     36.21%  36.24%  36.24%  38.37%  69.68%
+
+    The small queue is an admission filter, and a filter only pays when the main queue
+    is worth protecting. Below one token's working set (1,472 slots, 25.8 GB) the cache
+    cannot hold a single token, nothing survives to be reused, and the filter does
+    nothing but evict objects before their second touch -- losing to the LRU it replaced.
+    Above it, the filter is worth 6 to 24 points.
+
+    So the share follows that ratio, which is exactly what k3_cache_init computes from
+    cfg->topk and the MoE layer count. Pass small_frac to override and reproduce the
+    table above.
     """
+    if small_frac is None:
+        small_frac = 0.10 if cap >= working_set else 0.50
     small = max(1, int(cap * small_frac))
     S, M = deque(), deque()
     G, Gset = deque(), set()
@@ -246,6 +268,11 @@ def main():
           % a.disk_mbs)
     print("BELADY and PIN+LRU both use future knowledge, so they are ceilings rather\n"
           "than achievable policies. S3-FIFO is what the engine does; LRU is what it did.")
+    print("\nS3-FIFO sizes its small queue against ONE TOKEN'S WORKING SET, %d slots\n"
+          "(%.1f GB): 10%% of the cache above that, 50%% below it, where an admission\n"
+          "filter has nothing to protect and loses to LRU. The engine computes the same\n"
+          "threshold from the config."
+          % (WORKING_SET, WORKING_SET * a.expert_bytes / 1e9))
     comp = uniq
     print("compulsory misses: %d (every expert must be read at least once), a ceiling of\n"
           "%.2f%% hit rate for ANY policy at ANY size on this trace."
