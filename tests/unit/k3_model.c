@@ -228,6 +228,99 @@ static void forward(Model *m, const K3Cfg *c, const int *ids, int T, float *logi
 static int argmax_(const float *v, int n)
 { int b = 0; for (int i = 1; i < n; i++) if (v[i] > v[b]) b = i; return b; }
 
+/* Incremental greedy decode: prefill the prompt in one call, then one token per call,
+ * carrying the KDA state and an MLA KV cache in the requested LAYOUT. Returns how many
+ * of the T - np generated tokens match `full`.
+ *
+ * One function for both layouts on purpose. Gates 3, 4 and 5 differ only in the
+ * K3KvCache they hand to the decoder, so they must not differ in anything else; two
+ * near-identical copies of a decode loop is exactly how a gate ends up testing its own
+ * copy of the bug. */
+static int decode_inc(Model *m, const K3Cfg *c, const int *full, int np, int T,
+                      int mode, int window, int sinks)
+{
+    const int E = c->hidden;
+    const int maxb = c->n_layers / c->attn_res_block + 2;
+    const int P = c->kda_heads * c->kda_head_dim;
+    const size_t kper = (size_t)P * (size_t)c->kda_head_dim
+                      + (size_t)3 * (size_t)P * (size_t)(c->conv_k - 1);
+    const int slots = (window > 0 && window < T) ? window : T;
+    const size_t kvper = (size_t)T * c->n_heads * (c->qk_nope + c->v_head);
+    const size_t rpper = (size_t)T * c->qk_rope;
+    const size_t latper = (size_t)slots * (size_t)(c->kv_lora + c->qk_rope);
+
+    size_t need = k3_layer_scratch_kv(c, T, T, mode);
+    const size_t alt = (size_t)(maxb + 2) * (size_t)E + (size_t)c->vocab;
+    if (alt > need) need = alt;
+
+    float *kvc = (mode == K3_KV_LATENT) ? NULL
+               : (float *)calloc(kvper * (size_t)c->n_layers, sizeof(float));
+    float *rpc = (mode == K3_KV_LATENT) ? NULL
+               : (float *)calloc(rpper * (size_t)c->n_layers, sizeof(float));
+    float *lat = (mode == K3_KV_LATENT)
+               ? (float *)calloc(latper * (size_t)c->n_layers, sizeof(float)) : NULL;
+    float *sc  = (float *)malloc(need * sizeof(float));
+    float *h   = (float *)malloc((size_t)T * (size_t)E * sizeof(float));
+    float *br  = (float *)malloc((size_t)T * (size_t)maxb * (size_t)E * sizeof(float));
+    float *ks  = (float *)malloc(kper * (size_t)c->n_layers * sizeof(float));
+    float *lg  = (float *)malloc((size_t)c->vocab * sizeof(float));
+    int   *gi  = (int *)malloc((size_t)T * sizeof(int));
+    int ok = 0;
+    const int have = sc && h && br && ks && lg && gi
+                  && (mode == K3_KV_LATENT ? lat != NULL : (kvc && rpc));
+
+    if (have) {
+        memcpy(gi, full, (size_t)np * sizeof(int));
+        memset(ks, 0, kper * (size_t)c->n_layers * sizeof(float));
+        int cached = 0;
+        for (int step = 0; cached < T - 1 || step == 0; step++) {
+            const int base = cached;
+            const int nT   = (step == 0) ? np : 1;
+            for (int t = 0; t < nT; t++)
+                memcpy(h + (size_t)t * E, m->embed + (size_t)gi[base + t] * E,
+                       (size_t)E * sizeof(float));
+            memset(br, 0, (size_t)nT * (size_t)maxb * (size_t)E * sizeof(float));
+            int nb = 0;
+            for (int L = 0; L < c->n_layers; L++) {
+                K3KvCache kv; memset(&kv, 0, sizeof kv);
+                kv.mode = mode; kv.cached = base; kv.window = window; kv.sinks = sinks;
+                if (mode == K3_KV_LATENT) {
+                    kv.lat = lat + latper * (size_t)L; kv.cap = slots;
+                } else {
+                    kv.kv = kvc + kvper * (size_t)L; kv.rope = rpc + rpper * (size_t)L;
+                    kv.cap = T;
+                }
+                k3_decoder_layer_kv(h, br, &nb, &m->lay[L], c, L, nT,
+                                    ks + kper * (size_t)L, sc, &kv);
+            }
+            /* model-level aggregator and head, on the LAST new position */
+            float *fold = sc, *src = fold + E;
+            const int lastt = nT - 1;
+            if (m->out_res_norm && m->out_res_proj) {
+                for (int i = 0; i < E; i++)
+                    fold[i] = m->out_res_norm[i] * m->out_res_proj[i];
+                for (int b = 0; b < nb; b++)
+                    memcpy(src + (size_t)b * E, br + ((size_t)lastt * maxb + b) * E,
+                           (size_t)E * sizeof(float));
+                memcpy(src + (size_t)nb * E, h + (size_t)lastt * E,
+                       (size_t)E * sizeof(float));
+                k3_attn_res(h + (size_t)lastt * E, src, fold, nb + 1, E, c->rms_eps);
+            }
+            float *nrm = sc;
+            k3_rmsnorm(nrm, h + (size_t)lastt * E, m->final_norm, E, c->rms_eps);
+            k3_matmul(lg, nrm, m->lm_head, E, c->vocab);
+
+            cached = base + nT;
+            if (cached >= T) break;
+            gi[cached] = argmax_(lg, c->vocab);
+        }
+        for (int i = np; i < T; i++) if (gi[i] == full[i]) ok++;
+    }
+    free(kvc); free(rpc); free(lat); free(sc); free(h); free(br); free(ks);
+    free(lg); free(gi);
+    return ok;
+}
+
 /* Config is read through k3_cfg.h, which never substitutes a default for a missing
  * field: it collects every absent key and refuses the load. Do not reintroduce a
  * defaulting reader here. A default turns "this program cannot understand this config"
@@ -346,72 +439,42 @@ int main(int argc, char **argv)
      * happens, not what is computed, so anything other than an exact match is a bug in
      * the state carrying, and that is exactly the failure this gate exists to catch. */
     {
-        const int H = c.n_heads, kvd = c.qk_nope + c.v_head;
-        const size_t kvper  = (size_t)T * H * kvd;      /* per layer */
-        const size_t rpper  = (size_t)T * c.qk_rope;
-        float *kvc = (float *)calloc(kvper * (size_t)c.n_layers, sizeof(float));
-        float *rpc = (float *)calloc(rpper * (size_t)c.n_layers, sizeof(float));
-        size_t need_i = k3_mla_scratch_cached(&c, T, T, 1);
-        size_t li = k3_layer_scratch(&c, T);
-        if (li > need_i) need_i = li;
-        if (alt > need_i) need_i = alt;
-        float *sc_i = (float *)malloc(need_i * sizeof(float));
-        float *h_i  = (float *)malloc((size_t)T * (size_t)c.hidden * sizeof(float));
-        float *br_i = (float *)malloc((size_t)T * (size_t)maxb * (size_t)c.hidden * sizeof(float));
-        float *ks_i = (float *)malloc(kper * (size_t)c.n_layers * sizeof(float));
-        float *lg_i = (float *)malloc((size_t)c.vocab * sizeof(float));
-        int *gi = (int *)malloc((size_t)T * sizeof(int));
-        int iok = 0;
-
-        if (kvc && rpc && sc_i && h_i && br_i && ks_i && lg_i && gi) {
-            memcpy(gi, full, (size_t)np * sizeof(int));
-            memset(ks_i, 0, kper * (size_t)c.n_layers * sizeof(float));
-            int cached = 0;
-            for (int step = 0; cached < T - 1 || step == 0; step++) {
-                /* first call feeds the whole prompt, later calls feed one token */
-                const int base = cached;
-                const int nT   = (step == 0) ? np : 1;
-                for (int t = 0; t < nT; t++)
-                    memcpy(h_i + (size_t)t * c.hidden,
-                           m->embed + (size_t)gi[base + t] * c.hidden,
-                           (size_t)c.hidden * sizeof(float));
-                memset(br_i, 0, (size_t)nT * (size_t)maxb * (size_t)c.hidden * sizeof(float));
-                int nb_i = 0;
-                for (int L = 0; L < c.n_layers; L++)
-                    k3_decoder_layer_inc(h_i, br_i, &nb_i, &m->lay[L], &c, L, nT,
-                                         ks_i + kper * (size_t)L, sc_i,
-                                         kvc + kvper * (size_t)L,
-                                         rpc + rpper * (size_t)L, base, T);
-                /* model-level aggregator and head, on the LAST new position */
-                float *fold = sc_i, *src = fold + c.hidden;
-                const int lastt = nT - 1;
-                if (m->out_res_norm && m->out_res_proj) {
-                    for (int i = 0; i < c.hidden; i++)
-                        fold[i] = m->out_res_norm[i] * m->out_res_proj[i];
-                    for (int b = 0; b < nb_i; b++)
-                        memcpy(src + (size_t)b * c.hidden,
-                               br_i + ((size_t)lastt * maxb + b) * c.hidden,
-                               (size_t)c.hidden * sizeof(float));
-                    memcpy(src + (size_t)nb_i * c.hidden,
-                           h_i + (size_t)lastt * c.hidden, (size_t)c.hidden * sizeof(float));
-                    k3_attn_res(h_i + (size_t)lastt * c.hidden, src, fold,
-                                nb_i + 1, c.hidden, c.rms_eps);
-                }
-                float *nrm = sc_i;
-                k3_rmsnorm(nrm, h_i + (size_t)lastt * c.hidden, m->final_norm,
-                           c.hidden, c.rms_eps);
-                k3_matmul(lg_i, nrm, m->lm_head, c.hidden, c.vocab);
-
-                cached = base + nT;
-                if (cached >= T) break;
-                gi[cached] = argmax_(lg_i, c.vocab);
-            }
-            for (int i = np; i < T; i++) if (gi[i] == full[i]) iok++;
-        }
+        const int iok = decode_inc(m, &c, full, np, T, K3_KV_EXPANDED, 0, 0);
         printf("GATE 3  incremental    : %d/%d generated tokens match full_ids"
                "  <- KV cache + carried KDA state\n", iok, T - np);
         gok = (iok == T - np) ? gok : -1;   /* fail the verdict if incremental diverged */
-        free(kvc); free(rpc); free(sc_i); free(h_i); free(br_i); free(ks_i); free(lg_i); free(gi);
+    }
+
+    /* ---- GATE 4: the LATENT KV cache ---------------------------------------------
+     * Gate 3's cache stores per-head k and v already expanded through kv_b, at 2.37 MB
+     * per position on the released model. This one stores the 576-float latent that
+     * kv_b was going to be applied to, at 55.3 KB -- and reaches the same answer by
+     * WEIGHT ABSORPTION: W_UK moves onto the query, W_UV moves past the attention sum.
+     *
+     * That reassociates two matmuls, so unlike gate 3 this is NOT bit-identical to
+     * anything, and the op-level fixture (mla_latent in test_ops) is the numeric check.
+     * What THIS gate adds is the only thing that finally matters: the same integers out.
+     * Absorption is a rearrangement, and a rearrangement that changed a decoded token
+     * would be a bug in the algebra, not rounding -- the tiny model's logit gaps are far
+     * wider than a few ulps.
+     *
+     * GATE 5 then re-runs it with a window WIDE ENOUGH to hold the whole sequence.
+     * Windowing is local attention and legitimately changes the output once it bites;
+     * at full width it must not bite at all, which is what makes the modular slot
+     * arithmetic testable without asserting anything false about approximate decoding. */
+    {
+        const int lok = decode_inc(m, &c, full, np, T, K3_KV_LATENT, 0, 0);
+        printf("GATE 4  latent KV      : %d/%d generated tokens match full_ids"
+               "  <- absorbed W_UK/W_UV, %.1fx smaller cache\n", lok, T - np,
+               (double)(c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope)
+                   / (double)(c.kv_lora + c.qk_rope));
+        if (lok != T - np) gok = -1;
+
+        const int wok = decode_inc(m, &c, full, np, T, K3_KV_LATENT, T, 2);
+        printf("GATE 5  latent window  : %d/%d generated tokens match full_ids"
+               "  <- window %d + 2 sinks, wide enough to bind nothing\n",
+               wok, T - np, T);
+        if (wok != T - np) gok = -1;
     }
 
     const int pass = (tf_gen_ok == tf_gen) && (gok == T - np);

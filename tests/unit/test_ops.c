@@ -126,6 +126,30 @@ static void report(const char *name, const float *got, const float *want, int n)
     }
 }
 
+/* Same, at a MULTIPLE of the fixture tolerance, for paths that are deliberately not
+ * bit-identical to the reference. The multiplier is printed rather than hidden, so a
+ * relaxed bar can never be mistaken for the exact one every other case here holds to,
+ * and so tightening or loosening it is a visible edit rather than a silent drift. */
+static void report_x(const char *name, const float *got, const float *want, int n,
+                     double tolx)
+{
+    double worst = 0.0; int at = -1;
+    for (int i = 0; i < n; i++) {
+        const double a = fabs((double)got[i] - (double)want[i]);
+        const double tol = tolx * (ATOL + RTOL * fabs((double)want[i]));
+        if (a / tol > worst) { worst = a / tol; at = i; }
+    }
+    if (worst <= 1.0) {
+        printf("  PASS  %-14s n=%-6d worst=%.2fx tol (bar is %.0fx the fixture tol)\n",
+               name, n, worst, tolx);
+        g_pass++;
+    } else {
+        printf("  FAIL  %-14s n=%-6d worst=%.2fx tol at i=%d  got %.7f want %.7f\n",
+               name, n, worst, at, got[at], want[at]);
+        g_fail++;
+    }
+}
+
 /* ----------------------------------------------------------------- tests ---- */
 static void t_rmsnorm(const char *dir)
 {
@@ -448,6 +472,65 @@ static void t_mla(const char *dir)
             printf("        H=%d qh=%d (nope %d + rope %d) v=%d kv_lora=%d scale=%.6f\n",
                    c.n_heads, c.qk_nope + c.qk_rope, c.qk_nope, c.qk_rope,
                    c.v_head, c.kv_lora, 1.0 / sqrt((double)(c.qk_nope + c.qk_rope)));
+
+            /* ---- THE LATENT CACHE, gated separately because it CANNOT match bit for
+             * bit and pretending otherwise would be the lie.
+             *
+             * Weight absorption moves W_UK to the query side and W_UV past the
+             * attention sum, which reassociates two matmuls: the same values are
+             * multiplied and added in a different order, so the result differs in the
+             * last few ulps by construction. Three things are checked here, and each
+             * one catches a different class of mistake that the reference comparison
+             * alone would not:
+             *
+             *   mla_latent      absorption against the torch reference. Catches a
+             *                   transposed W_UK, a head stride read as qk_nope instead
+             *                   of qk_nope+v_head, or the rope slots scored from the
+             *                   wrong half of the cached 576.
+             *   mla_lat_inc     the same weights fed ONE POSITION AT A TIME through the
+             *                   cache, compared against the batched call. Catches slot
+             *                   indexing and anything that only shows up once `cached`
+             *                   is non-zero, which is every real decode step.
+             *   mla_lat_window  a window WIDE ENOUGH TO HOLD EVERYTHING must change
+             *                   nothing at all. Catches the modular slot arithmetic and
+             *                   the sink span, on the one configuration where the
+             *                   windowed and unwindowed answers are required to agree.
+             *                   (A narrow window legitimately differs: it is local
+             *                   attention. That is not a thing a fixture can gate, so
+             *                   it is not gated here.)
+             * ---- */
+            const int kvw = c.kv_lora + c.qk_rope;
+            float *lat = (float *)calloc((size_t)T * kvw, sizeof(float));
+            float *y2  = (float *)malloc((size_t)T * c.hidden * sizeof(float));
+            float *sc2 = (float *)malloc(k3_mla_scratch_latent(&c, T, T) * sizeof(float));
+            if (lat && y2 && sc2) {
+                K3KvCache kv; memset(&kv, 0, sizeof kv);
+                kv.mode = K3_KV_LATENT; kv.lat = lat; kv.cap = T;
+                k3_mla_latent(y2, x, &w, &c, T, sc2, &kv);
+                report_x("mla_latent", y2, eo, n_out, 8.0);
+
+                memset(lat, 0, (size_t)T * kvw * sizeof(float));
+                memset(&kv, 0, sizeof kv);
+                kv.mode = K3_KV_LATENT; kv.lat = lat; kv.cap = T;
+                for (int t = 0; t < T; t++) {
+                    k3_mla_latent(y2 + (size_t)t * c.hidden, x + (size_t)t * c.hidden,
+                                  &w, &c, 1, sc2, &kv);
+                    kv.cached = t + 1;
+                }
+                report_x("mla_lat_inc", y2, eo, n_out, 8.0);
+
+                memset(lat, 0, (size_t)T * kvw * sizeof(float));
+                memset(&kv, 0, sizeof kv);
+                kv.mode = K3_KV_LATENT; kv.lat = lat; kv.cap = T;
+                kv.window = T; kv.sinks = 1;
+                for (int t = 0; t < T; t++) {
+                    k3_mla_latent(y2 + (size_t)t * c.hidden, x + (size_t)t * c.hidden,
+                                  &w, &c, 1, sc2, &kv);
+                    kv.cached = t + 1;
+                }
+                report_x("mla_lat_window", y2, eo, n_out, 8.0);
+            }
+            free(lat); free(y2); free(sc2);
         }
         free(scratch); free(y);
     }

@@ -123,6 +123,52 @@ static int real_cfg(K3Cfg *c, int *fa, int fa_max,
 static int argmax_(const float *v, int n)
 { int b = 0; for (int i = 1; i < n; i++) if (v[i] > v[b]) b = i; return b; }
 
+typedef struct {
+    K3LayerBind *lay;
+    K3ModelBind  mb;
+    int          n_bound;
+    K3Trunk     *trunk;      /* non-NULL when the trunk is streamed rather than resident */
+    /* Incremental decode state. Only MLA layers need a KV cache, so the 24 of them are
+     * numbered densely rather than indexing all 93 and wasting 74% of the allocation. */
+    float       *kvc, *ropec;   /* K3_KV_EXPANDED: per-head k/v, and the shared rope row */
+    float       *latc;          /* K3_KV_LATENT: the 576-float latent, 42.9x smaller     */
+    int          kv_mode;       /* K3_KV_EXPANDED or K3_KV_LATENT                        */
+    int          kv_on;         /* 1 once a cache is allocated; selects incremental decode */
+    int          kv_slots;      /* latent slots per layer: kv_cap, or the window          */
+    int          kv_window, kv_sinks;
+    int         *mla_slot;   /* [n_layers] -> dense MLA index, or -1 */
+    int          n_mla, kv_cap, cached;
+    int          draft_mode;   /* 1 for the hybrid draft: cache-only expert routing */
+} Weights;
+
+/* Floats of latent per position per MLA layer: the compressed latent plus the shared
+ * rope slot, which is exactly one kv_a output row. */
+static size_t kv_latent_width(const K3Cfg *c)
+{
+    return (size_t)c->kv_lora + (size_t)c->qk_rope;
+}
+
+/* Describe this layer's slice of whichever cache is in use. One place builds the
+ * descriptor so the two layouts cannot drift apart in the offsets they imply. */
+static void kv_for_layer(const Weights *w, const K3Cfg *c, int mi, K3KvCache *kv)
+{
+    memset(kv, 0, sizeof *kv);
+    kv->mode   = w->kv_mode;
+    kv->cached = w->cached;
+    kv->window = w->kv_window;
+    kv->sinks  = w->kv_sinks;
+    if (w->kv_mode == K3_KV_LATENT) {
+        kv->lat = w->latc + (size_t)mi * (size_t)w->kv_slots * kv_latent_width(c);
+        kv->cap = w->kv_slots;
+    } else {
+        const size_t kvper = (size_t)w->kv_cap * c->n_heads * (c->qk_nope + c->v_head);
+        const size_t rpper = (size_t)w->kv_cap * c->qk_rope;
+        kv->kv   = w->kvc   + kvper * (size_t)mi;
+        kv->rope = w->ropec + rpper * (size_t)mi;
+        kv->cap  = w->kv_cap;
+    }
+}
+
 /* ------------------------------------------------------- conversation state ----
  * Everything the engine carries between tokens, on disk. The point is turn two of a
  * conversation: without this, resuming re-reads the whole prompt through all 93 layers,
@@ -138,9 +184,18 @@ static int argmax_(const float *v, int n)
  * OCCUPIED positions are written and a resumed run may size its cache differently. The
  * header carries a config fingerprint: restoring state built by a different architecture
  * would produce fluent, wrong output with nothing to indicate it, which is the one
- * failure mode this engine refuses to have. */
+ * failure mode this engine refuses to have.
+ *
+ * THE KV LAYOUT IS PART OF THE FINGERPRINT, for the same reason the architecture is.
+ * The expanded and latent caches hold different tensors of different widths; a file
+ * written by one and read by the other would restore numbers of the right count and the
+ * wrong meaning. Version 2 records the layout and the window geometry and refuses a
+ * mismatch, rather than trusting the caller to pass the same flags twice. A window also
+ * makes the cache a RING, so the slot array is saved whole -- slots are a pure function
+ * of absolute position, so restoring them verbatim is exact as long as the geometry
+ * agrees, which the header checks. */
 #define K3_STATE_MAGIC "K3ST"
-#define K3_STATE_VER   1
+#define K3_STATE_VER   2
 
 typedef struct {
     char    magic[4];
@@ -149,6 +204,10 @@ typedef struct {
     int32_t n_bound, n_mla, cached, nseq;
     int64_t kper;          /* KDA+conv floats per layer */
     int64_t kvpp, ropepp;  /* KV / rope floats per position, per MLA layer */
+    int32_t kv_mode;       /* K3_KV_EXPANDED or K3_KV_LATENT                 */
+    int32_t kv_window, kv_sinks;
+    int32_t kv_rows;       /* rows written per MLA layer: positions, or slots */
+    int64_t kv_row_floats; /* floats per row: kv_lora + qk_rope in latent mode */
 } K3StateHdr;
 
 static void k3_state_fp(const K3Cfg *c, int32_t *fp)
@@ -185,9 +244,18 @@ static int k3_state_peek(const char *path, K3StateHdr *hd)
     return 0;
 }
 
+/* Rows of KV written per MLA layer, and how wide each row is. A windowed latent cache
+ * is a ring, so the whole slot array goes out; everything else writes only the occupied
+ * positions and lets a resumed run size its cache differently. */
+static int32_t k3_state_rows(const Weights *w)
+{
+    if (w->kv_mode != K3_KV_LATENT) return w->cached;
+    return w->kv_window > 0 ? w->kv_slots
+                            : (w->cached < w->kv_slots ? w->cached : w->kv_slots);
+}
+
 static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
-                         int *seq, float *ks, float *kvc, float *ropec,
-                         int n_bound, int n_mla, int kv_cap)
+                         int *seq, float *ks, Weights *w)
 {
     int32_t fp[12];
     k3_state_fp(c, fp);
@@ -196,15 +264,35 @@ static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
                         "  Restoring it would produce fluent, wrong output.\n", path);
         return -1;
     }
-    if (hd->n_bound != n_bound || hd->n_mla != n_mla) {
+    if (hd->n_bound != w->n_bound || hd->n_mla != w->n_mla) {
         fprintf(stderr, "REFUSING: %s holds %d bound layers and %d MLA layers, "
                         "this run has %d and %d\n",
-                path, hd->n_bound, hd->n_mla, n_bound, n_mla);
+                path, hd->n_bound, hd->n_mla, w->n_bound, w->n_mla);
         return -1;
     }
-    if (hd->cached > kv_cap) {
+    /* The layout is not a formatting detail: the two caches hold different tensors, so
+     * the same float count means different things. Refuse rather than reinterpret. */
+    if (hd->kv_mode != w->kv_mode) {
+        fprintf(stderr, "REFUSING: %s holds a %s KV cache and this run uses the %s one.\n"
+                        "  Re-run with%s --mla-latent, or start a fresh session.\n",
+                path, hd->kv_mode == K3_KV_LATENT ? "LATENT" : "expanded",
+                w->kv_mode == K3_KV_LATENT ? "LATENT" : "expanded",
+                hd->kv_mode == K3_KV_LATENT ? "" : "out");
+        return -1;
+    }
+    if (hd->kv_window != w->kv_window || hd->kv_sinks != w->kv_sinks) {
+        /* Slots are a pure function of absolute position GIVEN the geometry. Change the
+         * geometry and every restored row lands under a different position. */
+        fprintf(stderr, "REFUSING: %s was written with --kv-window %d --kv-sinks %d, "
+                        "this run has %d and %d.\n"
+                        "  The window decides which slot a position occupies, so the "
+                        "rows would be misread.\n",
+                path, hd->kv_window, hd->kv_sinks, w->kv_window, w->kv_sinks);
+        return -1;
+    }
+    if (hd->cached > w->kv_cap) {
         fprintf(stderr, "REFUSING: %s holds %d positions, this run's KV cache is %d.\n"
-                        "  Raise --gen or shorten the prompt.\n", path, hd->cached, kv_cap);
+                        "  Raise --gen or shorten the prompt.\n", path, hd->cached, w->kv_cap);
         return -1;
     }
     FILE *f = fopen(path, "rb");
@@ -213,19 +301,35 @@ static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
 
     int rc = 0;
     if (fread(seq, sizeof(int), (size_t)hd->nseq, f) != (size_t)hd->nseq) rc = -1;
-    if (!rc && fread(ks, sizeof(float), (size_t)hd->kper * n_bound, f)
-               != (size_t)hd->kper * (size_t)n_bound) rc = -1;
-    /* Position-major inside each layer slice, so a differently-sized destination cache
-     * is written slice by slice rather than as one block. */
-    for (int mi = 0; !rc && mi < n_mla; mi++) {
-        float *dst = kvc + (size_t)mi * kv_cap * hd->kvpp;
-        const size_t n = (size_t)hd->cached * hd->kvpp;
-        if (fread(dst, sizeof(float), n, f) != n) rc = -1;
-    }
-    for (int mi = 0; !rc && mi < n_mla; mi++) {
-        float *dst = ropec + (size_t)mi * kv_cap * hd->ropepp;
-        const size_t n = (size_t)hd->cached * hd->ropepp;
-        if (fread(dst, sizeof(float), n, f) != n) rc = -1;
+    if (!rc && fread(ks, sizeof(float), (size_t)hd->kper * w->n_bound, f)
+               != (size_t)hd->kper * (size_t)w->n_bound) rc = -1;
+
+    if (w->kv_mode == K3_KV_LATENT) {
+        const size_t kvw = kv_latent_width(c);
+        if (hd->kv_row_floats != (int64_t)kvw || hd->kv_rows > w->kv_slots) {
+            fprintf(stderr, "REFUSING: %s holds %d latent rows of %lld floats, this run "
+                            "has %d rows of %zu\n",
+                    path, hd->kv_rows, (long long)hd->kv_row_floats, w->kv_slots, kvw);
+            fclose(f); return -1;
+        }
+        for (int mi = 0; !rc && mi < w->n_mla; mi++) {
+            float *dst = w->latc + (size_t)mi * (size_t)w->kv_slots * kvw;
+            const size_t n = (size_t)hd->kv_rows * kvw;
+            if (fread(dst, sizeof(float), n, f) != n) rc = -1;
+        }
+    } else {
+        /* Position-major inside each layer slice, so a differently-sized destination
+         * cache is written slice by slice rather than as one block. */
+        for (int mi = 0; !rc && mi < w->n_mla; mi++) {
+            float *dst = w->kvc + (size_t)mi * w->kv_cap * hd->kvpp;
+            const size_t n = (size_t)hd->kv_rows * hd->kvpp;
+            if (fread(dst, sizeof(float), n, f) != n) rc = -1;
+        }
+        for (int mi = 0; !rc && mi < w->n_mla; mi++) {
+            float *dst = w->ropec + (size_t)mi * w->kv_cap * hd->ropepp;
+            const size_t n = (size_t)hd->kv_rows * hd->ropepp;
+            if (fread(dst, sizeof(float), n, f) != n) rc = -1;
+        }
     }
     fclose(f);
     if (rc) fprintf(stderr, "%s is truncated\n", path);
@@ -233,38 +337,64 @@ static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
 }
 
 static int k3_state_save(const char *path, const K3Cfg *c, const int *seq, int nseq,
-                         const float *ks, const float *kvc, const float *ropec,
-                         int n_bound, int n_mla, int kv_cap, int cached,
-                         int64_t kper, int64_t kvpp, int64_t ropepp)
+                         const float *ks, const Weights *w, int64_t kper)
 {
     FILE *f = fopen(path, "wb");
     if (!f) { perror(path); return -1; }
+    const int64_t kvpp   = (int64_t)c->n_heads * (c->qk_nope + c->v_head);
+    const int64_t ropepp = (int64_t)c->qk_rope;
+    const size_t  kvw    = kv_latent_width(c);
+    const int32_t rows   = k3_state_rows(w);
+
     K3StateHdr hd;
     memset(&hd, 0, sizeof hd);
     memcpy(hd.magic, K3_STATE_MAGIC, 4);
     hd.version = K3_STATE_VER;
     k3_state_fp(c, hd.fp);
-    hd.n_bound = n_bound; hd.n_mla = n_mla; hd.cached = cached; hd.nseq = nseq;
+    hd.n_bound = w->n_bound; hd.n_mla = w->n_mla; hd.cached = w->cached; hd.nseq = nseq;
     hd.kper = kper; hd.kvpp = kvpp; hd.ropepp = ropepp;
+    hd.kv_mode = w->kv_mode; hd.kv_window = w->kv_window; hd.kv_sinks = w->kv_sinks;
+    hd.kv_rows = rows;
+    hd.kv_row_floats = (w->kv_mode == K3_KV_LATENT) ? (int64_t)kvw : kvpp + ropepp;
 
     int rc = 0;
     if (fwrite(&hd, sizeof hd, 1, f) != 1) rc = -1;
     if (!rc && fwrite(seq, sizeof(int), (size_t)nseq, f) != (size_t)nseq) rc = -1;
-    if (!rc && fwrite(ks, sizeof(float), (size_t)kper * n_bound, f)
-               != (size_t)kper * (size_t)n_bound) rc = -1;
-    for (int mi = 0; !rc && mi < n_mla; mi++) {
-        const float *src = kvc + (size_t)mi * kv_cap * kvpp;
-        const size_t n = (size_t)cached * kvpp;
-        if (fwrite(src, sizeof(float), n, f) != n) rc = -1;
-    }
-    for (int mi = 0; !rc && mi < n_mla; mi++) {
-        const float *src = ropec + (size_t)mi * kv_cap * ropepp;
-        const size_t n = (size_t)cached * ropepp;
-        if (fwrite(src, sizeof(float), n, f) != n) rc = -1;
+    if (!rc && fwrite(ks, sizeof(float), (size_t)kper * w->n_bound, f)
+               != (size_t)kper * (size_t)w->n_bound) rc = -1;
+    if (w->kv_mode == K3_KV_LATENT) {
+        for (int mi = 0; !rc && mi < w->n_mla; mi++) {
+            const float *src = w->latc + (size_t)mi * (size_t)w->kv_slots * kvw;
+            const size_t n = (size_t)rows * kvw;
+            if (fwrite(src, sizeof(float), n, f) != n) rc = -1;
+        }
+    } else {
+        for (int mi = 0; !rc && mi < w->n_mla; mi++) {
+            const float *src = w->kvc + (size_t)mi * w->kv_cap * kvpp;
+            const size_t n = (size_t)rows * kvpp;
+            if (fwrite(src, sizeof(float), n, f) != n) rc = -1;
+        }
+        for (int mi = 0; !rc && mi < w->n_mla; mi++) {
+            const float *src = w->ropec + (size_t)mi * w->kv_cap * ropepp;
+            const size_t n = (size_t)rows * ropepp;
+            if (fwrite(src, sizeof(float), n, f) != n) rc = -1;
+        }
     }
     if (fclose(f) != 0) rc = -1;
     if (rc) fprintf(stderr, "failed writing %s\n", path);
     return rc;
+}
+
+/* Bytes a saved state occupies, for the line printed after writing it. */
+static double k3_state_bytes(const K3Cfg *c, const Weights *w, int nseq, int64_t kper)
+{
+    const double rows = (double)k3_state_rows(w);
+    const double per  = (w->kv_mode == K3_KV_LATENT)
+        ? (double)kv_latent_width(c)
+        : (double)c->n_heads * (c->qk_nope + c->v_head) + (double)c->qk_rope;
+    return (double)sizeof(K3StateHdr) + (double)nseq * sizeof(int)
+         + (double)kper * w->n_bound * sizeof(float)
+         + rows * per * w->n_mla * sizeof(float);
 }
 
 static int spec_draft(const int *seq, int T, int cap, int *out)
@@ -331,6 +461,16 @@ static void usage(FILE *f)
 "generation:\n"
 "  --gen N               tokens to generate (default 8)\n"
 "  --incremental         carry KV cache and recurrent state between tokens\n"
+"  --mla-latent          cache the 576-float MLA latent instead of expanded per-head\n"
+"                        k and v: 55.3 KB per position instead of 2.37 MB, a 42.9x\n"
+"                        reduction, so 131k context costs 7.25 GB rather than 310 GB.\n"
+"                        Weight absorption keeps the arithmetic equivalent but NOT\n"
+"                        bit-identical; needs --incremental\n"
+"  --kv-window N         cap the latent cache at N positions. This is LOCAL ATTENTION\n"
+"                        beyond N and CHANGES THE OUTPUT; off by default. Needs\n"
+"                        --mla-latent\n"
+"  --kv-sinks S          of the window, keep the first S positions permanently\n"
+"                        (default 4). Attention sinks; only meaningful with --kv-window\n"
 "  --save-state PATH     write the carried state after the run, so the next turn of a\n"
 "                        conversation resumes instead of re-reading the whole prompt\n"
 "  --load-state PATH     resume from a saved state; the prompt given now is treated as\n"
@@ -443,19 +583,6 @@ static double mem_available_bytes(void)
     return kb * 1024.0;
 }
 
-typedef struct {
-    K3LayerBind *lay;
-    K3ModelBind  mb;
-    int          n_bound;
-    K3Trunk     *trunk;      /* non-NULL when the trunk is streamed rather than resident */
-    /* Incremental decode state. Only MLA layers need a KV cache, so the 24 of them are
-     * numbered densely rather than indexing all 93 and wasting 74% of the allocation. */
-    float       *kvc, *ropec;
-    int         *mla_slot;   /* [n_layers] -> dense MLA index, or -1 */
-    int          n_mla, kv_cap, cached;
-    int          draft_mode;   /* 1 for the hybrid draft: cache-only expert routing */
-} Weights;
-
 /* One full forward over T tokens, writing logits for the LAST position only. Every
  * step rebuilds state from scratch, matching the path the oracle validates.
  *
@@ -483,7 +610,7 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     /* Incremental decode carries the KDA recurrent matrix and ShortConv history across
      * steps, so it must NOT be cleared here; the full-recompute path rebuilds from
      * scratch every step and must be. */
-    if (!w->kvc) memset(kstate, 0, kper * (size_t)w->n_bound * sizeof(float));
+    if (!w->kv_on) memset(kstate, 0, kper * (size_t)w->n_bound * sizeof(float));
     int nb = 0;
     for (int L = 0; L < w->n_bound; L++) {
         /* Streaming: bring this layer in, and hint the next one so its read overlaps
@@ -505,19 +632,14 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
              * the exact model keeps true routing. This is what makes a draft step cheap. */
             w->lay[L].moe.cache_only = w->draft_mode;
         }
-        if (w->kvc && w->mla_slot[L] >= 0) {
-            const size_t kvper = (size_t)w->kv_cap * c->n_heads * (c->qk_nope + c->v_head);
-            const size_t rpper = (size_t)w->kv_cap * c->qk_rope;
-            const int mi = w->mla_slot[L];
-            k3_decoder_layer_inc(h, br, &nb, &w->lay[L].lay, c, L, T,
-                                 kstate + kper * (size_t)L, scratch,
-                                 w->kvc + kvper * (size_t)mi,
-                                 w->ropec + rpper * (size_t)mi,
-                                 w->cached, w->kv_cap);
+        if (w->kv_on && w->mla_slot[L] >= 0) {
+            K3KvCache kv;
+            kv_for_layer(w, c, w->mla_slot[L], &kv);
+            k3_decoder_layer_kv(h, br, &nb, &w->lay[L].lay, c, L, T,
+                                kstate + kper * (size_t)L, scratch, &kv);
         } else {
-            k3_decoder_layer_inc(h, br, &nb, &w->lay[L].lay, c, L, T,
-                                 kstate + kper * (size_t)L, scratch,
-                                 NULL, NULL, 0, 0);
+            k3_decoder_layer_kv(h, br, &nb, &w->lay[L].lay, c, L, T,
+                                kstate + kper * (size_t)L, scratch, NULL);
         }
     }
 
@@ -587,6 +709,7 @@ int main(int argc, char **argv)
     const char *load_state = NULL, *save_state = NULL;
     const char *preset_name = NULL;
     int incremental = 0;
+    int mla_latent = 0, kv_window = 0, kv_sinks = 4;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
@@ -610,6 +733,9 @@ int main(int argc, char **argv)
             else { trunk_gb = atof(v); budget_auto = 0; }
         }
         else if (!strcmp(argv[i], "--incremental")) incremental = 1;
+        else if (!strcmp(argv[i], "--mla-latent")) mla_latent = 1;
+        else if (!strcmp(argv[i], "--kv-window") && i + 1 < argc) kv_window = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--kv-sinks") && i + 1 < argc) kv_sinks = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) logits_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-cache-trace") && i + 1 < argc) trace_dir = argv[++i];
         else if (!strcmp(argv[i], "--preset") && i + 1 < argc && !strcmp(argv[i + 1], "auto")) {
@@ -801,22 +927,61 @@ int main(int argc, char **argv)
      * what the kernel says is actually available and refuse with both numbers, rather
      * than letting a long prompt get 40 minutes into a run and then be OOM-killed. Only
      * incremental decode allocates the KV cache; full recompute carries no cache. */
+    /* ---- KV layout, and the flags that only make sense together ---- */
+    if (mla_latent && !incremental) {
+        fprintf(stderr, "--mla-latent needs --incremental: without a carried cache "
+                        "there is no KV layout to choose\n");
+        return 2;
+    }
+    if (kv_window > 0 && !mla_latent) {
+        /* The window is a property of the latent cache. Applying it to the expanded one
+         * would work arithmetically and save 42.9x less memory for the same loss of
+         * context, which is not a trade worth offering. */
+        fprintf(stderr, "--kv-window needs --mla-latent\n");
+        return 2;
+    }
+    if (kv_window > 0 && (kv_sinks < 0 || kv_sinks >= kv_window)) {
+        fprintf(stderr, "--kv-sinks %d must be in [0, --kv-window %d)\n",
+                kv_sinks, kv_window);
+        return 2;
+    }
     if (incremental) {
-        const double kv_need = (double)(np + gen + 1) * K3_KV_BYTES_PER_POS;
+        const int npos = np + gen + 1;
+        const double per_pos = mla_latent ? K3_KV_LATENT_BYTES_PER_POS
+                                          : K3_KV_BYTES_PER_POS;
+        const int held = (kv_window > 0 && kv_window < npos) ? kv_window : npos;
+        const double kv_need = (double)held * per_pos;
         const double avail   = mem_available_bytes();
         char kb[32], ab[32];
         human(kv_need, kb, sizeof kb);
         human(avail, ab, sizeof ab);
-        printf("  KV cache : %s for %d positions (%.2f MB/position)\n",
-               kb, np + gen + 1, K3_KV_BYTES_PER_POS / 1e6);
+        printf("  KV cache : %s for %d positions (%.2f KB/position, %s layout)\n",
+               kb, held, per_pos / 1e3, mla_latent ? "LATENT" : "expanded");
+        if (mla_latent)
+            printf("             absorbed: W_UK folded onto the query and W_UV applied to "
+                   "the latent attention sum,\n"
+                   "             so per-head k and v are never materialised. NOT "
+                   "bit-identical to the expanded path.\n");
+        if (kv_window > 0 && kv_window < npos)
+            printf("             WINDOWED at %d positions (+%d sinks inside it): "
+                   "attention beyond the window is\n"
+                   "             not computed at all, so THE OUTPUT DIFFERS from an "
+                   "unwindowed run. This is a memory\n"
+                   "             ceiling, not a speed feature. See docs/TUNING.md.\n",
+                   kv_window, kv_sinks);
         if (avail > 0.0 && kv_need > avail * 0.9) {
             fprintf(stderr,
                 "\nREFUSING: the KV cache for %d positions needs %s but only %s is\n"
                 "available. This is a MEMORY limit, not an engine ceiling: MLA caches\n"
-                "expanded k and v in fp32 across 24 layers, so context costs ~2.37 MB per\n"
-                "position regardless of budget. Shorten the request, or use full\n"
+                "%s across 24 layers, so context costs ~%.2f %s per\n"
+                "position regardless of budget. %sShorten the request, or use full\n"
                 "recompute (drop --incremental), which carries no KV cache at all.\n",
-                np + gen + 1, kb, ab);
+                held, kb, ab,
+                mla_latent ? "the compressed latent in fp32"
+                           : "expanded k and v in fp32",
+                mla_latent ? per_pos / 1e3 : per_pos / 1e6,
+                mla_latent ? "KB" : "MB",
+                mla_latent ? "" : "Try --mla-latent, which is 42.9x smaller. ");
             return 2;
         }
     }
@@ -888,10 +1053,12 @@ int main(int argc, char **argv)
          * 4096-token prompt alone is 9.7 GB. */
         int n_mla = 0;
         for (int L = 0; L < c.n_layers; L++) if (k3_is_mla(&c, L)) n_mla++;
-        const double w_kv = incremental
-            ? (double)Tm * n_mla
-              * ((double)c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope) * 4
-            : 0.0;
+        const int kv_pos = (kv_window > 0 && kv_window < Tm) ? kv_window : Tm;
+        const double w_kv = !incremental ? 0.0
+            : mla_latent
+              ? (double)kv_pos * n_mla * (double)(c.kv_lora + c.qk_rope) * 4
+              : (double)Tm * n_mla
+                * ((double)c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope) * 4;
         const double need_b = w_trunk + w_model + w_cache + w_state + w_buf + w_kv;
         const double have = mem_available_bytes();
 
@@ -1015,7 +1182,11 @@ int main(int argc, char **argv)
     float *h  = (float *)malloc((size_t)Tmax * E * sizeof(float));
     float *br = (float *)malloc((size_t)Tmax * maxb * E * sizeof(float));
     float *ks = (float *)malloc(kper * (size_t)NL * sizeof(float));
-    size_t sc_need = k3_layer_scratch(&c, Tmax);
+    /* Size for the layout that will actually run. The latent path carries H absorbed
+     * queries and a latent-space accumulator that the expanded path has no use for, so
+     * sizing a latent run with the expanded figure under-allocates silently. */
+    size_t sc_need = k3_layer_scratch_kv(&c, Tmax, Tmax,
+                                         mla_latent ? K3_KV_LATENT : K3_KV_EXPANDED);
     {   /* the cached MLA path sizes its score buffer by cache capacity, not by T */
         const size_t ic = k3_mla_scratch_cached(&c, Tmax, Tmax, 1);
         if (ic > sc_need) sc_need = ic;
@@ -1052,22 +1223,50 @@ int main(int argc, char **argv)
         for (int L = 0; L < NL; L++)
             w.mla_slot[L] = k3_is_mla(&c, L) ? w.n_mla++ : -1;
         w.kv_cap = Tmax;
-        const size_t kvper = (size_t)w.kv_cap * c.n_heads * (c.qk_nope + c.v_head);
-        const size_t rpper = (size_t)w.kv_cap * c.qk_rope;
-        const double kvb = (double)(kvper + rpper) * w.n_mla * sizeof(float);
-        human(kvb, b1, sizeof b1);
-        printf("incremental decode: KV cache %s for %d MLA layers at %d positions\n\n",
-               b1, w.n_mla, w.kv_cap);
-        w.kvc   = (float *)calloc(kvper * (size_t)w.n_mla, sizeof(float));
-        w.ropec = (float *)calloc(rpper * (size_t)w.n_mla, sizeof(float));
-        if (!w.kvc || !w.ropec) { fprintf(stderr, "KV cache allocation failed\n"); return 1; }
+        w.kv_mode = mla_latent ? K3_KV_LATENT : K3_KV_EXPANDED;
+        w.kv_window = kv_window;
+        w.kv_sinks  = kv_window > 0 ? kv_sinks : 0;
+        /* A window that is not smaller than the run is no window at all; dropping it
+         * here keeps the fast, modulo-free slot path and stops the banner claiming a
+         * restriction that is not in force. */
+        if (w.kv_window >= Tmax) { w.kv_window = 0; w.kv_sinks = 0; }
+        w.kv_slots = w.kv_window > 0 ? w.kv_window : w.kv_cap;
+
+        if (w.kv_mode == K3_KV_LATENT) {
+            const size_t kvw = kv_latent_width(&c);
+            const size_t lper = (size_t)w.kv_slots * kvw;
+            human((double)lper * w.n_mla * sizeof(float), b1, sizeof b1);
+            printf("incremental decode: LATENT KV cache %s for %d MLA layers at %d "
+                   "positions\n", b1, w.n_mla, w.kv_slots);
+            {   /* the same run in the expanded layout, so the saving is on the record */
+                const double exp_b = (double)w.kv_cap * w.n_mla
+                    * ((double)c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope)
+                    * sizeof(float);
+                char b8[32]; human(exp_b, b8, sizeof b8);
+                printf("                    the expanded layout would be %s for the same "
+                       "run (%.1fx)\n\n", b8,
+                       exp_b / ((double)lper * w.n_mla * sizeof(float)));
+            }
+            w.latc = (float *)calloc(lper * (size_t)w.n_mla, sizeof(float));
+            if (!w.latc) { fprintf(stderr, "KV cache allocation failed\n"); return 1; }
+        } else {
+            const size_t kvper = (size_t)w.kv_cap * c.n_heads * (c.qk_nope + c.v_head);
+            const size_t rpper = (size_t)w.kv_cap * c.qk_rope;
+            const double kvb = (double)(kvper + rpper) * w.n_mla * sizeof(float);
+            human(kvb, b1, sizeof b1);
+            printf("incremental decode: KV cache %s for %d MLA layers at %d positions\n\n",
+                   b1, w.n_mla, w.kv_cap);
+            w.kvc   = (float *)calloc(kvper * (size_t)w.n_mla, sizeof(float));
+            w.ropec = (float *)calloc(rpper * (size_t)w.n_mla, sizeof(float));
+            if (!w.kvc || !w.ropec) { fprintf(stderr, "KV cache allocation failed\n"); return 1; }
+        }
+        w.kv_on = 1;
         memset(ks, 0, kper * (size_t)NL * sizeof(float));
         w.cached = 0;
 
         if (load_state) {
             const double tl = now_s();
-            if (k3_state_load(load_state, &c, &shd, seq, ks, w.kvc, w.ropec,
-                              w.n_bound, w.n_mla, w.kv_cap) != 0)
+            if (k3_state_load(load_state, &c, &shd, seq, ks, &w) != 0)
                 return 1;
             w.cached = shd.cached;
             printf("restored %d positions in %.2f s: decode continues without "
@@ -1125,11 +1324,28 @@ int main(int argc, char **argv)
             dw.lay = (K3LayerBind *)calloc((size_t)NL, sizeof(K3LayerBind));
             dks   = (float *)calloc(kper_f * (size_t)w.n_bound, sizeof(float));
             dsnap = (float *)malloc(kper_f * (size_t)w.n_bound * sizeof(float));
-            const size_t kvperd = (size_t)w.kv_cap * c.n_heads * (c.qk_nope + c.v_head);
-            const size_t rpperd = (size_t)w.kv_cap * c.qk_rope;
-            dw.kvc   = (float *)calloc(kvperd * (size_t)w.n_mla, sizeof(float));
-            dw.ropec = (float *)calloc(rpperd * (size_t)w.n_mla, sizeof(float));
-            if (!dw.lay || !dks || !dsnap || !dw.kvc || !dw.ropec) {
+            /* The draft carries its own KV in the SAME layout as the exact model, so a
+             * latent run drafts against a latent cache and the memory saving applies to
+             * both halves of the hybrid rather than being eaten by the draft. */
+            dw.kv_mode   = w.kv_mode;
+            dw.kv_window = w.kv_window;
+            dw.kv_sinks  = w.kv_sinks;
+            dw.kv_slots  = w.kv_slots;
+            dw.kv_cap    = w.kv_cap;
+            if (w.kv_mode == K3_KV_LATENT) {
+                const size_t lperd = (size_t)w.kv_slots * kv_latent_width(&c);
+                dw.latc = (float *)calloc(lperd * (size_t)w.n_mla, sizeof(float));
+                if (!dw.latc) { fprintf(stderr, "OOM for the draft model state\n"); return 1; }
+            } else {
+                const size_t kvperd = (size_t)w.kv_cap * c.n_heads * (c.qk_nope + c.v_head);
+                const size_t rpperd = (size_t)w.kv_cap * c.qk_rope;
+                dw.kvc   = (float *)calloc(kvperd * (size_t)w.n_mla, sizeof(float));
+                dw.ropec = (float *)calloc(rpperd * (size_t)w.n_mla, sizeof(float));
+                if (!dw.kvc || !dw.ropec) {
+                    fprintf(stderr, "OOM for the draft model state\n"); return 1;
+                }
+            }
+            if (!dw.lay || !dks || !dsnap) {
                 fprintf(stderr, "OOM for the draft model state\n"); return 1;
             }
             dw.mb = w.mb;              /* embed + lm_head are the same tensors */
@@ -1137,7 +1353,7 @@ int main(int argc, char **argv)
             dw.n_bound = w.n_bound;
             dw.mla_slot = w.mla_slot;  /* read-only map, safely shared */
             dw.n_mla = w.n_mla;
-            dw.kv_cap = w.kv_cap;
+            dw.kv_on = 1;
             dw.cached = 0;
             dw.draft_mode = 1;   /* cache-only routing: draft tokens read no new experts */
             printf("hybrid decode: draft trunk %s (%.1f GB budget) proposes up to %d "
@@ -1352,14 +1568,8 @@ int main(int argc, char **argv)
             fprintf(stderr, "--save-state needs --incremental; nothing written\n");
         } else {
             const double tsv = now_s();
-            const int64_t kvpp   = (int64_t)c.n_heads * (c.qk_nope + c.v_head);
-            const int64_t ropepp = (int64_t)c.qk_rope;
-            if (k3_state_save(save_state, &c, seq, T, ks, w.kvc, w.ropec,
-                              w.n_bound, w.n_mla, w.kv_cap, w.cached,
-                              (int64_t)kper, kvpp, ropepp) == 0) {
-                const double bytes = (double)sizeof(K3StateHdr) + (double)T * sizeof(int)
-                    + (double)kper * w.n_bound * sizeof(float)
-                    + (double)w.cached * (kvpp + ropepp) * w.n_mla * sizeof(float);
+            if (k3_state_save(save_state, &c, seq, T, ks, &w, (int64_t)kper) == 0) {
+                const double bytes = k3_state_bytes(&c, &w, T, (int64_t)kper);
                 char sb[32]; human(bytes, sb, sizeof sb);
                 printf("wrote %s (%s, %d positions) in %.2f s\n",
                        save_state, sb, w.cached, now_s() - tsv);
@@ -1374,7 +1584,7 @@ int main(int argc, char **argv)
                hyb_drafted ? 100.0 * hyb_accepted / hyb_drafted : 0.0,
                (double)hyb_accepted / hyb_rounds);
         k3_trunk_close(&trunk_d);
-        free(dw.lay); free(dks); free(dsnap); free(dw.kvc); free(dw.ropec);
+        free(dw.lay); free(dks); free(dsnap); free(dw.kvc); free(dw.ropec); free(dw.latc);
     }
     free(spec_snap);
     printf("--------------------------------------------------------------------\n");
@@ -1419,7 +1629,7 @@ int main(int argc, char **argv)
         k3_cache_dump_trace(&cache, p);
     }
 
-    free(w.kvc); free(w.ropec); free(w.mla_slot);
+    free(w.kvc); free(w.ropec); free(w.latc); free(w.mla_slot);
     /* Report the compute-versus-I/O split rather than leaving it to be inferred.
      *
      * It cannot be inferred safely: a flat curve across a RAM sweep looks like evidence

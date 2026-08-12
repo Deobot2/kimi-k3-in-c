@@ -393,6 +393,243 @@ void k3_mla(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     k3_mla_cached(out, x, w, c, T, scratch, NULL, NULL, 0, 0);
 }
 
+/* --------------------------------------------------- MLA over a LATENT cache ---- */
+/* See the long note in k3.h for why the latent form is cheaper in bytes without being
+ * more expensive in time, and for what absorption does to exactness. This is the
+ * arithmetic.
+ *
+ * kv_b is [n_heads*(qk_nope+v_head)][kv_lora], row-major. Head h owns kvd = qk_nope +
+ * v_head consecutive ROWS starting at h*kvd, and those rows are two matrices stacked:
+ *
+ *     rows [h*kvd,          h*kvd + qk_nope)   W_UK[h]   latent -> nope key
+ *     rows [h*kvd+qk_nope,  h*kvd + kvd)       W_UV[h]   latent -> value
+ *
+ * Neither is ever formed or copied. W_UK[h] is consumed transposed by k3_matmul_tr to
+ * pull the query into latent space; W_UV[h] is consumed as-is by k3_mmw, once per token
+ * rather than once per cached position, on the latent-space attention sum.
+ */
+void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
+                   int T, float *scratch, const K3KvCache *kv)
+{
+    const int E  = c->hidden, H = c->n_heads;
+    const int qn = c->qk_nope, qr = c->qk_rope, vh = c->v_head;
+    const int qh = qn + qr;                       /* 192: the FULL head width      */
+    const int kl = c->kv_lora;                    /* 512                            */
+    const int kvw = kl + qr;                      /* 576: latent + shared rope slot */
+    const int kvd = qn + vh;                      /* 256: rows of kv_b per head    */
+    const float scale = 1.0f / sqrtf((float)qh);  /* over qh, exactly as uncached   */
+    const int cached = kv->cached;
+    const int last = cached + T - 1;
+
+    /* Without a window the slot IS the position, so cap bounds the absolute position;
+     * with one, cap bounds the slot and positions run past it by design. */
+    if (!kv->window && last >= kv->cap)
+        k3_fatal_bound("MLA latent cache position", (long)last, (long)kv->cap - 1);
+
+    float *q    = scratch;                          /* [T][H][qh]      */
+    float *ct   = q    + (size_t)T * H * qh;        /* [kvw] transient */
+    float *ql   = ct   + (size_t)kvw;               /* [q_lora]        */
+    float *qa   = ql   + (size_t)c->q_lora;         /* [H][kl] absorbed queries */
+    float *al   = qa   + (size_t)H * kl;            /* [kl] latent attention sum */
+    float *acc  = al   + (size_t)kl;                /* [H][vh]         */
+    float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate    */
+    float *sc   = gbuf + (size_t)H * vh;            /* [span] scores   */
+
+    const size_t kvb_row = k3_row_bytes(w->wdt, kl);
+
+    for (int t = 0; t < T; t++) {
+        const int p = cached + t;
+        const float *xt = x + (size_t)t * E;
+
+        /* ---- projections. Identical to the expanded path up to the point where it
+         * would have called kv_b, which is exactly the call absorption removes. ---- */
+        k3_mmw(ql, xt, w->q_a, w->wdt, E, c->q_lora);
+        k3_rmsnorm(ql, ql, w->q_a_norm, c->q_lora, c->rms_eps);
+        k3_mmw(q + (size_t)t * H * qh, ql, w->q_b, w->wdt, c->q_lora, H * qh);
+
+        k3_mmw(ct, xt, w->kv_a, w->wdt, E, kvw);
+        /* the norm covers the latent only, never the rope slot -- so the 576 floats
+         * stored below are byte-for-byte what the expanded path fed to kv_b and to the
+         * rope row, and a cache written by one layout means the same thing to the other */
+        k3_rmsnorm(ct, ct, w->kv_a_norm, c->kv_lora, c->rms_eps);
+        {
+            const int slot = k3_kv_slot(kv, p);
+            if (slot < 0)
+                k3_fatal_bound("MLA latent slot for the position being written", (long)p, 0);
+            memcpy(kv->lat + (size_t)slot * kvw, ct, (size_t)kvw * sizeof(float));
+        }
+
+        /* ---- absorb W_UK into the query, once per head per token ---- */
+        const float *qt = q + (size_t)t * H * qh;
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static)
+#endif
+        for (int h = 0; h < H; h++) {
+            const unsigned char *wuk =
+                (const unsigned char *)w->kv_b + (size_t)(h * kvd) * kvb_row;
+            k3_matmul_tr(qa + (size_t)h * kl, qt + (size_t)h * qh, wuk, w->wdt, kl, qn);
+        }
+
+        /* ---- attention, per head, causal, over whatever the cache still holds ----
+         * Two spans, always ascending in absolute position: the sinks [0, nsink) and
+         * the rolling region [s0, p]. Unwindowed they collapse to the single span
+         * [0, p], and when the rolling region still reaches back to the sinks they are
+         * contiguous, so the reduction order is the same as the unwindowed case
+         * wherever the two hold the same positions. nsink is clamped to p+1 so a
+         * position inside the sink region cannot attend to sinks ahead of itself. */
+        const int s0 = k3_kv_first(kv, p);
+        int nsink = kv->window ? kv->sinks : 0;
+        if (nsink > p + 1) nsink = p + 1;
+        for (int h = 0; h < H; h++) {
+            const float *qah = qa + (size_t)h * kl;
+            const float *qrh = qt + (size_t)h * qh + qn;   /* the unrotated rope slots */
+            float m = -INFINITY;
+            int n = 0;
+            /* sinks first, then the rolling span: ascending in absolute position, so
+             * the reduction order matches the contiguous case wherever they coincide */
+            for (int pass = 0; pass < 2; pass++) {
+                const int a = pass ? s0 : 0;
+                const int b = pass ? p : nsink - 1;
+                for (int s = a; s <= b; s++) {
+                    const int slot = k3_kv_slot(kv, s);
+                    const float *cs = kv->lat + (size_t)slot * kvw;
+                    double d = 0.0;
+                    for (int i = 0; i < kl; i++) d += (double)qah[i] * (double)cs[i];
+                    /* the rope slot is UNROTATED but still scored, and the SAME 64
+                     * values serve every head -- here they are simply the tail of the
+                     * cached latent rather than a separate array */
+                    for (int i = 0; i < qr; i++) d += (double)qrh[i] * (double)cs[kl + i];
+                    sc[n] = (float)d * scale;
+                    if (sc[n] > m) m = sc[n];
+                    n++;
+                }
+            }
+            double z = 0.0;
+            for (int i = 0; i < n; i++) { sc[i] = expf(sc[i] - m); z += sc[i]; }
+
+            /* weighted sum IN LATENT SPACE, then one W_UV per head. This is the second
+             * half of the absorption: the 512-wide sum happens once, the 24576x512
+             * expansion never happens at all. */
+            for (int i = 0; i < kl; i++) al[i] = 0.0f;
+            n = 0;
+            for (int pass = 0; pass < 2; pass++) {
+                const int a = pass ? s0 : 0;
+                const int b = pass ? p : nsink - 1;
+                for (int s = a; s <= b; s++) {
+                    const int slot = k3_kv_slot(kv, s);
+                    const float pr = (float)(sc[n++] / z);
+                    const float *cs = kv->lat + (size_t)slot * kvw;
+                    for (int i = 0; i < kl; i++) al[i] += pr * cs[i];
+                }
+            }
+            const unsigned char *wuv =
+                (const unsigned char *)w->kv_b + (size_t)(h * kvd + qn) * kvb_row;
+            k3_mmw(acc + (size_t)h * vh, al, wuv, w->wdt, kl, vh);
+        }
+
+        /* ---- gate then projection, unchanged: the gate is why W_UV could not be
+         * folded into o_proj in the first place ---- */
+        if (w->g) {
+            k3_mmw(gbuf, xt, w->g, w->wdt, E, H * vh);
+            for (int i = 0; i < H * vh; i++)
+                acc[i] *= 1.0f / (1.0f + expf(-gbuf[i]));
+        }
+        k3_mmw(out + (size_t)t * E, acc, w->o, w->wdt, H * vh, E);
+    }
+}
+
+/* Slot holding absolute position p. Identity without a window, which is what keeps the
+ * unbounded case free of any modular arithmetic.
+ *
+ * With a window of W and S sinks: positions 0..S-1 live in slots 0..S-1 forever, and
+ * everything from S on rolls through the remaining R = W - S slots. A position that has
+ * rolled out returns -1 rather than a stale slot, because silently reading the position
+ * R further along is precisely the kind of wrong-but-fluent failure this engine refuses
+ * to have. */
+int k3_kv_slot(const K3KvCache *kv, int p)
+{
+    if (p < 0) return -1;
+    if (!kv->window) return p < kv->cap ? p : -1;
+    if (p < kv->sinks) return p;
+    const int R = kv->window - kv->sinks;
+    if (R <= 0) return -1;
+    return kv->sinks + (p - kv->sinks) % R;
+}
+
+int k3_kv_first(const K3KvCache *kv, int p)
+{
+    if (!kv->window) return 0;
+    const int R = kv->window - kv->sinks;
+    if (R <= 0) return p;
+    const int lo = p - R + 1;
+    return lo > kv->sinks ? lo : kv->sinks;
+}
+
+size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span)
+{
+    const int H = c->n_heads, qh = c->qk_nope + c->qk_rope, vh = c->v_head;
+    return (size_t)T * H * qh                          /* q                   */
+         + (size_t)(c->kv_lora + c->qk_rope)           /* ct transient        */
+         + (size_t)c->q_lora
+         + (size_t)H * c->kv_lora                      /* absorbed queries    */
+         + (size_t)c->kv_lora                          /* latent attn sum     */
+         + (size_t)2 * H * vh                          /* acc, gbuf           */
+         + (size_t)(span > T ? span : T);              /* scores              */
+}
+
+/* The transposed product, W row-major and never moved.
+ *
+ * Column-outer rather than row-outer: each output element gets its own double
+ * accumulator summed over rows in index order, so the result does not depend on how the
+ * loop is scheduled and the OpenMP and serial forms agree to the bit. Row-outer would
+ * need an accumulator array and a reduction whose order changes with the thread count.
+ *
+ * The stride is unfriendly -- consecutive rows are `in` elements apart -- but the whole
+ * of W_UK[h] is 128 KB at the released dimensions and stays in L2 across the sweep. */
+void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int rows)
+{
+    if (wdt == K3_WBF16) {
+        const uint16_t *w16 = (const uint16_t *)W;
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static) if (in > 64)
+#endif
+        for (int j = 0; j < in; j++) {
+            double acc = 0.0;
+            for (int r = 0; r < rows; r++)
+                acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
+            y[j] = (float)acc;
+        }
+    } else if (wdt == K3_WI8) {
+        /* Per-row [f32 scale][int8 * in]: the scale is a property of the ROW, so it
+         * multiplies x[r] once rather than every element of the column. */
+        const size_t stride = k3_row_bytes(K3_WI8, in);
+        const unsigned char *base = (const unsigned char *)W;
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static) if (in > 64)
+#endif
+        for (int j = 0; j < in; j++) {
+            double acc = 0.0;
+            for (int r = 0; r < rows; r++) {
+                const unsigned char *row = base + (size_t)r * stride;
+                float s; memcpy(&s, row, sizeof s);
+                acc += (double)x[r] * (double)s * (double)((const int8_t *)(row + 4))[j];
+            }
+            y[j] = (float)acc;
+        }
+    } else {
+        const float *wf = (const float *)W;
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static) if (in > 64)
+#endif
+        for (int j = 0; j < in; j++) {
+            double acc = 0.0;
+            for (int r = 0; r < rows; r++)
+                acc += (double)x[r] * (double)wf[(size_t)r * in + j];
+            y[j] = (float)acc;
+        }
+    }
+}
+
 /* ---------------------------------------------------------------- router ---- */
 void k3_router(int *idx, float *w, const float *x, const float *W,
                const float *bias, int hidden, int n_experts, int topk,
@@ -900,7 +1137,25 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
 /* ----------------------------------------------------------- decoder layer ---- */
 size_t k3_layer_scratch(const K3Cfg *c, int T)
 {
+    return k3_layer_scratch_kv(c, T, T, K3_KV_EXPANDED);
+}
+
+/* Same, sized for a specific KV layout and attention span.
+ *
+ * The layout matters here because the two MLA paths want different scratch: the
+ * expanded one holds a score row as wide as the cache, the latent one additionally
+ * holds H absorbed queries (96 x 512 floats at the released dimensions) and the latent
+ * attention sum. Sizing a latent run with k3_layer_scratch would under-allocate by
+ * about 200 KB per layer and overwrite whatever followed, so the caller must say which
+ * layout it is going to use rather than letting the default stand in. */
+size_t k3_layer_scratch_kv(const K3Cfg *c, int T, int span, int mode)
+{
+    /* The uncached path is still reachable from the same buffer (any layer may run
+     * without a cache), so take the larger of it and the selected cached form. */
     size_t a = k3_mla_scratch(c, T);
+    size_t sel = (mode == K3_KV_LATENT) ? k3_mla_scratch_latent(c, T, span)
+                                        : k3_mla_scratch_cached(c, T, span, 1);
+    if (sel > a) a = sel;
     size_t b = k3_kda_scratch(c, T);
     size_t m = k3_moe_scratch(c);
     size_t sub = a > b ? a : b;
@@ -926,6 +1181,18 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
                           const K3LayerW *w, const K3Cfg *c, int layer_idx,
                           int T, float *state, float *scratch,
                           float *kvc, float *ropec, int cached, int cap)
+{
+    K3KvCache kv;
+    memset(&kv, 0, sizeof kv);       /* mode K3_KV_EXPANDED is zero, window off */
+    kv.kv = kvc; kv.rope = ropec; kv.cached = cached; kv.cap = cap;
+    k3_decoder_layer_kv(h, block_residual, n_blocks, w, c, layer_idx, T, state, scratch,
+                        kvc ? &kv : NULL);
+}
+
+void k3_decoder_layer_kv(float *h, float *block_residual, int *n_blocks,
+                         const K3LayerW *w, const K3Cfg *c, int layer_idx,
+                         int T, float *state, float *scratch,
+                         const K3KvCache *kv)
 {
     const int E = c->hidden;
     const int maxb = c->n_layers / c->attn_res_block + 2;
@@ -974,8 +1241,13 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
     /* attention */
     for (int t = 0; t < T; t++)
         k3_rmsnorm(hin + (size_t)t * E, h + (size_t)t * E, w->in_norm, E, c->rms_eps);
-    if (w->kda) k3_kda_layer(tmp, hin, w->kda, c, T, state, sub);
-    else        k3_mla_cached(tmp, hin, w->mla, c, T, sub, kvc, ropec, cached, cap);
+    if (w->kda)                              k3_kda_layer(tmp, hin, w->kda, c, T, state, sub);
+    else if (kv && kv->mode == K3_KV_LATENT) k3_mla_latent(tmp, hin, w->mla, c, T, sub, kv);
+    else if (kv)                             k3_mla_cached(tmp, hin, w->mla, c, T, sub,
+                                                           kv->kv, kv->rope,
+                                                           kv->cached, kv->cap);
+    else                                     k3_mla_cached(tmp, hin, w->mla, c, T, sub,
+                                                           NULL, NULL, 0, 0);
 
     if (have_prefix) for (size_t i = 0; i < (size_t)T * E; i++) pref[i] += tmp[i];
     else             { memcpy(pref, tmp, (size_t)T * E * sizeof(float)); have_prefix = 1; }
