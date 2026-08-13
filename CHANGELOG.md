@@ -45,6 +45,29 @@ not needing the bytes at all.
   layer as well as in total. `t_sweep` re-runs that assertion across the whole space of
   pinned shapes at the real 93-layer count, because a hand-built fixture proves one
   arrangement is handled and the arrangement that escaped was not one anybody guessed.
+- **`tools/awq_trunk.py`**: 4-bit activation-aware quantisation of the trunk. Plain MXFP4
+  rounds every weight identically regardless of what it multiplies, which is the wrong
+  objective — what reaches the next layer is `W x`. AWQ uses the exact identity
+  `W x == (W diag(s)) (diag(s)^-1 x)` to spend the 4-bit grid where the activations are
+  large. **The inverse scale is folded into the preceding RMSNorm weight**, which is fp32
+  in the trunk, so the fold is exact and the output is *ordinary MXFP4* that the existing
+  kernel reads unchanged — no format change, no kernel change. Tensors whose input has no
+  norm in front of it (`o_proj`, `f_b_proj`, the shared and dense `down_proj`) are
+  quantised plain; the tool reports which. α is searched per group with α=0 always in the
+  grid, so it cannot do worse than `mxfp4_trunk.py`.
+- **`k3 --calib-dump PATH`**: per-input-channel activation statistics over an eval suite,
+  which is what AWQ needs and only this engine can produce at full scale. Five slots, one
+  per activation that both feeds quantised weights and has a norm to fold into.
+- **`tools/verify_awq_fold.py`** and `make awq-check`: build a trunk with the scaling and
+  the fold applied but *no* quantisation, and require it to reproduce the source model.
+  Plus a **coverage audit inside `awq_trunk.py`** that refuses to run when any narrow
+  tensor matching a rescaled activation's width is neither a declared consumer nor a
+  declared non-consumer. Both exist because they catch different bugs: omitting the router
+  rescale moves log-probabilities by 1.9e-04 nats and the numerical check catches it,
+  while omitting `g_proj` moves them by 2.9e-06 against a 1.4e-06 rounding floor and only
+  the structural check catches it. Both omissions are equally wrong.
+- **`tools/make_random_checkpoint.py`**: a loadable checkpoint of noise, numpy only, so
+  the quantisers and the harness can be exercised without torch or the 110 GB download.
 
 ### Changed
 

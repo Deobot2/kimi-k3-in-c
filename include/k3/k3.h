@@ -129,6 +129,51 @@ int  k3_is_dense(const K3Cfg *c, int layer);
  * to float32 from bf16 and sums 7168 terms. eps is INSIDE the rsqrt. */
 void k3_rmsnorm(float *y, const float *x, const float *w, int n, float eps);
 
+/* ------------------------------------------------- activation calibration ----
+ * Per-input-channel activation statistics, for activation-aware quantisation.
+ *
+ * WHY THE ENGINE HAS TO COLLECT THESE. Which weights can be rounded hard is decided by
+ * the ACTIVATIONS they multiply, not by the weights themselves: a column of W that meets
+ * a large input contributes proportionally more output error for the same rounding step.
+ * That information exists only at inference time, and this is the only implementation of
+ * the model that can produce it at full scale -- the torch reference needs the whole
+ * checkpoint resident. tools/awq_trunk.py consumes the dump.
+ *
+ * A FILE-SCOPE SINK, deliberately. The obvious alternative is to thread a context
+ * argument through k3_mla, k3_mla_latent, k3_kda_layer and k3_moe, four hot kernels, so
+ * that a tool which runs ONCE per checkpoint can see their intermediates. That cost is
+ * paid on every token forever. This is off unless k3_calib_begin has been called, costs
+ * one NULL test when off, and every observation point is outside an OpenMP region, so
+ * there is no locking and no ordering question. The layer index is set the same way, by
+ * the decoder layer, because the attention kernels do not otherwise know it.
+ *
+ * FIVE SLOTS, and the choice is not arbitrary: these are exactly the activations that
+ * (a) feed a group of quantised weights and (b) have an RMSNorm in front of them. The
+ * second half is what makes the scale foldable -- awq_trunk divides the norm weight by
+ * the same vector it multiplies the weight columns by, so the model is re-parameterised
+ * rather than approximated, and the output trunk is ordinary MXFP4 that the existing
+ * kernel reads unchanged. A matmul whose input has no norm in front of it (o_proj,
+ * f_b_proj, the shared down_proj) cannot be handled this way and is quantised plain. */
+enum {
+    K3_CAL_IN    = 0,   /* rmsnorm(h, input_layernorm)           -> q,k,v,g,b,f_a | q_a,kv_a,g */
+    K3_CAL_POST  = 1,   /* rmsnorm(h, post_attention_layernorm)  -> moe down,sh1,sh3,router | dense */
+    K3_CAL_QA    = 2,   /* rmsnorm(q_a, q_a_layernorm)           -> q_b   */
+    K3_CAL_KVA   = 3,   /* rmsnorm(kv_a, kv_a_layernorm)         -> kv_b  */
+    K3_CAL_LAT   = 4,   /* rmsnorm(acc, routed_expert_norm)      -> up    */
+    K3_CAL_SLOTS = 5
+};
+
+/* Returns 0 on success. After this, observations accumulate until k3_calib_write. */
+int  k3_calib_begin(int n_layers);
+/* Which layer subsequent observations belong to. Set by k3_decoder_layer_kv. */
+void k3_calib_layer(int L);
+/* Accumulate sum|x| and sum x^2 per channel over `rows` contiguous rows of width n. */
+void k3_calib_observe(int slot, const float *x, int rows, int n);
+int  k3_calib_write(const char *path);
+void k3_calib_end(void);
+/* Non-zero when collection is on, so callers can skip preparing an observation. */
+int  k3_calib_active(void);
+
 /* SiTU-GLU over a 2*n input laid out as [gate | up].
  *   a  = b1 * tanh(gate / b1) * sigmoid(gate)     sigmoid sees the UNCAPPED gate
  *   u  = b2 * tanh(up / b2)

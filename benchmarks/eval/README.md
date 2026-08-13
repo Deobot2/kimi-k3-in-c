@@ -84,6 +84,26 @@ repeats" from "repeats because the model has collapsed".
 separate a loop from a model that quoted itself once. At the default `--gen 64` that is a
 period of 21. The driver warns when `--gen` is small enough for this to bite.
 
+## Scoring a 4-bit activation-aware trunk
+
+```bash
+# 1. calibrate against the BF16 trunk — the statistics must come from the model being
+#    approximated, not from an approximation of it
+./bin/k3 ~/k3model --trunk ~/trunk-bf16 --trunk-gb 6 \
+    --ppl-file benchmarks/eval/results/bf16/suite.tsv --calib-dump calib.bin
+
+# 2. build the trunk
+python3 tools/awq_trunk.py ~/trunk-bf16 ~/trunk-awq4 --calib calib.bin --report awq.json
+
+# 3. score it
+python3 benchmarks/eval/run_eval.py --model ~/k3model --trunk ~/trunk-awq4 \
+    --label awq4 --out benchmarks/eval/results/awq4 \
+    --baseline benchmarks/eval/results/bf16
+```
+
+Compare against `tools/mxfp4_trunk.py` on the same corpus to isolate what the
+activation-awareness bought, as opposed to what 4-bit cost.
+
 ## The corpus
 
 Eight documents in `corpus/`, spanning the registers where quantization damage shows up

@@ -643,6 +643,11 @@ static void usage(FILE *f)
 "                        per line, \"name<TAB>id,id,...\". Reports per document and in\n"
 "                        total. Amortises the model load, and with a resident trunk\n"
 "                        the trunk read too\n"
+"  --calib-dump PATH     collect per-input-channel activation statistics over the\n"
+"                        suite, for activation-aware quantisation. Implies --ppl;\n"
+"                        feed the result to tools/awq_trunk.py. Run it against the\n"
+"                        BF16 trunk: the statistics must come from the model being\n"
+"                        approximated, not from an approximation of it\n"
 "  --ppl-dump PATH       write one 20-byte record per scored position: target id,\n"
 "                        top-1 id, both log-probabilities and the entropy. Aligned\n"
 "                        position-for-position between two runs this gives the TOP-1\n"
@@ -911,7 +916,7 @@ int main(int argc, char **argv)
     int budget_auto = 0;
     int spec_n = 0;
     int tf_check = 0, want_ppl = 0, gen_set = 0;
-    const char *ppl_file = NULL, *ppl_dump = NULL;
+    const char *ppl_file = NULL, *ppl_dump = NULL, *calib_dump = NULL;
     const char *draft_dir = NULL;
     double draft_gb = 6.0;
     const char *load_state = NULL, *save_state = NULL;
@@ -935,6 +940,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--ppl")) want_ppl = 1;
         else if (!strcmp(argv[i], "--ppl-file") && i + 1 < argc) { ppl_file = argv[++i]; want_ppl = 1; }
         else if (!strcmp(argv[i], "--ppl-dump") && i + 1 < argc) ppl_dump = argv[++i];
+        else if (!strcmp(argv[i], "--calib-dump") && i + 1 < argc) { calib_dump = argv[++i]; want_ppl = 1; }
         else if (!strcmp(argv[i], "--load-state") && i + 1 < argc) load_state = argv[++i];
         else if (!strcmp(argv[i], "--save-state") && i + 1 < argc) save_state = argv[++i];
         else if (!strcmp(argv[i], "--draft-trunk") && i + 1 < argc) draft_dir = argv[++i];
@@ -1758,6 +1764,14 @@ int main(int argc, char **argv)
             docs = &solo; ndoc = 1; doc_pos = np - 1;
         }
 
+        /* Collection spans the WHOLE suite: the scale vector wants statistics over as
+         * much varied text as can be afforded, and per-document scales would be
+         * meaningless -- a trunk has one set of weights. */
+        if (calib_dump && k3_calib_begin(c.n_layers) != 0) {
+            fprintf(stderr, "OOM starting calibration\n");
+            return 1;
+        }
+
         K3Ppl pp; memset(&pp, 0, sizeof pp);
         if (ppl_dump) {
             pp.rec = (K3PplRec *)malloc((size_t)doc_pos * sizeof(K3PplRec));
@@ -1840,6 +1854,18 @@ int main(int argc, char **argv)
             fclose(df);
             printf("  wrote %ld per-position records to %s (%zu bytes each)\n",
                    pp.nrec, ppl_dump, sizeof(K3PplRec));
+        }
+
+        if (calib_dump) {
+            if (k3_calib_write(calib_dump) != 0) {
+                fprintf(stderr, "k3: cannot write --calib-dump %s\n", calib_dump);
+                k3_calib_end();
+                return 1;
+            }
+            k3_calib_end();
+            printf("  wrote activation calibration for %d layers to %s\n"
+                   "  next: python3 tools/awq_trunk.py <bf16 trunk> <out trunk> --calib %s\n",
+                   c.n_layers, calib_dump, calib_dump);
         }
 
         FILE *pf = fopen(outp, "w");

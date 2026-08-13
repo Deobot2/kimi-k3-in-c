@@ -97,6 +97,99 @@ int k3_is_mla(const K3Cfg *c, int layer)
 int k3_is_kda(const K3Cfg *c, int layer)   { return !k3_is_mla(c, layer); }
 int k3_is_dense(const K3Cfg *c, int layer) { return layer < c->first_dense; }
 
+/* ----------------------------------------------- activation calibration ---- */
+/* See the note in k3.h for why this is a file-scope sink rather than a threaded context.
+ *
+ * Accumulators are DOUBLE. A calibration pass sums |x| over every position of every
+ * document -- tens of thousands of terms per channel -- and a float32 running sum stops
+ * moving once the accumulator is large relative to the addend, which biases exactly the
+ * small channels whose smallness the scale is meant to encode. */
+typedef struct { double *abs_sum, *sq_sum; int64_t count; int n; } K3CalSlot;
+
+static K3CalSlot *g_cal;          /* [n_layers][K3_CAL_SLOTS], NULL when off */
+static int        g_cal_layers;
+static int        g_cal_L;        /* layer that observations belong to       */
+
+int k3_calib_active(void) { return g_cal != NULL; }
+
+int k3_calib_begin(int n_layers)
+{
+    k3_calib_end();
+    g_cal = (K3CalSlot *)calloc((size_t)n_layers * K3_CAL_SLOTS, sizeof(K3CalSlot));
+    if (!g_cal) return -1;
+    g_cal_layers = n_layers;
+    g_cal_L = 0;
+    return 0;
+}
+
+void k3_calib_layer(int L) { g_cal_L = L; }
+
+void k3_calib_observe(int slot, const float *x, int rows, int n)
+{
+    if (!g_cal || g_cal_L < 0 || g_cal_L >= g_cal_layers) return;
+    if (slot < 0 || slot >= K3_CAL_SLOTS || n <= 0 || rows <= 0) return;
+    K3CalSlot *s = &g_cal[(size_t)g_cal_L * K3_CAL_SLOTS + slot];
+    if (!s->abs_sum) {
+        s->abs_sum = (double *)calloc((size_t)n, sizeof(double));
+        s->sq_sum  = (double *)calloc((size_t)n, sizeof(double));
+        if (!s->abs_sum || !s->sq_sum) { free(s->abs_sum); free(s->sq_sum);
+                                         s->abs_sum = s->sq_sum = NULL; return; }
+        s->n = n;
+    }
+    /* A width that changes under the same slot means the caller mapped two different
+     * tensors onto it. Dropping the observation is the safe response: a truncated or
+     * over-read accumulation would produce a plausible scale vector for the wrong
+     * channels, which is the failure mode with no symptom. */
+    if (s->n != n) return;
+    for (int r = 0; r < rows; r++) {
+        const float *v = x + (size_t)r * n;
+        for (int i = 0; i < n; i++) {
+            const double a = (double)v[i];
+            s->abs_sum[i] += a < 0 ? -a : a;
+            s->sq_sum[i]  += a * a;
+        }
+    }
+    s->count += rows;
+}
+
+/* magic, then per (layer, slot): n, count, n doubles of sum|x|, n doubles of sum x^2.
+ * n == 0 marks a slot this layer never used, which is normal: a KDA layer has no q_a
+ * and a dense layer no latent. */
+int k3_calib_write(const char *path)
+{
+    if (!g_cal) return -1;
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    const char magic[8] = { 'K','3','C','A','L','I','B','1' };
+    int32_t hdr[2] = { g_cal_layers, K3_CAL_SLOTS };
+    int ok = fwrite(magic, 1, 8, f) == 8 && fwrite(hdr, sizeof hdr, 1, f) == 1;
+    for (int L = 0; ok && L < g_cal_layers; L++)
+        for (int t = 0; ok && t < K3_CAL_SLOTS; t++) {
+            const K3CalSlot *s = &g_cal[(size_t)L * K3_CAL_SLOTS + t];
+            const int32_t n = s->abs_sum ? s->n : 0;
+            int64_t cnt = s->count;
+            ok = fwrite(&n, sizeof n, 1, f) == 1 && fwrite(&cnt, sizeof cnt, 1, f) == 1;
+            if (ok && n) {
+                ok = fwrite(s->abs_sum, sizeof(double), (size_t)n, f) == (size_t)n
+                  && fwrite(s->sq_sum,  sizeof(double), (size_t)n, f) == (size_t)n;
+            }
+        }
+    if (fclose(f) != 0) ok = 0;
+    return ok ? 0 : -1;
+}
+
+void k3_calib_end(void)
+{
+    if (!g_cal) return;
+    for (int i = 0; i < g_cal_layers * K3_CAL_SLOTS; i++) {
+        free(g_cal[i].abs_sum);
+        free(g_cal[i].sq_sum);
+    }
+    free(g_cal);
+    g_cal = NULL;
+    g_cal_layers = 0;
+}
+
 /* --------------------------------------------------------------- rmsnorm ---- */
 void k3_rmsnorm(float *y, const float *x, const float *w, int n, float eps)
 {
@@ -345,12 +438,14 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         const float *xt = x + (size_t)t * E;
         k3_mmw(ql, xt, w->q_a, w->wdt, E, c->q_lora);
         k3_rmsnorm(ql, ql, w->q_a_norm, c->q_lora, c->rms_eps);
+        if (g_cal) k3_calib_observe(K3_CAL_QA, ql, 1, c->q_lora);
         k3_mmw(q + (size_t)t * H * qh, ql, w->q_b, w->wdt, c->q_lora, H * qh);
 
         /* ONE projection emits the compressed latent AND the shared rope slot */
         k3_mmw(ct, xt, w->kv_a, w->wdt, E, kvw);
         /* the norm covers the latent only, never the rope slot */
         k3_rmsnorm(ct, ct, w->kv_a_norm, c->kv_lora, c->rms_eps);
+        if (g_cal) k3_calib_observe(K3_CAL_KVA, ct, 1, c->kv_lora);
         memcpy(K3_ROPE_AT(p), ct + c->kv_lora, (size_t)qr * sizeof(float));
         k3_mmw(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, H * kvd);
     }
@@ -455,6 +550,7 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
          * would have called kv_b, which is exactly the call absorption removes. ---- */
         k3_mmw(ql, xt, w->q_a, w->wdt, E, c->q_lora);
         k3_rmsnorm(ql, ql, w->q_a_norm, c->q_lora, c->rms_eps);
+        if (g_cal) k3_calib_observe(K3_CAL_QA, ql, 1, c->q_lora);
         k3_mmw(q + (size_t)t * H * qh, ql, w->q_b, w->wdt, c->q_lora, H * qh);
 
         k3_mmw(ct, xt, w->kv_a, w->wdt, E, kvw);
@@ -462,6 +558,7 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
          * stored below are byte-for-byte what the expanded path fed to kv_b and to the
          * rope row, and a cache written by one layout means the same thing to the other */
         k3_rmsnorm(ct, ct, w->kv_a_norm, c->kv_lora, c->rms_eps);
+        if (g_cal) k3_calib_observe(K3_CAL_KVA, ct, 1, c->kv_lora);
         {
             const int slot = k3_kv_slot(kv, p);
             if (slot < 0)
@@ -908,6 +1005,7 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
 
         /* 4. RMSNorm the AGGREGATE (not per expert), then 5. up-project */
         if (c->latent_norm) k3_rmsnorm(accL, accL, w->latent_norm, L, c->rms_eps);
+        if (g_cal && c->latent_norm) k3_calib_observe(K3_CAL_LAT, accL, 1, L);
         k3_mmw(ot, accL, w->up, w->wdt, L, E);
 
         /* 6. shared expert on the ORIGINAL full-width input, added UNWEIGHTED */
@@ -1059,6 +1157,7 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
             for (int i = 0; i < Ll; i++) acc[i] += wj * cb[i];
         }
         if (c->latent_norm) k3_rmsnorm(acc, acc, w->latent_norm, Ll, c->rms_eps);
+        if (g_cal && c->latent_norm) k3_calib_observe(K3_CAL_LAT, acc, 1, Ll);
         k3_mmw(ot, acc, w->up, w->wdt, Ll, E);
 
         float *sgu  = gu;                 /* [2*SI] */
@@ -1293,6 +1392,10 @@ void k3_decoder_layer_kv(float *h, float *block_residual, int *n_blocks,
     /* attention */
     for (int t = 0; t < T; t++)
         k3_rmsnorm(hin + (size_t)t * E, h + (size_t)t * E, w->in_norm, E, c->rms_eps);
+    /* Every quantisable projection in both attention families reads exactly this, so one
+     * scale vector serves all of them -- which is required, not merely convenient: they
+     * share the norm the inverse scale folds into. */
+    if (g_cal) { k3_calib_layer(layer_idx); k3_calib_observe(K3_CAL_IN, hin, T, E); }
     if (w->kda)                              k3_kda_layer(tmp, hin, w->kda, c, T, state, sub);
     else if (kv && kv->mode == K3_KV_LATENT) k3_mla_latent(tmp, hin, w->mla, c, T, sub, kv);
     else if (kv)                             k3_mla_cached(tmp, hin, w->mla, c, T, sub,
@@ -1317,6 +1420,11 @@ void k3_decoder_layer_kv(float *h, float *block_residual, int *n_blocks,
 
     for (int t = 0; t < T; t++)
         k3_rmsnorm(hin + (size_t)t * E, h + (size_t)t * E, w->post_norm, E, c->rms_eps);
+    /* The ROUTER gate reads this too. It is fp32 and never quantised, but it still has to
+     * be rescaled by awq_trunk or it would see a differently-scaled input and route to
+     * different experts -- exactly, and for free, since multiplying an fp32 matrix by a
+     * per-column constant is lossless. */
+    if (g_cal) { k3_calib_layer(layer_idx); k3_calib_observe(K3_CAL_POST, hin, T, E); }
 
     if (w->moe) {
         int   idx[K3_MAX_TOPK]; float wt[K3_MAX_TOPK];

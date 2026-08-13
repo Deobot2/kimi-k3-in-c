@@ -255,6 +255,18 @@ debug:
 # runtime's thread pool produce false positives together, and a serial build is the
 # point of a sanitizer run. OMP_CFLAGS is still omitted rather than replaced, so the
 # #pragma omp lines compile to nothing on every platform alike.
+# The AWQ fold, end to end, on a checkpoint of random weights. Needs numpy and about a
+# minute; not part of `make test` because it builds a checkpoint and a trunk on the way.
+#
+# Two things are gated: awq_trunk's coverage audit refuses a GROUPS table that leaves a
+# consumer unmentioned, and the folded trunk must reproduce the source model. Run it
+# after touching GROUPS, the calibration hooks, or any layer kernel's dataflow.
+.PHONY: awq-check
+awq-check: $(BIN)/k3
+	python3 tools/make_random_checkpoint.py $(BUILD)/awqck
+	python3 tools/pack_trunk.py $(BUILD)/awqck $(BUILD)/awqtrunk 13
+	python3 tools/verify_awq_fold.py $(BUILD)/awqck $(BUILD)/awqtrunk --work $(BUILD)/awqwork
+
 asan:
 	$(MAKE) CFLAGS="-O1 -g -std=gnu99 $(WARN) -fsanitize=address,undefined -fno-omit-frame-pointer" \
 	        LDFLAGS="-lm -fsanitize=address,undefined" ARCH= all
