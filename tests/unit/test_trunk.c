@@ -15,16 +15,22 @@
  * reused underneath the caller changes the pattern, so the check that cannot be made
  * against real weights (they all look like noise) is trivial against these.
  *
- * FIVE THINGS ARE GATED
+ * SIX THINGS ARE GATED
  *   1. the pinned set is chosen LARGEST FIRST, and the ring slot is therefore sized to
  *      the largest UNPINNED layer rather than the largest layer;
  *   2. largest-first pins at least as many bytes as prefix pinning at the same budget,
  *      which is the entire claim the change rests on;
  *   3. a fetched layer's bytes survive an arbitrary number of prefetch hints landing in
  *      other slots, at ring depths 1, 2 and 3;
- *   4. the io_uring and pread paths return identical bytes, so the fast path cannot
+ *   4. NO LAYER IS READ MORE THAN THE WALK OWES -- once for a pinned layer, once per pass
+ *      for a streamed one. This is bytes rather than correctness, so nothing else can see
+ *      it, and it is checked per layer as well as in aggregate because the aggregate says
+ *      a run went over without saying where. t_sweep then asserts it across the whole
+ *      space of pinned shapes at the real layer count, which is what finally caught the
+ *      escape two hand-built fixtures and two arguments from mechanism all missed;
+ *   5. the io_uring and pread paths return identical bytes, so the fast path cannot
  *      quietly differ from the portable one;
- *   5. a packed run's WEIGHT FORMAT is worked out correctly -- all bf16, all MXFP4, and
+ *   6. a packed run's WEIGHT FORMAT is worked out correctly -- all bf16, all MXFP4, and
  *      a mixture refused. See the note above t_formats: that logic shipped wrong and
  *      rejected every quantised trunk ever built, and nothing here could see it.
  *
@@ -32,10 +38,15 @@
  */
 #define _POSIX_C_SOURCE 200809L
 
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include "k3.h"
 #include "k3_bind.h"
@@ -54,9 +65,28 @@ static void ok(const char *what, int cond, const char *fmt, ...)
 
 /* Layer sizes in 64 KB units, deliberately unsorted and with one outlier that stands in
  * for the released model's dense layer 0: 2.34 GB against a 1.17 GB mean. Prefix pinning
- * takes that one FIRST, which is exactly why it wasted a ring slot sized for it. */
+ * takes that one FIRST, which is exactly why it wasted a ring slot sized for it.
+ *
+ * The two largest are ADJACENT on purpose. Largest-first therefore pins a RUN of layers,
+ * and a run is what makes the prefetcher scan past them -- it skips pinned layers rather
+ * than stopping at them -- and queue a layer further ahead than the ring's own depth.
+ * With the sizes spread out, every queued layer happened to sit within nslot of the walk
+ * and the re-read bug below could not appear. A fixture whose shape hides the bug is not
+ * a fixture, so the shape is chosen to expose it. */
 #define NLAY 8
 static const int SIZE_UNITS[NLAY] = { 12, 3, 5, 2, 7, 4, 6, 1 };
+
+/* A second shape, whose two biggest layers are ADJACENT. Largest-first then pins a RUN,
+ * and a run is what makes the prefetcher queue further ahead than the ring is deep: it
+ * SKIPS pinned layers while scanning rather than stopping at them, so from layer 1 it
+ * skips 2 and 3 and queues 4 -- three ahead, with a two-slot ring. A slot holding a
+ * layer that far out was not protected, so the next claim evicted it and the walk read
+ * it again a moment later.
+ *
+ * The first shape cannot produce that: at its budget largest-first picks layers 0, 2 and
+ * 7, never two in a row. A fixture that cannot reach the state is not evidence the state
+ * is handled, which is exactly how this survived the first bound check. */
+static const int SIZE_RUN[NLAY] = { 5, 5, 4, 4, 4, 4, 4, 4 };
 #define UNIT (64 * 1024)
 
 static unsigned char pattern_of(int L, int64_t off)
@@ -66,18 +96,25 @@ static unsigned char pattern_of(int L, int64_t off)
     return (unsigned char)((L * 37 + (int)(off / 4096) * 11 + 1) & 0xFF);
 }
 
-static int write_trunk(const char *dir, int64_t *off_out, int64_t *len_out)
+static int write_trunk(const char *dir, const int *units, int nlay,
+                       int64_t *off_out, int64_t *len_out)
 {
     char p[1024];
     snprintf(p, sizeof p, "%s/trunk.bin", dir);
     FILE *f = fopen(p, "wb");
     if (!f) { perror(p); return -1; }
 
-    unsigned char *buf = (unsigned char *)malloc(UNIT * 16);
+    /* Size the scratch from the TABLE, not from a constant. It was UNIT * 16, which
+     * covered the first shape's 12-unit maximum and silently overran on the second
+     * shape's 20-unit layers -- a heap smash inside the test harness, which glibc
+     * reported as a double free three cases later and nowhere near the cause. */
+    int maxu = 0;
+    for (int L = 0; L < nlay; L++) if (units[L] > maxu) maxu = units[L];
+    unsigned char *buf = (unsigned char *)malloc((size_t)maxu * UNIT);
     if (!buf) { fclose(f); return -1; }
     int64_t at = 0;
-    for (int L = 0; L < NLAY; L++) {
-        const int64_t n = (int64_t)SIZE_UNITS[L] * UNIT;   /* already 4096-aligned */
+    for (int L = 0; L < nlay; L++) {
+        const int64_t n = (int64_t)units[L] * UNIT;        /* already 4096-aligned */
         for (int64_t i = 0; i < n; i++) buf[i] = pattern_of(L, i);
         if (fwrite(buf, 1, (size_t)n, f) != (size_t)n) { free(buf); fclose(f); return -1; }
         off_out[L] = at; len_out[L] = n;
@@ -90,7 +127,7 @@ static int write_trunk(const char *dir, int64_t *off_out, int64_t *len_out)
     f = fopen(p, "w");
     if (!f) { perror(p); return -1; }
     fprintf(f, "{\"align\":%d,\"layers\":[", K3_TRUNK_ALIGN);
-    for (int L = 0; L < NLAY; L++)
+    for (int L = 0; L < nlay; L++)
         fprintf(f, "%s{\"file_off\":%lld,\"nbytes\":%lld,\"tensors\":"
                    "{\"dummy\":{\"off\":0,\"nbytes\":4,\"dtype\":\"F32\"}}}",
                 L ? "," : "", (long long)off_out[L], (long long)len_out[L]);
@@ -109,12 +146,17 @@ static void tiny_cfg(K3Cfg *c)
     c->q_lora = 16; c->kv_lora = 8; c->latent = 16; c->n_experts = 4;
 }
 
-/* Walk the layers the way forward() does and verify every byte handed back. */
-static void walk(K3Trunk *tr, const int64_t *len, int passes, const char *label)
+/* Walk the layers the way forward() does and verify every byte handed back.
+ *
+ * Returns the number of layers read more times than the walk owed, so the sweep below can
+ * call it a few hundred times and report only what fails. quiet suppresses the per-case
+ * PASS lines that a named case wants and a sweep would drown in. */
+static int walk(K3Trunk *tr, const int64_t *len, int nlay, int passes,
+                const char *label, int quiet)
 {
     int bad = 0, checked = 0;
     for (int pass = 0; pass < passes; pass++) {
-        for (int L = 0; L < NLAY; L++) {
+        for (int L = 0; L < nlay; L++) {
             unsigned char *base = NULL;
             if (k3_trunk_fetch(tr, L, &base) != 0) { bad++; continue; }
             /* Hint the next layers BEFORE inspecting this one. That is the order the
@@ -128,7 +170,9 @@ static void walk(K3Trunk *tr, const int64_t *len, int passes, const char *label)
             checked++;
         }
     }
-    ok(label, bad == 0, "%d fetches over %d passes, %d wrong", checked, passes, bad);
+    if (!quiet) ok(label, bad == 0, "%d fetches over %d passes, %d wrong",
+                   checked, passes, bad);
+    else if (bad) ok(label, 0, "%d fetches over %d passes, %d wrong", checked, passes, bad);
 
     /* HOW MANY BYTES DID THAT COST? A layer needed in a pass is read at most ONCE:
      * pinned layers are read on first touch and never again, and a streamed layer is
@@ -143,13 +187,125 @@ static void walk(K3Trunk *tr, const int64_t *len, int passes, const char *label)
      * catch it. A real run reported 491 GB against a 29.81 GB trunk over ten passes,
      * which is what this bound exists to reproduce or refute. */
     int64_t pinned_b = 0, unpinned_b = 0;
-    for (int L = 0; L < NLAY; L++)
+    for (int L = 0; L < nlay; L++)
         if (tr->pin_of[L] >= 0) pinned_b += len[L]; else unpinned_b += len[L];
     const double bound = (double)pinned_b + (double)passes * (double)unpinned_b;
-    ok("  bytes read <= one per pass", (double)tr->bytes_read <= bound * 1.02,
-       "%.2f MB read, bound %.2f MB (%d pinned + %d passes x %d streamed)",
-       (double)tr->bytes_read / 1e6, bound / 1e6,
-       (int)(pinned_b / 1024), passes, (int)(unpinned_b / 1024));
+    if (!quiet)
+        ok("  bytes read <= one per pass", (double)tr->bytes_read <= bound * 1.02,
+           "%.2f MB read, bound %.2f MB (%d pinned + %d passes x %d streamed)",
+           (double)tr->bytes_read / 1e6, bound / 1e6,
+           (int)(pinned_b / 1024), passes, (int)(unpinned_b / 1024));
+
+    /* The same claim per LAYER, which is the form that can be acted on. The aggregate says
+     * a run went over and says nothing about where, and on the released checkpoint that
+     * gap produced two confident explanations from the pinned set's shape, neither
+     * supported by evidence. Naming the layers is what distinguishes "the prefetcher
+     * reaches past a pinned run" from "the wrap at the end of a pass loses the last two",
+     * which have the same aggregate and different fixes. */
+    char detail[512]; int at = 0, over = 0;
+    detail[0] = 0;
+    for (int L = 0; L < nlay; L++) {
+        const int want = (tr->pin_of[L] >= 0) ? 1 : passes;
+        if ((int)tr->reads_of[L] > want) {
+            over++;
+            if (at < (int)sizeof detail - 32)
+                at += snprintf(detail + at, sizeof detail - (size_t)at, " %d(%ux/%d%s)",
+                               L, tr->reads_of[L], want,
+                               tr->pin_of[L] >= 0 ? ",pin" : "");
+        }
+    }
+    if (!quiet)
+        ok("  no layer read twice", over == 0,
+           over ? "re-read:%s" : "every layer read exactly what the walk owed", detail);
+    return over ? over : (bad ? -1 : 0);
+}
+
+/* ------------------------------------------------------------------ the sweep ----
+ * Two hand-built shapes prove that a particular pinned arrangement is handled. They
+ * cannot prove that EVERY arrangement is, and that distinction stopped being academic:
+ * a measured run on the released checkpoint read 13.7% more than the walk owed at a
+ * budget that pins 13 of 93 layers, after a fix that both hand-built shapes accept. Two
+ * explanations were then argued from the pinned set's shape and neither had evidence
+ * behind it, because the fixtures could not reach the shape in question.
+ *
+ * So rather than guess which arrangement escapes, enumerate them. A trunk at the real
+ * layer count, swept across budgets from "nothing pinned" to "almost everything pinned"
+ * and across every ring depth, walks the whole space of pinned patterns the fixed-point
+ * loop can produce -- runs, singletons, alternations, and the boundary cases at each end.
+ * Each case asserts the same per-layer bound. A silent pass means the arrangement that
+ * escapes is not one of these, which is itself worth knowing; a failure names it.
+ *
+ * Layer sizes: one fat layer 0, as in the released model, and five sizes cycling on a
+ * stride coprime with the count, so consecutive budgets pin genuinely different sets
+ * rather than lengthening one prefix. */
+#define SWEEP_LAY 93
+
+static void t_sweep(const char *dir, const K3Cfg *c)
+{
+    char sub[1100];
+    snprintf(sub, sizeof sub, "%s/sweep", dir);
+    if (mkdir(sub, 0777) != 0 && errno != EEXIST) { ok("sweep", 0, "cannot create %s", sub); return; }
+
+    int *units = (int *)malloc(SWEEP_LAY * sizeof(int));
+    int64_t *off = (int64_t *)malloc(SWEEP_LAY * sizeof(int64_t));
+    int64_t *len = (int64_t *)malloc(SWEEP_LAY * sizeof(int64_t));
+    if (!units || !off || !len) { ok("sweep", 0, "out of memory"); goto out; }
+
+    for (int L = 0; L < SWEEP_LAY; L++) units[L] = 2 + (L * 7) % 5;
+    units[0] = 9;                                  /* the dense layer */
+
+    if (write_trunk(sub, units, SWEEP_LAY, off, len) != 0) {
+        ok("sweep", 0, "cannot write the %d-layer trunk", SWEEP_LAY);
+        goto out;
+    }
+
+    int64_t total = 0, biggest = 0;
+    for (int L = 0; L < SWEEP_LAY; L++) { total += len[L]; if (len[L] > biggest) biggest = len[L]; }
+
+    /* stdout would carry one open banner per case. The cases that matter print through
+     * ok(); the rest is noise, and a few hundred banners would bury it. */
+    fflush(stdout);
+    const int saved = dup(1);
+    const int devnull = open("/dev/null", O_WRONLY);
+
+    int cases = 0, failed = 0, worst_pins = -1, worst_ring = 0, worst_over = 0;
+    int64_t worst_budget = 0;
+    const int STEPS = 24;
+    for (int ring = 1; ring <= 4; ring++) {
+        for (int step = 0; step <= STEPS; step++) {
+            /* From a bare ring to the whole trunk resident. */
+            const int64_t budget = (int64_t)ring * biggest * 2
+                                 + (int64_t)((double)total * (double)step / (double)STEPS);
+            K3Trunk tr;
+            if (devnull >= 0) { fflush(stdout); dup2(devnull, 1); }
+            const int rc = k3_trunk_open(&tr, sub, c, budget, ring);
+            int over = 0;
+            if (rc == 0) {
+                over = walk(&tr, len, SWEEP_LAY, 3, "sweep", 1);
+                if (over > worst_over) {
+                    worst_over = over; worst_pins = tr.npin;
+                    worst_ring = tr.nslot; worst_budget = budget;
+                }
+                k3_trunk_close(&tr);
+            }
+            if (devnull >= 0) { fflush(stdout); dup2(saved, 1); }
+            if (rc != 0) { failed++; continue; }
+            cases++;
+            if (over) failed++;
+        }
+    }
+    if (devnull >= 0) close(devnull);
+    close(saved);
+
+    ok("sweep: every pin shape", failed == 0,
+       failed ? "%d of %d cases over the bound; worst %d layer(s) at budget %lld, "
+                "%d pinned, ring %d"
+              : "%d cases, %d layers, rings 1-4, budgets from bare ring to fully resident",
+       failed ? failed : cases, failed ? cases : SWEEP_LAY,
+       worst_over, (long long)worst_budget, worst_pins, worst_ring);
+
+out:
+    free(units); free(off); free(len);
 }
 
 static void run_case(const char *dir, const K3Cfg *c, const int64_t *len,
@@ -160,7 +316,7 @@ static void run_case(const char *dir, const K3Cfg *c, const int64_t *len,
         ok(label, 0, "k3_trunk_open failed");
         return;
     }
-    walk(&tr, len, 3, label);
+    (void)walk(&tr, len, NLAY, 3, label, 0);
     k3_trunk_close(&tr);
 }
 
@@ -317,7 +473,7 @@ int main(int argc, char **argv)
     printf("Kimi K3 streaming trunk, on a synthetic trunk in %s\n\n", dir);
 
     int64_t off[NLAY], len[NLAY];
-    if (write_trunk(dir, off, len) != 0) {
+    if (write_trunk(dir, SIZE_UNITS, NLAY, off, len) != 0) {
         fprintf(stderr, "cannot write the synthetic trunk into %s\n", dir);
         return 1;
     }
@@ -373,6 +529,32 @@ int main(int argc, char **argv)
     run_case(dir, &c, len, budget, 3, "ring depth 3");
     /* And at the floor, where nothing is pinned and every layer streams. */
     run_case(dir, &c, len, 3 * biggest, 3, "floor, nothing pinned");
+
+    /* ---- 4b: a pinned RUN, which is what makes the prefetcher reach past the ring ----
+     * Its own directory, because it needs a different layer-size shape. See SIZE_RUN. */
+    {
+        char sub[1100];
+        snprintf(sub, sizeof sub, "%s/run", dir);
+        if (mkdir(sub, 0777) != 0 && errno != EEXIST) {
+            ok("pinned run", 0, "cannot create %s", sub);
+        } else {
+            int64_t off2[NLAY], len2[NLAY];
+            if (write_trunk(sub, SIZE_RUN, NLAY, off2, len2) != 0) {
+                ok("pinned run", 0, "cannot write the second trunk");
+            } else {
+                int64_t big2 = 0;
+                for (int L = 0; L < NLAY; L++) if (len2[L] > big2) big2 = len2[L];
+                /* Enough for a two-slot ring plus BOTH giants. They are only slightly
+                 * larger than the rest, which is what lets the fixed-point loop pin them
+                 * both -- a big gap would make a single ring slot cost more than a pin
+                 * and the loop would settle on small layers instead. */
+                run_case(sub, &c, len2, 4 * big2, 2, "pinned run, ring 2");
+            }
+        }
+    }
+
+    /* ---- 4c: the whole shape space, at the real layer count ---- */
+    t_sweep(dir, &c);
 
     /* ---- 5: weight formats in a packed run ---- */
     t_formats();

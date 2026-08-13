@@ -33,6 +33,16 @@ token's working set. Speculative prefetch lost outright — 25.8 GB read per tok
 30% of it, on a run 96.9% I/O bound — and is off by default. That is 2 for 2 against
 reasoning from mechanism, on a codebase whose own instrumentation was sitting there the
 whole time, and the remaining three should be read in that light.
+
+The deeper ring makes it 3 for 3. It shipped re-reading layers it had already fetched —
+491 GB from a 29.81 GB trunk — and the first fix left 13.7% of the excess behind. Two
+further explanations were then argued from the pinned set's shape, both without evidence,
+because the fixtures could not reach the shape in question. What settled it was
+enumerating the space instead: `t_sweep` in `tests/unit/test_trunk.c` walks a 93-layer
+trunk at every budget and ring depth and failed 40 of 100 pinned shapes. **The pattern
+across all three is the same — the mechanism argument was directionally right and
+quantitatively unchecked**, and the fix each time came from measuring rather than
+reasoning harder.
 Each is A/B-able on a single binary by design (`K3_PIN_PREFIX`, `--trunk-ring`,
 `K3_NOURING`, `K3_CACHE_POLICY=lru`, `K3_SPEC`), which is exactly what the harness
 needs and exactly what has not yet been run.
