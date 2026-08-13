@@ -1,0 +1,43 @@
+{"schema": "measurement.v2", "records": [
+{"host": "node-01", "disk": "nvme0n1", "queue_depth": 1, "block_kb": 8, "read_mbs": 1180, "write_mbs": 940},
+{"host": "node-01", "disk": "nvme0n1", "queue_depth": 2, "block_kb": 8, "read_mbs": 2210, "write_mbs": 1620},
+{"host": "node-01", "disk": "nvme0n1", "queue_depth": 4, "block_kb": 8, "read_mbs": 3980, "write_mbs": 2440},
+{"host": "node-01", "disk": "nvme0n1", "queue_depth": 8, "block_kb": 8, "read_mbs": 5310, "write_mbs": 2610},
+{"host": "node-01", "disk": "nvme0n1", "queue_depth": 16, "block_kb": 8, "read_mbs": 5920, "write_mbs": 2640},
+{"host": "node-01", "disk": "nvme0n1", "queue_depth": 32, "block_kb": 8, "read_mbs": 5940, "write_mbs": 2650},
+{"host": "node-02", "disk": "nvme0n1", "queue_depth": 1, "block_kb": 8, "read_mbs": 1165, "write_mbs": 931},
+{"host": "node-02", "disk": "nvme0n1", "queue_depth": 2, "block_kb": 8, "read_mbs": 2190, "write_mbs": 1605},
+{"host": "node-02", "disk": "nvme0n1", "queue_depth": 4, "block_kb": 8, "read_mbs": 3940, "write_mbs": 2420},
+{"host": "node-02", "disk": "nvme0n1", "queue_depth": 8, "block_kb": 8, "read_mbs": 5280, "write_mbs": 2590},
+{"host": "node-02", "disk": "nvme0n1", "queue_depth": 16, "block_kb": 8, "read_mbs": 5880, "write_mbs": 2620},
+{"host": "node-02", "disk": "nvme0n1", "queue_depth": 32, "block_kb": 8, "read_mbs": 5900, "write_mbs": 2630}
+]}
+
+# per-layer trunk sizes, bytes
+layer   0  2513924096  dense
+layer   1  1249902592  kda
+layer   2  1249902592  kda
+layer   3  1249902592  kda
+layer   4  1176502272  mla
+layer   5  1249902592  kda
+layer   6  1249902592  kda
+layer   7  1249902592  kda
+layer   8  1176502272  mla
+layer   9  1249902592  kda
+layer  10  1249902592  kda
+layer  11  1249902592  kda
+layer  12  1176502272  mla
+
+CREATE TABLE measurement (
+    id          BIGSERIAL PRIMARY KEY,
+    host        TEXT      NOT NULL,
+    device      TEXT      NOT NULL,
+    queue_depth INTEGER   NOT NULL CHECK (queue_depth > 0),
+    block_bytes INTEGER   NOT NULL CHECK (block_bytes > 0),
+    read_bps    BIGINT    NOT NULL,
+    write_bps   BIGINT    NOT NULL,
+    taken_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX measurement_host_idx   ON measurement (host);
+CREATE INDEX measurement_device_idx ON measurement (device);
+CREATE INDEX measurement_taken_idx  ON measurement (taken_at DESC);

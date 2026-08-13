@@ -123,6 +123,138 @@ static int real_cfg(K3Cfg *c, int *fa, int fa_max,
 static int argmax_(const float *v, int n)
 { int b = 0; for (int i = 1; i < n; i++) if (v[i] > v[b]) b = i; return b; }
 
+/* ---------------------------------------------------------------- perplexity ----
+ * ONE RECORD PER PREDICTED POSITION, because a mean cannot answer the question a
+ * quantisation change actually raises.
+ *
+ * The question is not "is the quantised model worse" -- it always is -- but "worse in
+ * what way, and by how much against the model it replaces". A perplexity ratio answers
+ * neither. It is an average over a heavy-tailed per-token quantity, so 1.13x is equally
+ * consistent with a uniform small loss and with an intact model that falls apart on a
+ * few percent of positions, and the second is what makes generation collapse while the
+ * first does not.
+ *
+ * These five numbers, aligned position-for-position between a baseline run and a
+ * candidate run, give: perplexity (target_lp), the TOP-1 AGREEMENT RATE between the two
+ * models (top1), how confidently each was wrong (top1_lp), and whether the distribution
+ * is flattening or collapsing (entropy). Agreement in particular is the sharp
+ * instrument here -- it compares the candidate against the model it must stand in for,
+ * rather than against the text, and it does not average away.
+ *
+ * 20 bytes a position: a 4,096-position suite is 80 KB. */
+typedef struct {
+    int32_t target;      /* the id the text actually continues with */
+    int32_t top1;        /* the id this model would have predicted   */
+    float   target_lp;   /* log p(target), nats. perplexity's numerator */
+    float   top1_lp;     /* log p(top1), nats. the model's confidence   */
+    float   entropy;     /* H(p) in nats over the full vocabulary       */
+} K3PplRec;
+
+typedef struct {
+    double    nll;       /* summed negative log-likelihood over counted positions */
+    long      n;         /* positions counted                                     */
+    K3PplRec *rec;       /* optional, capacity >= total predicted positions        */
+    long      nrec;      /* records written so far; runs across documents          */
+} K3Ppl;
+
+/* One document of the evaluation suite. Several short documents beat one long one here:
+ * attention in the MLA layers is quadratic in sequence length, so doubling a document
+ * more than doubles its cost, while the perplexity estimate only needs POSITIONS and
+ * does not care how they are grouped. Splitting also gives a per-document breakdown,
+ * which is where a register-specific failure (code fine, prose broken) becomes visible
+ * instead of being averaged into one number. */
+typedef struct {
+    char *name;
+    int  *ids;
+    int   n;
+} K3PplDoc;
+
+/* Read an evaluation suite: one document per line, "name<TAB>id,id,id,...".
+ * Blank lines and lines beginning with '#' are ignored, so the file can carry a header
+ * saying which tokenizer produced it -- ids from a different vocabulary would score as
+ * noise and there would be nothing in the numbers to say so.
+ *
+ * Returns the document array and sets *ndoc / *maxlen; NULL on any failure, having said
+ * why. Refuses an empty suite rather than reporting a perplexity over zero positions. */
+static K3PplDoc *ppl_load_suite(const char *path, int *ndoc, int *maxlen, int vocab)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "k3: cannot read --ppl-file %s\n", path); return NULL; }
+
+    size_t cap = 16, nd = 0;
+    K3PplDoc *d = (K3PplDoc *)calloc(cap, sizeof *d);
+    if (!d) { fclose(f); return NULL; }
+
+    char *line = NULL; size_t lcap = 0; ssize_t ln;
+    int  longest = 0, lineno = 0, bad = 0;
+    while ((ln = getline(&line, &lcap, f)) > 0) {
+        lineno++;
+        while (ln > 0 && (line[ln - 1] == '\n' || line[ln - 1] == '\r')) line[--ln] = 0;
+        if (ln == 0 || line[0] == '#') continue;
+
+        char *tab = strchr(line, '\t');
+        if (!tab) {
+            fprintf(stderr, "k3: %s:%d has no TAB; expected \"name<TAB>ids\"\n", path, lineno);
+            bad = 1; break;
+        }
+        *tab = 0;
+        if (nd == cap) {
+            cap *= 2;
+            K3PplDoc *nx = (K3PplDoc *)realloc(d, cap * sizeof *d);
+            if (!nx) { bad = 1; break; }
+            d = nx;
+            memset(d + nd, 0, (cap - nd) * sizeof *d);
+        }
+        /* An upper bound on the id count: every id needs at least one separator byte
+         * after the first, so the remaining text length always covers it. */
+        const size_t room = (size_t)(ln - (tab - line)) + 1;
+        d[nd].name = strdup(line);
+        d[nd].ids  = (int *)malloc(room * sizeof(int));
+        if (!d[nd].name || !d[nd].ids) { bad = 1; break; }
+        int n = 0;
+        for (const char *p = tab + 1; *p; ) {
+            char *end = NULL;
+            const long v = strtol(p, &end, 10);
+            if (end == p) break;
+            if (v < 0 || v >= vocab) {
+                fprintf(stderr, "k3: %s:%d (%s) has id %ld outside the vocabulary of %d\n",
+                        path, lineno, d[nd].name, v, vocab);
+                bad = 1; break;
+            }
+            d[nd].ids[n++] = (int)v;
+            p = end;
+            while (*p == ',' || *p == ' ') p++;
+        }
+        if (bad) break;
+        /* One id predicts nothing: perplexity is scored on transitions, so a
+         * single-token document contributes zero positions and would silently dilute
+         * the document count it is averaged over. */
+        if (n < 2) {
+            fprintf(stderr, "k3: %s:%d (%s) has %d id(s); a document needs at least 2\n",
+                    path, lineno, d[nd].name, n);
+            bad = 1; break;
+        }
+        d[nd].n = n;
+        if (n > longest) longest = n;
+        nd++;
+    }
+    free(line);
+    fclose(f);
+
+    if (!bad && nd == 0) {
+        fprintf(stderr, "k3: --ppl-file %s contains no documents\n", path);
+        bad = 1;
+    }
+    if (bad) {
+        for (size_t i = 0; i < nd; i++) { free(d[i].name); free(d[i].ids); }
+        free(d);
+        return NULL;
+    }
+    *ndoc = (int)nd;
+    *maxlen = longest;
+    return d;
+}
+
 typedef struct {
     K3LayerBind *lay;
     K3ModelBind  mb;
@@ -504,7 +636,18 @@ static void usage(FILE *f)
 "  --ppl                 perplexity over the --ids sequence in one teacher-forced\n"
 "                        sweep. THE gate for a quantised trunk, which cannot be\n"
 "                        byte-compared against anything: run it on the bf16 trunk and\n"
-"                        on the quantised one and compare\n"
+"                        on the quantised one and compare. It is TEACHER-FORCED, so it\n"
+"                        cannot see a model that loops in free generation; that needs\n"
+"                        the second leg of benchmarks/eval/run_eval.py\n"
+"  --ppl-file PATH       score a whole evaluation suite in ONE process: one document\n"
+"                        per line, \"name<TAB>id,id,...\". Reports per document and in\n"
+"                        total. Amortises the model load, and with a resident trunk\n"
+"                        the trunk read too\n"
+"  --ppl-dump PATH       write one 20-byte record per scored position: target id,\n"
+"                        top-1 id, both log-probabilities and the entropy. Aligned\n"
+"                        position-for-position between two runs this gives the TOP-1\n"
+"                        AGREEMENT RATE against a baseline model, which does not\n"
+"                        average away the way a perplexity ratio does\n"
 "  --config PATH         model config; defaults to <model_dir>/config.json\n"
 "  --layers N            bind only the first N layers (partial shard sets)\n"
 "  --dump-logits PATH    write float32 logits for the first step\n"
@@ -610,15 +753,25 @@ static double mem_available_bytes(void)
  * full vector either way. The extra cost is one lm_head matmul per additional position,
  * pure RAM-resident compute; measured, an extra verified position costs ~22% of a serial
  * token at streamed-trunk budgets, which is the entire economics of --spec. */
-/* nll: when non-NULL, accumulate the negative log-likelihood the model assigns to the
+/* ppl: when non-NULL, accumulate the negative log-likelihood the model assigns to the
  * id the sequence ACTUALLY continues with at each position, summed over positions
  * 0..T-2, and count them. That is perplexity's numerator, and it is the gate that
  * replaces bit-identity when the trunk is quantised: a quantised model cannot be
- * byte-compared against anything, but it can be asked how surprised it is. */
+ * byte-compared against anything, but it can be asked how surprised it is.
+ *
+ * ppl->rec, when non-NULL, additionally records each position individually. The mean is
+ * not enough to compare two models. Perplexity is an average over a heavy-tailed
+ * quantity, so a change of a few points is consistent with "slightly worse everywhere"
+ * and with "identical almost everywhere and catastrophic on the rare tokens", which are
+ * different failures with different fixes. Per position, the two are trivially
+ * distinguishable -- and the top-1 id makes an AGREEMENT rate against a baseline run
+ * possible, which is a far sharper instrument than the ratio of two means. */
 static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, int T,
                    float *logits_last, float *scratch, float *h, float *br, float *kstate,
-                   int *arg_all, double *nll, long *nll_n)
+                   int *arg_all, K3Ppl *ppl)
 {
+    double *nll  = ppl ? &ppl->nll : NULL;
+    long   *nll_n = ppl ? &ppl->n  : NULL;
     const int E = c->hidden;
     const int maxb = c->n_layers / c->attn_res_block + 2;
     const int P = c->kda_heads * c->kda_head_dim;
@@ -689,14 +842,34 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
                 /* log-softmax the stable way: subtract the max before exponentiating.
                  * A 163,840-wide vocabulary with logits in the tens overflows expf()
                  * without it, and the result would be inf rather than wrong-by-a-little. */
+                int am = 0;
                 float m = logits_last[0];
                 for (int i = 1; i < c->vocab; i++)
-                    if (logits_last[i] > m) m = logits_last[i];
-                double z = 0.0;
-                for (int i = 0; i < c->vocab; i++) z += exp((double)logits_last[i] - m);
+                    if (logits_last[i] > m) { m = logits_last[i]; am = i; }
+                /* One pass for both the partition function and sum(p*logit), so the
+                 * entropy costs no extra sweep of a 163,840-wide vector. */
+                double z = 0.0, zx = 0.0;
+                for (int i = 0; i < c->vocab; i++) {
+                    const double e = exp((double)logits_last[i] - m);
+                    z += e; zx += e * ((double)logits_last[i] - m);
+                }
                 const int tgt = ids[t + 1];
-                *nll -= ((double)logits_last[tgt] - m) - log(z);
+                const double lz = log(z);
+                const double tlp = ((double)logits_last[tgt] - m) - lz;
+                *nll -= tlp;
                 if (nll_n) (*nll_n)++;
+                if (ppl->rec) {
+                    K3PplRec *r = &ppl->rec[ppl->nrec++];
+                    r->target   = tgt;
+                    r->top1     = am;
+                    r->target_lp = (float)tlp;
+                    r->top1_lp   = (float)(-lz);   /* logit_am - m is 0 by construction */
+                    /* H = log z - E_p[logit - m], in nats. A model that has collapsed
+                     * onto a short loop shows this falling toward zero, which is the
+                     * one teacher-forced signal that anticipates the degeneration the
+                     * free-running leg measures directly. */
+                    r->entropy   = (float)(lz - zx / z);
+                }
             }
         }
         /* logits_last now holds the FINAL position's vector, same as the plain path. */
@@ -737,7 +910,8 @@ int main(int argc, char **argv)
     double cache_gb = 64.0, trunk_gb = 16.0;
     int budget_auto = 0;
     int spec_n = 0;
-    int tf_check = 0, want_ppl = 0;
+    int tf_check = 0, want_ppl = 0, gen_set = 0;
+    const char *ppl_file = NULL, *ppl_dump = NULL;
     const char *draft_dir = NULL;
     double draft_gb = 6.0;
     const char *load_state = NULL, *save_state = NULL;
@@ -751,7 +925,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--prompt-file") && i + 1 < argc) prompt_file = argv[++i];
         else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
-        else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--gen") && i + 1 < argc) { gen = atoi(argv[++i]); gen_set = 1; }
         else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) want_layers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
@@ -759,6 +933,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--spec") && i + 1 < argc) spec_n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tf-check")) tf_check = 1;
         else if (!strcmp(argv[i], "--ppl")) want_ppl = 1;
+        else if (!strcmp(argv[i], "--ppl-file") && i + 1 < argc) { ppl_file = argv[++i]; want_ppl = 1; }
+        else if (!strcmp(argv[i], "--ppl-dump") && i + 1 < argc) ppl_dump = argv[++i];
         else if (!strcmp(argv[i], "--load-state") && i + 1 < argc) load_state = argv[++i];
         else if (!strcmp(argv[i], "--save-state") && i + 1 < argc) save_state = argv[++i];
         else if (!strcmp(argv[i], "--draft-trunk") && i + 1 < argc) draft_dir = argv[++i];
@@ -805,8 +981,14 @@ int main(int argc, char **argv)
     }
     {
         int nsrc = (ids_s != NULL) + (prompt_text != NULL) + (prompt_file != NULL);
-        if (nsrc == 0) {
-            fprintf(stderr, "one of --ids, --prompt or --prompt-file is required\n");
+        /* --ppl-file carries its own ids for every document, so it IS the prompt source.
+         * Combining it with another one would leave the other silently unused. */
+        if (ppl_file && nsrc > 0) {
+            fprintf(stderr, "--ppl-file supplies its own ids; drop --ids/--prompt/--prompt-file\n");
+            return 2;
+        }
+        if (nsrc == 0 && !ppl_file) {
+            fprintf(stderr, "one of --ids, --prompt, --prompt-file or --ppl-file is required\n");
             return 2;
         }
         if (nsrc > 1) {
@@ -845,7 +1027,32 @@ int main(int argc, char **argv)
     int np = 0;
     Tok tok; int have_tok = 0;
 
-    if (prompt_text || prompt_file) {
+    /* The evaluation suite is loaded HERE, before anything is sized, because every
+     * scratch buffer below is allocated from np and the suite's longest document is what
+     * they have to hold. Loading it later would size the run for one document and then
+     * run a longer one through the same buffers. */
+    K3PplDoc *docs = NULL; int ndoc = 0, doc_max = 0; long doc_pos = 0;
+    if (ppl_file) {
+        docs = ppl_load_suite(ppl_file, &ndoc, &doc_max, c.vocab);
+        if (!docs) return 2;
+        for (int i = 0; i < ndoc; i++) doc_pos += docs[i].n - 1;
+        if (doc_max > K3_MAX_PROMPT) {
+            fprintf(stderr, "k3: --ppl-file document of %d ids exceeds the %d-id ceiling\n",
+                    doc_max, K3_MAX_PROMPT);
+            return 2;
+        }
+        /* Stand the longest document in as the prompt so every size below is derived
+         * from the largest sweep that will actually run. */
+        np = doc_max;
+        for (int i = 0; i < ndoc; i++)
+            if (docs[i].n == doc_max) { memcpy(prompt, docs[i].ids, (size_t)np * sizeof(int)); break; }
+        printf("  eval suite: %d documents, %ld scored positions, longest %d ids (%s)\n",
+               ndoc, doc_pos, doc_max, ppl_file);
+    }
+
+    if (ppl_file) {
+        /* already populated */
+    } else if (prompt_text || prompt_file) {
         if (!tok_dir) {
             fprintf(stderr, "--prompt/--prompt-file need --tok DIR (the directory with "
                             "tiktoken.model and tokenizer_config.json)\n");
@@ -1537,16 +1744,59 @@ int main(int argc, char **argv)
      * difference is the whole of what quantisation cost. A single number, but it is a
      * number, which is more than "it still emits fluent text" ever was. */
     if (want_ppl) {
-        if (np < 2) { fprintf(stderr, "--ppl needs at least 2 ids\n"); return 2; }
-        const double t0p = now_s();
-        double nll = 0.0; long npos = 0;
-        if (forward(&w, &c, &cache, seq, np, lg, sc, h, br, ks, NULL, &nll, &npos) != 0) {
-            fprintf(stderr, "forward failed in --ppl\n");
-            return 1;
+        /* ONE PROCESS, EVERY DOCUMENT. Each document is its own teacher-forced sweep,
+         * but they share a model load -- and, when the trunk is resident, share the
+         * trunk entirely. That is the difference between a suite that costs one warm-up
+         * and one that pays it per document.
+         *
+         * Single-document --ppl is the same path with a suite of one, so there is one
+         * implementation of the arithmetic rather than two that can drift apart. */
+        K3PplDoc solo;
+        if (!docs) {
+            if (np < 2) { fprintf(stderr, "--ppl needs at least 2 ids\n"); return 2; }
+            solo.name = (char *)"stdin"; solo.ids = seq; solo.n = np;
+            docs = &solo; ndoc = 1; doc_pos = np - 1;
         }
-        const double mean = npos ? nll / (double)npos : 0.0;
-        printf("perplexity: %.4f over %ld positions (mean NLL %.4f nats) in %.1f s\n",
-               exp(mean), npos, mean, now_s() - t0p);
+
+        K3Ppl pp; memset(&pp, 0, sizeof pp);
+        if (ppl_dump) {
+            pp.rec = (K3PplRec *)malloc((size_t)doc_pos * sizeof(K3PplRec));
+            if (!pp.rec) { fprintf(stderr, "OOM for --ppl-dump (%ld records)\n", doc_pos); return 1; }
+        }
+
+        const double t0p = now_s();
+        double *dnll = (double *)calloc((size_t)ndoc, sizeof(double));
+        long   *dpos = (long *)calloc((size_t)ndoc, sizeof(long));
+        if (!dnll || !dpos) { fprintf(stderr, "OOM for the per-document totals\n"); return 1; }
+
+        for (int di = 0; di < ndoc; di++) {
+            const double n0 = pp.nll; const long p0 = pp.n;
+            /* Each document is scored from a clean slate: no carried KV cache and no
+             * carried recurrent state, so document i's score cannot depend on document
+             * i-1 having been run first. forward() clears the recurrent state itself
+             * whenever kv_on is false, which is the case here -- --ppl is a full
+             * recompute by construction. */
+            if (forward(&w, &c, &cache, docs[di].ids, docs[di].n, lg, sc, h, br, ks,
+                        NULL, &pp) != 0) {
+                fprintf(stderr, "forward failed on document %s\n", docs[di].name);
+                return 1;
+            }
+            dnll[di] = pp.nll - n0;
+            dpos[di] = pp.n - p0;
+            if (ndoc > 1) {
+                const double dm = dpos[di] ? dnll[di] / (double)dpos[di] : 0.0;
+                printf("  %-28s %6ld pos   ppl %10.4f   NLL %7.4f\n",
+                       docs[di].name, dpos[di], exp(dm), dm);
+                fflush(stdout);
+            }
+        }
+
+        const long npos = pp.n;
+        const double mean = npos ? pp.nll / (double)npos : 0.0;
+        printf("perplexity: %.4f over %ld positions in %d document(s) "
+               "(mean NLL %.4f nats) in %.1f s\n",
+               exp(mean), npos, ndoc, mean, now_s() - t0p);
+
         /* SAY WHEN THE NUMBER IS TOO SMALL TO USE. Per-token NLL varies by whole nats
          * between positions, so the standard error on a short sequence is large enough
          * to swallow the effect this figure exists to measure -- a few points of
@@ -1558,7 +1808,9 @@ int main(int argc, char **argv)
                    "  NLL varies by whole nats, so the error on this mean is comparable\n"
                    "  to the difference you are probably trying to measure. Use a few\n"
                    "  thousand ids of held-out text before quoting it.\n", npos);
-        if (gen > 0)
+        /* Only when it was actually ASKED for. gen defaults to 8, so testing gen > 0
+         * printed this on every --ppl run and trained the reader to skip it. */
+        if (gen_set && gen > 0)
             printf("  NOTE: --gen %d was ignored. --ppl is one teacher-forced sweep over\n"
                    "  the ids given; it generates nothing.\n", gen);
         printf("  weights  : %s\n",
@@ -1567,12 +1819,48 @@ int main(int argc, char **argv)
         printf("  compare this against the SAME ids on a bf16 trunk. A quantised trunk\n"
                "  cannot be byte-compared against anything, so this difference is the\n"
                "  entire measurement. See docs/notes/compressed-trunk.md.\n");
+        /* AND SAY WHAT PERPLEXITY CANNOT SEE, because this measurement has already been
+         * quoted past its range once. It is TEACHER-FORCED: every position is scored
+         * against the real text, so the model is never conditioned on its own output and
+         * a collapse into a repeating loop -- the failure mode a quantised trunk actually
+         * produced here -- leaves this number almost unchanged. Free-running generation
+         * is a separate leg, and benchmarks/eval/run_eval.py runs both. */
+        if (!ppl_dump)
+            printf("  NOTE: this is TEACHER-FORCED and cannot see degeneration. A model\n"
+                   "  that loops in free generation scores nearly the same here. Run\n"
+                   "  benchmarks/eval/run_eval.py for both legs.\n");
+
+        if (ppl_dump && pp.rec) {
+            FILE *df = fopen(ppl_dump, "wb");
+            if (!df) { fprintf(stderr, "k3: cannot write --ppl-dump %s\n", ppl_dump); return 1; }
+            if (fwrite(pp.rec, sizeof(K3PplRec), (size_t)pp.nrec, df) != (size_t)pp.nrec) {
+                fprintf(stderr, "k3: short write to %s\n", ppl_dump);
+                fclose(df); return 1;
+            }
+            fclose(df);
+            printf("  wrote %ld per-position records to %s (%zu bytes each)\n",
+                   pp.nrec, ppl_dump, sizeof(K3PplRec));
+        }
+
         FILE *pf = fopen(outp, "w");
         if (pf) {
-            fprintf(pf, "{\"ppl_positions\":%ld,\"mean_nll\":%.6f,\"perplexity\":%.6f}\n",
-                    npos, mean, exp(mean));
+            fprintf(pf, "{\"ppl_positions\":%ld,\"mean_nll\":%.6f,\"perplexity\":%.6f,"
+                        "\"documents\":[", npos, mean, exp(mean));
+            long at = 0;
+            for (int di = 0; di < ndoc; di++) {
+                const double dm = dpos[di] ? dnll[di] / (double)dpos[di] : 0.0;
+                /* rec_off lets a reader slice the dump per document without re-deriving
+                 * the boundaries from document lengths it would have to trust. */
+                fprintf(pf, "%s{\"name\":\"%s\",\"positions\":%ld,\"rec_off\":%ld,"
+                            "\"mean_nll\":%.6f,\"perplexity\":%.6f}",
+                        di ? "," : "", docs[di].name, dpos[di], at, dm, exp(dm));
+                at += dpos[di];
+            }
+            fprintf(pf, "],\"teacher_forced\":true}\n");
             fclose(pf);
+            printf("  wrote %s\n", outp);
         }
+        free(dnll); free(dpos); free(pp.rec);
         return 0;
     }
 
@@ -1587,7 +1875,7 @@ int main(int argc, char **argv)
         int *arg = (int *)malloc((size_t)np * sizeof(int));
         if (!arg) { fprintf(stderr, "OOM for --tf-check\n"); return 1; }
         const double t0c = now_s();
-        if (forward(&w, &c, &cache, seq, np, lg, sc, h, br, ks, arg, NULL, NULL) != 0) {
+        if (forward(&w, &c, &cache, seq, np, lg, sc, h, br, ks, arg, NULL) != 0) {
             fprintf(stderr, "forward failed in --tf-check\n");
             return 1;
         }
@@ -1634,7 +1922,7 @@ int main(int argc, char **argv)
              * from a context one token short: fluent, plausible, and wrong. */
             const int base = w.cached;
             const int nT0 = T - base;
-            frc = forward(&w, &c, &cache, seq + base, nT0, lg, sc, h, br, ks, NULL, NULL, NULL);
+            frc = forward(&w, &c, &cache, seq + base, nT0, lg, sc, h, br, ks, NULL, NULL);
             if (frc == 0) { w.cached = base + nT0; emit[emitn++] = argmax_(lg, c.vocab); }
             /* The draft model must absorb the same context, or its first proposals
              * come from a shorter one; one draft sweep, paid once. Saved state does
@@ -1644,7 +1932,7 @@ int main(int argc, char **argv)
             if (dw.trunk && frc == 0) {
                 const int db = load_state ? 0 : base;
                 if (forward(&dw, &c, &cache, seq + db, base + nT0 - db, lg, sc, h, br,
-                            dks, NULL, NULL, NULL) == 0)
+                            dks, NULL, NULL) == 0)
                     dw.cached = base + nT0;
                 else frc = -1;
             }
@@ -1661,7 +1949,7 @@ int main(int argc, char **argv)
                     int prev = seq[base];
                     while (nd < spec_n) {
                         if (forward(&dw, &c, &cache, &prev, 1, lg, sc, h, br,
-                                    dks, NULL, NULL, NULL) != 0) break;
+                                    dks, NULL, NULL) != 0) break;
                         dw.cached += 1;
                         prev = argmax_(lg, c.vocab);
                         d[nd++] = prev;
@@ -1680,7 +1968,7 @@ int main(int argc, char **argv)
                 int arg[K3_SPEC_MAX + 1];
                 memcpy(spec_snap, ks, kper_f * (size_t)w.n_bound * sizeof(float));
                 for (int i = 0; i < nd; i++) seq[T + i] = d[i];
-                frc = forward(&w, &c, &cache, seq + base, nd + 1, lg, sc, h, br, ks, arg, NULL, NULL);
+                frc = forward(&w, &c, &cache, seq + base, nd + 1, lg, sc, h, br, ks, arg, NULL);
                 if (frc == 0) {
                     int m = 0;
                     while (m < nd && arg[m] == d[m]) m++;
@@ -1694,7 +1982,7 @@ int main(int argc, char **argv)
                         memcpy(ks, spec_snap, kper_f * (size_t)w.n_bound * sizeof(float));
                         w.cached = base;
                         frc = forward(&w, &c, &cache, seq + base, m + 1, lg, sc, h, br,
-                                      ks, NULL, NULL, NULL);
+                                      ks, NULL, NULL);
                         if (frc == 0) w.cached = base + m + 1;
                     }
                     /* Resync the draft model to the ACCEPTED sequence. On full
@@ -1707,13 +1995,13 @@ int main(int argc, char **argv)
                         if (m == nd) {
                             int last = d[nd - 1];
                             if (forward(&dw, &c, &cache, &last, 1, lg, sc, h, br,
-                                        dks, NULL, NULL, NULL) == 0) dw.cached += 1;
+                                        dks, NULL, NULL) == 0) dw.cached += 1;
                             else frc = -1;
                         } else {
                             memcpy(dks, dsnap, kper_f * (size_t)w.n_bound * sizeof(float));
                             dw.cached = base;
                             if (forward(&dw, &c, &cache, seq + base, m + 1, lg, sc,
-                                        h, br, dks, NULL, NULL, NULL) == 0) dw.cached = base + m + 1;
+                                        h, br, dks, NULL, NULL) == 0) dw.cached = base + m + 1;
                             else frc = -1;
                         }
                     }
@@ -1723,17 +2011,17 @@ int main(int argc, char **argv)
                     }
                 }
             } else {
-                frc = forward(&w, &c, &cache, seq + base, 1, lg, sc, h, br, ks, NULL, NULL, NULL);
+                frc = forward(&w, &c, &cache, seq + base, 1, lg, sc, h, br, ks, NULL, NULL);
                 if (frc == 0) { w.cached = base + 1; emit[emitn++] = argmax_(lg, c.vocab); }
                 /* keep the draft in lockstep through non-drafted steps */
                 if (dw.trunk && frc == 0) {
                     if (forward(&dw, &c, &cache, seq + base, 1, lg, sc, h, br,
-                                dks, NULL, NULL, NULL) == 0) dw.cached = base + 1;
+                                dks, NULL, NULL) == 0) dw.cached = base + 1;
                     else frc = -1;
                 }
             }
         } else {
-            frc = forward(&w, &c, &cache, seq, T, lg, sc, h, br, ks, NULL, NULL, NULL);
+            frc = forward(&w, &c, &cache, seq, T, lg, sc, h, br, ks, NULL, NULL);
             if (frc == 0) emit[emitn++] = argmax_(lg, c.vocab);
         }
         /* Abort the run rather than argmax a buffer the forward never wrote. */

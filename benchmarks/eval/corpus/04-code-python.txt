@@ -1,0 +1,82 @@
+"""Streaming quantile estimation over an unbounded sequence.
+
+The exact answer needs the whole stream in memory. The t-digest gets within a bounded
+relative error using space that does not grow with the input, and it is far more accurate
+in the tails than at the median, which is usually the way round you want.
+"""
+from __future__ import annotations
+
+import bisect
+import math
+from dataclasses import dataclass, field
+
+
+@dataclass(order=True)
+class Centroid:
+    mean: float
+    count: int = 1
+
+    def merge(self, x: float, w: int) -> None:
+        self.count += w
+        self.mean += w * (x - self.mean) / self.count
+
+
+@dataclass
+class TDigest:
+    compression: float = 100.0
+    centroids: list[Centroid] = field(default_factory=list)
+    total: int = 0
+
+    def _q(self, index: float) -> float:
+        return index / self.total if self.total else 0.0
+
+    def _limit(self, q: float) -> float:
+        """Maximum weight a centroid at quantile q may carry.
+
+        The 4 * n * q * (1 - q) / compression form is what makes the tails precise: the
+        bound vanishes as q approaches 0 or 1, so extreme centroids stay small and the
+        estimate there stays sharp, while centroids near the median are allowed to grow.
+        """
+        return 4 * self.total * q * (1 - q) / self.compression
+
+    def add(self, x: float, w: int = 1) -> None:
+        if not self.centroids:
+            self.centroids.append(Centroid(x, w))
+            self.total = w
+            return
+
+        self.total += w
+        i = bisect.bisect_left([c.mean for c in self.centroids], x)
+        candidates = [j for j in (i - 1, i) if 0 <= j < len(self.centroids)]
+        best, best_d = None, math.inf
+        for j in candidates:
+            d = abs(self.centroids[j].mean - x)
+            if d < best_d:
+                best, best_d = j, d
+
+        if best is not None:
+            running = sum(c.count for c in self.centroids[:best])
+            q = self._q(running + self.centroids[best].count / 2)
+            if self.centroids[best].count + w <= self._limit(q):
+                self.centroids[best].merge(x, w)
+                return
+
+        self.centroids.insert(i, Centroid(x, w))
+
+    def quantile(self, q: float) -> float:
+        if not self.centroids:
+            return math.nan
+        if len(self.centroids) == 1:
+            return self.centroids[0].mean
+
+        target = q * self.total
+        running = 0.0
+        for i, c in enumerate(self.centroids):
+            if running + c.count / 2 >= target and i > 0:
+                prev = self.centroids[i - 1]
+                lo = running - prev.count / 2
+                span = (running + c.count / 2) - lo
+                frac = (target - lo) / span if span else 0.0
+                return prev.mean + frac * (c.mean - prev.mean)
+            running += c.count
+        return self.centroids[-1].mean

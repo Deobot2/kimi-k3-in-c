@@ -1,0 +1,13 @@
+Worked problems, with the arithmetic shown.
+
+A trunk of 108.81 gigabytes is read once per generated token. The device sustains 5.9 gigabytes per second. The read therefore costs 108.81 divided by 5.9, which is 18.44 seconds per token. If compute for the same token is 11.2 seconds and the two do not overlap, the token costs 29.64 seconds and the read is 62.2 percent of it. If they overlap perfectly the token costs the larger of the two, 18.44 seconds, and the improvement is 29.64 divided by 18.44, or 1.61 times.
+
+Quantising the trunk to four bits reduces it by a factor of four, from 108.81 to 27.2 gigabytes, so the read falls to 4.61 seconds. Now compute dominates at 11.2 seconds, and with perfect overlap the token costs 11.2 seconds rather than 18.44, an improvement of 1.65 times. Note what happened: the first factor of four bought 1.65, not 4, because the bottleneck moved. A further halving to two bits would take the read to 2.31 seconds and change the token cost not at all.
+
+A cache of 64 gigabytes holds objects of 17,547,264 bytes each. The slot count is 64 times ten to the ninth divided by 17,547,264, which is 3,647 slots. One token routes 16 experts across 92 mixture layers, so its working set is 1,472 experts, or 25.83 gigabytes. The cache therefore holds 2.48 working sets.
+
+If the hit rate is 36.24 percent, the bytes actually read per token are 25.83 times one minus 0.3624, which is 16.47 gigabytes. At 61.74 percent, the optimum, it would be 9.88 gigabytes. The difference is 6.59 gigabytes per token, which at 5.9 gigabytes per second is 1.12 seconds per token.
+
+A sequence of 131,072 positions with a key-value cache costing 2.37 megabytes per position needs 310.6 gigabytes. At 55.3 kilobytes per position it needs 7.25 gigabytes, a reduction of 42.9 times. The first does not fit on any machine under discussion; the second fits on all of them.
+
+Three repeats of a measurement give 71.8, 42.3 and 55.1 seconds. The mean is 56.4 seconds. The deviations are 15.4, minus 14.1 and minus 1.3, whose squares are 237.2, 198.8 and 1.69. The sample variance is their sum, 437.7, divided by two, giving 218.8, so the standard deviation is 14.79 seconds, or 26.2 percent of the mean. A single sample from this distribution tells you very little, and a difference of ten percent between two single samples tells you nothing at all.
