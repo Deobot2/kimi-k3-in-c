@@ -113,7 +113,13 @@ def make_config(hidden, layers, vocab, seed):
     binder and the kernels care about: a dense layer 0, both attention families, MoE with
     shared experts, AttnRes blocks, and every narrow width a multiple of 32."""
     n_kda_heads = 4
-    kda_head_dim = hidden // n_kda_heads // 2      # P = heads*dim = hidden/2
+    # A MULTIPLE OF 32, always. f_b_proj is [heads*dim][kda_head_dim], so this value is
+    # its column count -- and a narrow tensor whose columns are not a multiple of the
+    # MXFP4 group cannot be quantised, which leaves its layer mixing BF16 and MX4 and the
+    # binder refuses the whole trunk. The released model uses 128. A fixture that cannot
+    # be quantised cannot test a quantiser, and the failure appears at layer 0 of an
+    # unrelated tool.
+    kda_head_dim = max(GROUP, (hidden // n_kda_heads // 2 + GROUP - 1) // GROUP * GROUP)
     # MLA layers: every 4th, one-based in the config as the reader expects.
     full_attn = [i for i in range(4, layers + 1, 4)]
     if not full_attn:
@@ -170,8 +176,12 @@ def build(cfg, rng):
     T = {}
 
     def n(name, *shape):
-        """A narrow (matmul) weight: bf16, the format the binder tags a layer with."""
-        T[name] = bf16(rng.normal(0, 0.02, size=shape))
+        """A narrow (matmul) weight: bf16, the format the binder tags a layer with.
+
+        std 0.05 rather than 0.02: at 0.02 the signal through 13 layers decays into the
+        rounding floor and downstream tensors stop mattering, which makes the fixture
+        useless for exactly the checks it exists to support."""
+        T[name] = bf16(rng.normal(0, 0.05, size=shape))
 
     def w(name, *shape):
         """A wide weight: fp32, read elementwise and never through a matmul."""
@@ -206,15 +216,23 @@ def build(cfg, rng):
             for leaf in ("q_proj", "k_proj", "v_proj", "g_proj"):
                 n(p + f"self_attn.{leaf}.weight", P, H)
             n(p + "self_attn.o_proj.weight", H, P)
-            for leaf in ("q_conv1d", "k_conv1d", "v_conv1d"):
-                w(p + f"self_attn.{leaf}.weight", P, 1, cfg["short_conv_kernel_size"])
             n(p + "self_attn.f_a_proj.weight", cfg["kda_head_dim"], H)
             n(p + "self_attn.f_b_proj.weight", P, cfg["kda_head_dim"])
             n(p + "self_attn.b_proj.weight", cfg["kda_num_heads"], H)
-            # A_log ships kda_head_dim values per the checkpoint; the engine takes the
-            # first kda_num_heads of them. Writing fewer would bind short.
-            w(p + "self_attn.A_log", cfg["kda_head_dim"])
-            w(p + "self_attn.dt_bias", P)
+            # THE KDA RECURRENCE HAS TO ACTUALLY ENGAGE, and at std 0.02 it does not.
+            # The decay, the delta-rule gate and the ShortConv compound, and the layer
+            # output underflows to ~1e-6 -- scale_test reports exactly that on a
+            # full-width random layer. A fixture in that state cannot test anything
+            # upstream of the KDA output: zeroing q_proj or g_proj outright changed
+            # nothing measurable, because they were being multiplied into zero.
+            #
+            # These three are the values tools/make_k3_oracle.py uses to make the caps
+            # and the routing bias engage, and they exist for the same reason.
+            T[p + "self_attn.A_log"] = np.linspace(-0.4, 1.2, cfg["kda_head_dim"]).astype(np.float32)
+            T[p + "self_attn.dt_bias"] = rng.normal(0, 0.5, size=P).astype(np.float32)
+            for leaf in ("q_conv1d", "k_conv1d", "v_conv1d"):
+                T[p + f"self_attn.{leaf}.weight"] = rng.normal(
+                    0, 0.4, size=(P, 1, cfg["short_conv_kernel_size"])).astype(np.float32)
             w(p + "self_attn.o_norm.weight", cfg["kda_head_dim"])
 
         if L < cfg["first_k_dense_replace"]:
