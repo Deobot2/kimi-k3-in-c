@@ -81,6 +81,14 @@ not needing the bytes at all.
 - The S3-FIFO victim search could cycle the small queue forever when its head was the
   expert the caller was still using, while the main queue sat full of evictable slots.
   That is a failed admission and a dropped expert, not a slow path.
+- **The trunk ring re-read layers it had already prefetched.** `claim_slot_locked`
+  protected slots being read into and the slot in use, but not one holding a layer the
+  prefetcher had fetched and the walk had not yet reached — so a further-ahead prefetch
+  evicted the very next layer needed, which was then read again. Worst right after a
+  pinned layer, which holds no ring slot and so leaves every slot looking claimable.
+  Measured on the released checkpoint as **491 GB read from a 29.81 GB trunk over ten
+  passes**; reproduced in `test_trunk` at ring depth 2 as 6.23 MB against a 4.72 MB
+  bound, and that bound is now asserted on every ring depth.
 
 ## [1.0.0] - 2026-08-07
 
