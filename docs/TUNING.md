@@ -81,7 +81,7 @@ what a gigabyte of expert cache is worth once you have given the trunk everythin
 Both are A/B-able on one binary, which is the only honest way to attribute a difference:
 
     K3_CACHE_POLICY=lru   # the old policy
-    K3_NOSPEC=1           # no speculative prefetch
+    K3_SPEC=1             # speculative prefetch ON (off by default; it lost)
     K3_NOPREFETCH=1       # no batch prefetch either
 
 ### The one number that decides whether cache capacity is worth anything

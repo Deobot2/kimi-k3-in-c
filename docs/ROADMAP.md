@@ -23,10 +23,18 @@ docs/data/ with replicated ones.
 
 **This is now the most urgent item on the list, not the second.** Five changes landed
 that each claim a speed or memory effect — largest-first pinning, a deeper ring, io_uring
-reads, S3-FIFO, speculative expert prefetch — and every one of them is argued from
-mechanism and gated for correctness, not measured for effect on the released checkpoint.
+reads, S3-FIFO, speculative expert prefetch — and every one was argued from mechanism and
+gated for correctness rather than measured for effect.
+
+Two have since been measured on the released checkpoint, and **both arguments were
+wrong**. S3-FIFO's flat 10% small queue LOST to the LRU it replaced at every size below
+32 GB, including the laptop and desktop presets; it now sizes the small queue against one
+token's working set. Speculative prefetch lost outright — 25.8 GB read per token to avoid
+30% of it, on a run 96.9% I/O bound — and is off by default. That is 2 for 2 against
+reasoning from mechanism, on a codebase whose own instrumentation was sitting there the
+whole time, and the remaining three should be read in that light.
 Each is A/B-able on a single binary by design (`K3_PIN_PREFIX`, `--trunk-ring`,
-`K3_NOURING`, `K3_CACHE_POLICY=lru`, `K3_NOSPEC`), which is exactly what the harness
+`K3_NOURING`, `K3_CACHE_POLICY=lru`, `K3_SPEC`), which is exactly what the harness
 needs and exactly what has not yet been run.
 
 ## 3. Thread scaling

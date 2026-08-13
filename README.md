@@ -456,7 +456,7 @@ layout, or the weather:
 | | |
 |---|---|
 | `K3_CACHE_POLICY=lru` | expert cache uses LRU instead of S3-FIFO |
-| `K3_NOSPEC=1` | no speculative expert prefetch |
+| `K3_SPEC=1` | speculative expert prefetch ON. Off by default: measured, it read 25.8 GB/token to avoid 30% of it |
 | `K3_NOPREFETCH=1` | no batch expert prefetch either |
 | `K3_PIN_PREFIX=1` | pin trunk layers as a prefix instead of largest-first |
 | `K3_NOURING=1` | trunk reads use `pread` instead of io_uring |
@@ -2807,21 +2807,36 @@ the friendliest possible case: every expert is exactly 17,547,264 bytes, so a sl
 slot and no cost-aware weighting is needed, and the ghost queue can be exact rather than a
 sketch because 82,432 keys is 82 KB.
 
-**Speculative prefetch, from the line above the table.** *90.0% of requests are repeats.*
-When decode reaches layer L for token *t*, layer L's top-16 for token *t−1* is already
-known, and by that line it is a good guess. So the cache issues those reads on a
-background thread the moment the layer is entered, before the router has even run on the
-current hidden state. A right guess turns a blocking 17.55 MB read into a warm hit; a
-wrong one spends bandwidth on a machine that is idle waiting for the disk 40–77% of the
-time. The two compose neatly: an expert fetched on a guess nobody uses lands in the small
-FIFO and leaves from there, which is exactly where a wrong guess belongs.
+**Speculative prefetch — which was tried, measured, and turned off.** *90.0% of requests
+are repeats*, says the line above the table, so layer L's top-16 for token *t−1* looks
+like a good guess for token *t*. The cache issues those reads on a background thread the
+moment the layer is entered. Then it was run on the released checkpoint:
+
+```text
+speculation : 1472 experts read on the previous token's routing,
+              446 of the guessed set were then requested (30.3%)
+per token   : 43.8 GB read, against a maximum of 25.8 GB if nothing were cached
+I/O share   : 96.9% of wall clock
+```
+
+It read a whole token's experts to avoid re-reading 30% of them. **That 90% figure does
+not mean what I used it for**: this trace was recorded during *full-recompute* decode,
+where every step reprocesses the prefix, so the repeats are within one forward pass across
+positions — the caveat `sim_cache.py` prints itself. Consecutive-token overlap at the same
+layer is a different quantity, and it is 30%.
+
+The structural half is worse. Speculation only *reads* something when the cache failed to
+retain it; if the cache retained it, the guess is free and pointless. So it does work
+exactly when the extra bytes hurt most — and a correct guess does not *avoid* a read, it
+only starts it earlier. `K3_SPEC=1` still enables it, because the trade reverses on a
+machine with spare read bandwidth. This engine is not that machine.
 
 Both are switchable on one binary, because comparing two builds compares two binaries
 while comparing one decision compares one decision:
 
 ```bash
 K3_CACHE_POLICY=lru ./bin/k3 ...    # the old policy
-K3_NOSPEC=1         ./bin/k3 ...    # no speculation
+K3_SPEC=1           ./bin/k3 ...    # speculation ON (off by default; it lost)
 ```
 
 **Neither has been measured on the released checkpoint yet**, and this section will not
