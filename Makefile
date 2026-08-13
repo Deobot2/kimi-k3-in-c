@@ -195,6 +195,12 @@ test: $(TEST_BINS)
 	  fi
 	@echo "== real dimensions ==";   ./$(BIN)/scale_test
 	@echo "== full-model oracle =="; ./$(BIN)/k3_model $(FIXTURES)
+	@echo "== eval metrics =="; \
+	  if python3 -c "import numpy" 2>/dev/null; then \
+	      python3 benchmarks/eval/run_eval.py --self-test || exit 1; \
+	  else \
+	      echo "  NOT RUN: no numpy. The degeneration metrics are Python."; \
+	  fi
 	@echo
 	@if [ ! -f "$(TOK_FILES)/tiktoken.model" ]; then \
 	     echo "NOTE: tokenizer parity did NOT run; see above. Everything else did."; \

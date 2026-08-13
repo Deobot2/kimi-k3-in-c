@@ -189,9 +189,16 @@ jobs:
       - run: pip install --quiet ruff
       # Gates. Style drift in tools that generate the test fixtures is worth catching,
       # and an unparseable tool is a broken fixture pipeline.
-      - run: ruff check tools/ --output-format=github
+      - run: ruff check tools/ benchmarks/ --output-format=github
       - name: Syntax check every tool
-        run: python -m compileall -q tools/
+        run: python -m compileall -q tools/ benchmarks/
+      # The evaluation metrics are the only part of the harness that can be checked
+      # without a 110 GB checkpoint, and loop_period failing toward "no loop found"
+      # would clear a broken model silently.
+      - name: Evaluation metric self-test
+        run: |
+          pip install --quiet numpy
+          python3 benchmarks/eval/run_eval.py --self-test
 
   shellcheck:
     name: shellcheck

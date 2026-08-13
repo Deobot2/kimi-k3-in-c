@@ -1,0 +1,13 @@
+Selected constants, dates and quantities, stated flatly.
+
+The speed of light in vacuum is exactly 299,792,458 metres per second; the metre has been defined from it since 1983. The Planck constant is exactly 6.62607015 by ten to the minus thirty-four joule seconds, fixed by the 2019 redefinition of the SI base units, which also fixed the elementary charge at 1.602176634 by ten to the minus nineteen coulombs, the Boltzmann constant at 1.380649 by ten to the minus twenty-three joules per kelvin, and the Avogadro constant at 6.02214076 by ten to the twenty-three per mole.
+
+The standard acceleration due to gravity is 9.80665 metres per second squared. Absolute zero is minus 273.15 degrees Celsius. Water at standard pressure freezes at 273.15 kelvin and boils at 373.13 kelvin, the latter slightly below the round figure because the kelvin is now defined from the Boltzmann constant rather than from water.
+
+The Earth's equatorial radius is about 6,378 kilometres and its polar radius about 6,357 kilometres, a flattening of roughly one part in 298. Its mean orbital distance from the Sun is about 149.6 million kilometres, which is the astronomical unit, fixed since 2012 at exactly 149,597,870,700 metres. Light crosses that distance in about 499 seconds.
+
+In computing, one gibibyte is 1,073,741,824 bytes, and one gigabyte in decimal notation is 1,000,000,000 bytes; the ratio is about 1.074. A single-precision float has 24 bits of significand including the implicit leading bit, giving about 7.2 decimal digits. Double precision has 53 bits, about 15.9 decimal digits. The bfloat16 format keeps the 8 exponent bits of single precision and truncates the significand to 8 bits including the implicit one, which is why it has the dynamic range of a float and the precision of about two and a half decimal digits.
+
+The first transatlantic telegraph cable carried its first message in August 1858 and failed within three weeks; a durable cable followed in 1866. The ARPANET carried its first host-to-host message in October 1969. The first commercially available microprocessor, the Intel 4004, was released in November 1971 and ran at 740 kilohertz. IPv4 was specified in RFC 791 in September 1981 and provides 32-bit addresses, about 4.29 billion of them. IPv6, specified in RFC 2460 in December 1998 and superseded by RFC 8200 in July 2017, provides 128-bit addresses.
+
+The tallest mountain above sea level is Everest at about 8,849 metres, revised upward in 2020. The deepest known point of the ocean is Challenger Deep, about 10,935 metres below sea level. The longest river is either the Nile at about 6,650 kilometres or the Amazon at about 6,400 kilometres, depending on where the Amazon is judged to begin.

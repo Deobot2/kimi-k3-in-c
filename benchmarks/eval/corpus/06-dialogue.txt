@@ -1,0 +1,27 @@
+"You said the build was green."
+
+"The build is green. The tests are green. The thing that is red is the thing nobody wrote a test for."
+
+"Which is?"
+
+"Memory. It builds, it passes, and it uses eleven gigabytes to do a job that should take three. Nothing in the suite asserts anything about memory, so nothing in the suite noticed."
+
+"How long has it been doing that?"
+
+"I don't know yet. That's the honest answer. I can tell you it's doing it now, because I measured it now. I can't tell you when it started, because there's no historical record to compare against. We have timing numbers going back eight months and no memory numbers at all."
+
+"Guess."
+
+"I'd rather not. Every time I've guessed on this project I've been wrong in a way that cost more than the measurement would have. Give me an afternoon and I'll bisect it properly."
+
+"An afternoon is fine. What do you need?"
+
+"Nothing you can give me. It's a bisect over eighty commits, and each one has to actually run, which takes about four minutes. Call it six hours of machine time and twenty minutes of mine."
+
+"Then start it now and tell me what else is on your list while it runs."
+
+"Three things. First, the same gap exists for disk reads — we report bandwidth but never total bytes, and those two can move in opposite directions. Second, nothing in CI runs the streaming path at all, because it needs the full checkpoint, so every bug in it has been found by hand. Third, and this is the one that worries me, we have exactly one number for each published measurement. No repeats. The noise floor might be thirty percent and we would not know."
+
+"Which of those three would you do first if you could only do one?"
+
+"The third, and it isn't close. The other two are missing measurements. That one means the measurements we already published might not say what we think they say."

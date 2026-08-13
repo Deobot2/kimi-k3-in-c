@@ -1,0 +1,76 @@
+/* ring.c - a single-producer single-consumer ring buffer with no locks.
+ *
+ * The invariant is that head is written only by the consumer and tail only by the
+ * producer, so neither ever needs to observe a value the other is mid-way through
+ * writing. What both need is ordering, which is what the acquire/release pairs below
+ * provide and what a plain volatile read does not.
+ */
+#include <stdatomic.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+typedef struct {
+    unsigned char *buf;
+    size_t         cap;        /* must be a power of two */
+    _Atomic size_t head;       /* consumer reads here */
+    _Atomic size_t tail;       /* producer writes here */
+} Ring;
+
+static inline size_t ring_mask(const Ring *r, size_t v) { return v & (r->cap - 1); }
+
+int ring_init(Ring *r, unsigned char *storage, size_t cap)
+{
+    if (cap == 0 || (cap & (cap - 1)) != 0) return -1;
+    r->buf = storage;
+    r->cap = cap;
+    atomic_store_explicit(&r->head, 0, memory_order_relaxed);
+    atomic_store_explicit(&r->tail, 0, memory_order_relaxed);
+    return 0;
+}
+
+size_t ring_write(Ring *r, const unsigned char *src, size_t n)
+{
+    const size_t tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
+    const size_t head = atomic_load_explicit(&r->head, memory_order_acquire);
+    const size_t free_bytes = r->cap - (tail - head);
+    if (n > free_bytes) n = free_bytes;
+
+    const size_t first = r->cap - ring_mask(r, tail);
+    if (n <= first) {
+        memcpy(r->buf + ring_mask(r, tail), src, n);
+    } else {
+        memcpy(r->buf + ring_mask(r, tail), src, first);
+        memcpy(r->buf, src + first, n - first);
+    }
+    atomic_store_explicit(&r->tail, tail + n, memory_order_release);
+    return n;
+}
+
+size_t ring_read(Ring *r, unsigned char *dst, size_t n)
+{
+    const size_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
+    const size_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
+    const size_t avail = tail - head;
+    if (n > avail) n = avail;
+
+    const size_t first = r->cap - ring_mask(r, head);
+    if (n <= first) {
+        memcpy(dst, r->buf + ring_mask(r, head), n);
+    } else {
+        memcpy(dst, r->buf + ring_mask(r, head), first);
+        memcpy(dst + first, r->buf, n - first);
+    }
+    atomic_store_explicit(&r->head, head + n, memory_order_release);
+    return n;
+}
+
+/* Counters are free-running and unsigned, so wrap-around is defined and the difference
+ * tail - head stays correct across it. Storing masked indices instead would make a full
+ * ring indistinguishable from an empty one, which is the classic bug here. */
+size_t ring_used(const Ring *r)
+{
+    const size_t head = atomic_load_explicit(&r->head, memory_order_acquire);
+    const size_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
+    return tail - head;
+}

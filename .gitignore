@@ -59,3 +59,7 @@ venv/
 # confusing one to debug.
 !tests/fixtures/
 !tests/fixtures/**
+
+# Evaluation runs. The corpus and the driver are committed; results are machine- and
+# checkpoint-specific and can be large (per-position dumps).
+benchmarks/eval/results/
