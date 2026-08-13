@@ -109,12 +109,15 @@ not exist when it was made. Re-running it is item 2 on the roadmap, along with t
 of the campaign, and until then the honest statement is that S3-FIFO is expected to close
 part of that gap and has not been measured on this trace.
 
-A second change targets the same gap from the other side. About 90% of requests in this
-trace are repeats, and when decode reaches layer L for token t, layer L's top-16 for
-token t−1 is already known. The cache issues reads for that set on a background thread
-the moment the layer is entered, before the router has run, so a right guess converts a
-blocking 17.55 MB read into a warm hit and a wrong one spends bandwidth the engine is not
-otherwise using. Both are A/B-able on one binary (`K3_CACHE_POLICY=lru`, `K3_NOSPEC=1`).
+A second change targeted the same gap from the other side and **failed**, which is worth
+recording as carefully as a success. Speculative prefetch reads layer L's top-16 from the
+previous token before the router runs. Measured on the released checkpoint it read 1,472
+experts per token and 30.3% of the guessed set was then requested -- 43.8 GB per token
+against a 25.8 GB maximum, on a run that was 96.9% I/O bound. The "90% of requests are
+repeats" figure it rested on describes reuse *within a full-recompute forward pass*, not
+overlap between consecutive tokens at the same layer; the caveat below this table says so.
+It is off by default and `K3_SPEC=1` enables it. `K3_CACHE_POLICY=lru` remains the A/B for
+the policy itself.
 
 Two things to hold onto:
 

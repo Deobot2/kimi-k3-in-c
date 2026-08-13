@@ -50,11 +50,13 @@ not needing the bytes at all.
   policy rather than the size. Small FIFO, main FIFO, ghost queue; uniform object size
   makes it the friendliest possible case. `K3_CACHE_POLICY=lru` restores the old policy on
   the same binary, and `tools/sim_cache.py` reports both.
-- **Speculative expert prefetch.** About 90% of expert requests in a real trace are
-  repeats, so on entering layer L the cache starts reads for what that layer wanted for
-  the previous token, on a background thread, before the router has run. `K3_NOSPEC=1`
-  disables it; it also refuses to start when the cache cannot hold two tokens' working
-  set.
+- **Speculative expert prefetch, implemented and then turned OFF after measuring it.**
+  On entering layer L the cache can start reads for what that layer wanted for the
+  previous token, before the router has run. Measured on the released checkpoint it read
+  1,472 experts per token and 30.3% of the guessed set was requested: 43.8 GB per token
+  against a 25.8 GB maximum, on a run 96.9% I/O bound. The "90% of requests are repeats"
+  premise describes reuse within a full-recompute forward pass, not consecutive-token
+  overlap. `K3_SPEC=1` enables it for machines with spare read bandwidth.
 - **Trunk layers are pinned largest-first, not as a prefix.** Which layers you pin is
   byte-neutral for the traffic avoided but not for the ring, whose uniform slot must hold
   the largest layer still streaming — prefix pinning took the 2.34 GB dense layer first
