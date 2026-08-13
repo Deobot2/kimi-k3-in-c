@@ -247,10 +247,18 @@ def run_one(a, outdir: str) -> dict:
     # ---- leg A ----
     print("  leg A: teacher-forced perplexity ...", flush=True)
     t0 = time.time()
-    k3(model_args(a) + ["--ppl-file", suite,
-                        "--ppl-dump", os.path.join(outdir, "ppl.bin"),
-                        "--out", os.path.join(outdir, "ppl.json")],
-       os.path.join(outdir, "ppl.log"))
+    legA = ["--ppl-file", suite,
+            "--ppl-dump", os.path.join(outdir, "ppl.bin"),
+            "--out", os.path.join(outdir, "ppl.json")]
+    if a.calib_dump:
+        # The AWQ calibration sweep and this one are the SAME teacher-forced forward
+        # pass. With a streamed trunk each document costs a full trunk read, so running
+        # them separately pays for the whole suite twice for no reason. Only meaningful
+        # on the BF16 baseline run -- statistics from a quantised model describe the
+        # approximation rather than what is being approximated.
+        legA += ["--calib-dump", a.calib_dump]
+        print(f"    (also writing activation calibration to {a.calib_dump})")
+    k3(model_args(a) + legA, os.path.join(outdir, "ppl.log"))
     with open(os.path.join(outdir, "ppl.json")) as f:
         result["ppl"] = json.load(f)
     result["ppl"]["seconds"] = round(time.time() - t0, 1)
@@ -473,6 +481,10 @@ def main():
     ap.add_argument("--trunk-gb", type=float)
     ap.add_argument("--cache-gb", type=float)
     ap.add_argument("--preset")
+    ap.add_argument("--calib-dump",
+                    help="also collect AWQ activation statistics during leg A, which is "
+                         "the same forward pass. Use on the BF16 baseline run so the "
+                         "suite is not swept twice")
     a = ap.parse_args()
 
     if a.self_test:
