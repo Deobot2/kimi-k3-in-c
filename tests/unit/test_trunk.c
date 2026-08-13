@@ -129,6 +129,27 @@ static void walk(K3Trunk *tr, const int64_t *len, int passes, const char *label)
         }
     }
     ok(label, bad == 0, "%d fetches over %d passes, %d wrong", checked, passes, bad);
+
+    /* HOW MANY BYTES DID THAT COST? A layer needed in a pass is read at most ONCE:
+     * pinned layers are read on first touch and never again, and a streamed layer is
+     * read when the walk reaches it -- by the reader thread if the prefetch got there
+     * first, by the caller otherwise, but not both. So
+     *
+     *     bytes_read <= pinned_bytes + passes * unpinned_bytes
+     *
+     * and anything above that means a layer was fetched twice, or counted twice, which
+     * are the same symptom from outside: a device rate that flatters and an I/O share
+     * that is wrong. Neither shows up in the token stream, so nothing else here would
+     * catch it. A real run reported 491 GB against a 29.81 GB trunk over ten passes,
+     * which is what this bound exists to reproduce or refute. */
+    int64_t pinned_b = 0, unpinned_b = 0;
+    for (int L = 0; L < NLAY; L++)
+        if (tr->pin_of[L] >= 0) pinned_b += len[L]; else unpinned_b += len[L];
+    const double bound = (double)pinned_b + (double)passes * (double)unpinned_b;
+    ok("  bytes read <= one per pass", (double)tr->bytes_read <= bound * 1.02,
+       "%.2f MB read, bound %.2f MB (%d pinned + %d passes x %d streamed)",
+       (double)tr->bytes_read / 1e6, bound / 1e6,
+       (int)(pinned_b / 1024), passes, (int)(unpinned_b / 1024));
 }
 
 static void run_case(const char *dir, const K3Cfg *c, const int64_t *len,
