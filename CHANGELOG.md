@@ -41,7 +41,10 @@ not needing the bytes at all.
 - **`tests/unit/test_trunk.c`**: the streaming trunk was unreachable without a 108.81 GB
   checkpoint and every failure in it is silent. It now runs against a synthetic trunk
   whose layers carry byte patterns derived from their own index, at three ring depths and
-  on both read paths.
+  on both read paths — and asserts that no layer is read more than the walk owes, per
+  layer as well as in total. `t_sweep` re-runs that assertion across the whole space of
+  pinned shapes at the real 93-layer count, because a hand-built fixture proves one
+  arrangement is handled and the arrangement that escaped was not one anybody guessed.
 
 ### Changed
 
@@ -89,6 +92,20 @@ not needing the bytes at all.
   Measured on the released checkpoint as **491 GB read from a 29.81 GB trunk over ten
   passes**; reproduced in `test_trunk` at ring depth 2 as 6.23 MB against a 4.72 MB
   bound, and that bound is now asserted on every ring depth.
+- **…and then re-read a smaller share of them anyway, because the protection window
+  measured the wrong thing.** It protected layers `walk+1 .. walk+nslot` by INDEX, which
+  is only the right window when nothing is pinned: `k3_trunk_prefetch` skips pinned layers
+  while scanning rather than stopping at them, so with pinned layers ahead it queues
+  something many indices out that is only a few slots out, and the index window called it
+  stale. It now counts the layers that would actually take a slot, which is identical
+  whenever nothing is pinned and strictly wider otherwise. A run on the released
+  checkpoint sat 13.7% above the bound after the first fix; a new 93-layer sweep across
+  budgets and ring depths failed **40 of 100 pinned shapes**, worst 35 layers re-read at
+  56 pinned with a four-slot ring, and passes all 100 with this.
+- `K3Trunk` now counts reads **per layer**, and `k3_trunk_report` prints the layers that
+  went over what the walk owed. The aggregate byte total could say a run went over and
+  never which layers; two explanations for the 13.7% were argued from the pinned set's
+  shape before this existed, and both were wrong.
 
 ## [1.0.0] - 2026-08-07
 

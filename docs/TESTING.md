@@ -34,6 +34,22 @@ a crash. It covers ring depths 1, 2 and 3, the io_uring and `pread` paths, and t
 largest-first pinning choice (including that it pins at least as many bytes as prefix
 pinning at the same budget).
 
+It also asserts a **byte** bound rather than only a correctness one: a pinned layer is read
+once for the whole run and a streamed layer once per pass, so anything above that is a slot
+evicted between the prefetch that filled it and the walk that needed it. That failure
+changes no token and shows up only as a device rate that flatters. It is checked per layer,
+not just in aggregate, because the aggregate can say a run went over and never which
+layers.
+
+`t_sweep` then runs that same assertion across the *whole space* of pinned shapes — a
+93-layer trunk, ring depths 1 to 4, budgets from a bare ring to fully resident. This is the
+part worth copying elsewhere. Two hand-built fixtures had already been shaped, deliberately
+and with reasoning attached, to expose this bug; both passed a build that a real run showed
+was still reading 13.7% too much, and two further explanations were argued from the pinned
+set's shape without evidence. The sweep failed 40 of 100 shapes on that same build and
+named the worst one. **A fixture proves an arrangement is handled; only enumeration proves
+the arrangement that escapes is not there.**
+
 **`test_st`**, the safetensors reader: dtype widening, offsets, tail bytes, escaped
 tensor names, and a tensor deliberately containing non-finite values.
 
