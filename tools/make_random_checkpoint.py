@@ -184,8 +184,27 @@ def build(cfg, rng):
         T[name] = bf16(rng.normal(0, 0.05, size=shape))
 
     def w(name, *shape):
-        """A wide weight: fp32, read elementwise and never through a matmul."""
+        """A wide weight the engine points at IN PLACE: F32 on disk, no widening.
+
+        The conv kernels, A_log, dt_bias, o_norm and the router bias are here. See wb()
+        for why the split matters and is not a free choice."""
         T[name] = rng.normal(0, 0.02, size=shape).astype(np.float32)
+
+    def wb(name, *shape):
+        """A wide weight the engine WIDENS from BF16 into the slot's widen area.
+
+        THE SPLIT BETWEEN w AND wb IS NOT COSMETIC. k3_bind_widen_bytes budgets the widen
+        area for exactly one set of tensors -- the six per-layer norms, the two MLA
+        layernorms, the routed-expert norm and the router gate -- and a trunk that stores
+        anything ELSE as bf16 overflows that area and is refused at bind time. The
+        released checkpoint stores precisely this set as bf16 and the rest as fp32, which
+        is why it fits.
+
+        Both fixture generators wrote every wide tensor as F32, so no fixture ever
+        exercised the widen path at all. tools/awq_trunk.py assumed fp32 norms on that
+        evidence and crashed on the first real trunk; making everything bf16 instead
+        overflowed the widen area. The real checkpoint is neither, and this is it."""
+        T[name] = bf16(rng.normal(0, 0.02, size=shape))
 
     n(PRE + "embed_tokens.weight", V, H)
     n("language_model.lm_head.weight", V, H)
@@ -198,15 +217,15 @@ def build(cfg, rng):
         for leaf in ("input_layernorm", "post_attention_layernorm",
                      "self_attention_res_norm", "self_attention_res_proj",
                      "mlp_res_norm", "mlp_res_proj"):
-            w(p + leaf + ".weight", H)
+            wb(p + leaf + ".weight", H)
 
         if L in mla:
             n(p + "self_attn.q_a_proj.weight", cfg["q_lora_rank"], H)
-            w(p + "self_attn.q_a_layernorm.weight", cfg["q_lora_rank"])
+            wb(p + "self_attn.q_a_layernorm.weight", cfg["q_lora_rank"])
             n(p + "self_attn.q_b_proj.weight", NH * qh, cfg["q_lora_rank"])
             n(p + "self_attn.kv_a_proj_with_mqa.weight",
               cfg["kv_lora_rank"] + cfg["qk_rope_head_dim"], H)
-            w(p + "self_attn.kv_a_layernorm.weight", cfg["kv_lora_rank"])
+            wb(p + "self_attn.kv_a_layernorm.weight", cfg["kv_lora_rank"])
             n(p + "self_attn.kv_b_proj.weight",
               NH * (cfg["qk_nope_head_dim"] + cfg["v_head_dim"]), cfg["kv_lora_rank"])
             n(p + "self_attn.o_proj.weight", H, NH * cfg["v_head_dim"])
@@ -241,11 +260,11 @@ def build(cfg, rng):
             n(p + "mlp.down_proj.weight", H, cfg["intermediate_size"])
         else:
             q = p + "block_sparse_moe."
-            w(q + "gate.weight", NE, H)
+            wb(q + "gate.weight", NE, H)
             w(q + "gate.e_score_correction_bias", NE)
             n(q + "routed_expert_down_proj.weight", LAT, H)
             n(q + "routed_expert_up_proj.weight", H, LAT)
-            w(q + "routed_expert_norm.weight", LAT)
+            wb(q + "routed_expert_norm.weight", LAT)
             n(q + "shared_experts.gate_proj.weight", SI, H)
             n(q + "shared_experts.up_proj.weight", SI, H)
             n(q + "shared_experts.down_proj.weight", H, SI)

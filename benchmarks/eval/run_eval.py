@@ -245,6 +245,20 @@ def run_one(a, outdir: str) -> dict:
               "model": a.model, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
     # ---- leg A ----
+    # RESUMABLE, because leg A costs hours on a streamed trunk and leg B can fail after
+    # it: a machine that is 800 MB short for the generation runs should not cost another
+    # full teacher-forced sweep to find that out. Delete ppl.json to force a redo.
+    ppl_json = os.path.join(outdir, "ppl.json")
+    ppl_bin = os.path.join(outdir, "ppl.bin")
+    if os.path.exists(ppl_json) and os.path.exists(ppl_bin) and not a.redo:
+        with open(ppl_json) as f:
+            result["ppl"] = json.load(f)
+        print(f"  leg A: REUSING {ppl_json} "
+              f"(perplexity {result['ppl']['perplexity']:.4f} over "
+              f"{result['ppl']['ppl_positions']} positions)")
+        print("         pass --redo to run it again")
+        return _leg_b(a, outdir, result)
+
     print("  leg A: teacher-forced perplexity ...", flush=True)
     t0 = time.time()
     legA = ["--ppl-file", suite,
@@ -266,6 +280,10 @@ def run_one(a, outdir: str) -> dict:
           f"over {result['ppl']['ppl_positions']} positions "
           f"({result['ppl']['seconds']:.0f} s)")
 
+    return _leg_b(a, outdir, result)
+
+
+def _leg_b(a, outdir, result):
     # ---- leg B ----
     if a.gen > 0 and not a.synthetic_vocab:
         print(f"  leg B: free generation, {a.gen} tokens x {len(GEN_PROMPTS)} prompts ...",
@@ -277,9 +295,11 @@ def run_one(a, outdir: str) -> dict:
             with open(pf, "w") as f:
                 f.write(text)
             t1 = time.time()
-            k3(model_args(a) + ["--prompt-file", pf, "--tok", a.tok,
-                                "--gen", str(a.gen), "--incremental", "--out", gp],
-               os.path.join(outdir, f"gen-{name}.log"))
+            reused = os.path.exists(gp) and not a.redo
+            if not reused:
+                k3(model_args(a) + ["--prompt-file", pf, "--tok", a.tok,
+                                    "--gen", str(a.gen), "--incremental", "--out", gp],
+                   os.path.join(outdir, f"gen-{name}.log"))
             with open(gp) as f:
                 g = json.load(f)
             d = degeneration(g["generated_ids"])
@@ -289,7 +309,8 @@ def run_one(a, outdir: str) -> dict:
             gens.append(d)
             loop = f"LOOP p={d['loop_period']}" if d["loop_period"] else "no loop"
             print(f"    {name:<14} repeat {d['repeat_rate_4']:.2f}  "
-                  f"distinct-3 {d['distinct_3']:.2f}  {loop}")
+                  f"distinct-3 {d['distinct_3']:.2f}  {loop}"
+                  f"{'   (reused)' if reused else ''}")
         result["gen"] = gens
 
     with open(os.path.join(outdir, "result.json"), "w") as f:
@@ -481,6 +502,9 @@ def main():
     ap.add_argument("--trunk-gb", type=float)
     ap.add_argument("--cache-gb", type=float)
     ap.add_argument("--preset")
+    ap.add_argument("--redo", action="store_true",
+                    help="re-run legs whose output already exists. Off by default so a "
+                         "run interrupted in leg B does not repeat a multi-hour leg A")
     ap.add_argument("--calib-dump",
                     help="also collect AWQ activation statistics during leg A, which is "
                          "the same forward pass. Use on the BF16 baseline run so the "
