@@ -19,16 +19,28 @@ WHAT IS BEING CHECKED, AND WHY IT NEEDS ITS OWN TOOL
     the only difference left is bf16 re-rounding of the scaled weights. Anything larger is
     a missing consumer.
 
-    The check runs on the per-position log-probabilities from --ppl-dump rather than on
-    perplexity, because perplexity is a mean over the vocabulary and washes this out. When
-    this was written, omitting just the router rescale moved perplexity by 0.002 and left
-    top-1 agreement at 100.00% -- while the maximum per-position log-probability delta went
-    from 1.4e-06 to 8.6e-05, a factor of sixty. The delta is the instrument; the others are
-    not sensitive enough to rely on.
+    TWO STAGES, because only one of them is rigorous and it is important to say which.
 
-    alpha is FORCED rather than searched. The search legitimately picks alpha=0 when the
-    calibration activations are isotropic, and alpha=0 means s=1, which makes this check
-    pass trivially while testing nothing.
+    Stage 1, alpha = 0. The scale is exactly 1, so the fold is the identity: norms are
+    divided by 1, weight columns multiplied by 1, and a bf16 value that round-trips
+    through f32 comes back bit-identical. The output must therefore match the source
+    EXACTLY -- zero, not "small". This validates the whole rewrite path (tensor offsets,
+    alignment, dtype promotion of the norms, the gate rescale, run padding) with no
+    tolerance to argue about.
+
+    Stage 2, alpha > 0. Now s varies per channel and the fold is still exact in fp32 --
+    but the scaled weights are written back as bf16, because the container's narrow
+    tensors are bf16 and a layer of fp32 matmul weights would overflow the widen area.
+    So W*s is re-rounded, and that sets a NOISE FLOOR this check cannot see beneath.
+    Measured on the random fixture the floor is 7.4e-04 nats, while omitting the router
+    rescale entirely measured 1.9e-04. THE FLOOR IS LARGER THAN THE BUG. Stage 2 therefore
+    catches gross errors only, and its tolerance is deliberately loose.
+
+    THE REAL COMPLETENESS GATE IS THE COVERAGE AUDIT inside awq_trunk.py, which is
+    structural and does not depend on any of this: a narrow tensor whose input width
+    matches a rescaled activation must be declared a consumer or declared not to be one,
+    and being unmentioned is refused. That is what catches an omission whose numerical
+    signature is smaller than bf16 rounding -- g_proj, for one, at 2.9e-06.
 """
 from __future__ import annotations
 
@@ -47,7 +59,11 @@ REC = np.dtype([("target", "<i4"), ("top1", "<i4"),
 # 2^-9 relative. Accumulated over a deep stack that lands well below 1e-4 nats on the
 # fixtures measured; a missing consumer lands above it. The gap measured was 60x, so the
 # threshold does not need to be tight to separate them.
-TOL_NATS = 1e-4
+# Stage 2 only, and loose on purpose: see the note above. bf16 re-rounding of the scaled
+# weights measured 7.4e-04 nats on the random fixture, so anything tighter fails honest
+# runs, and anything at all only catches order-of-magnitude breakage. Stage 1 is the
+# check with no tolerance.
+TOL_NATS = 5e-3
 
 
 def run(cmd, log):
@@ -90,48 +106,59 @@ def main():
     base = ["--trunk-gb", a.trunk_gb, "--cache-gb", a.cache_gb, "--ppl-file", suite]
     cal = os.path.join(a.work, "calib.bin")
     d0 = os.path.join(a.work, "src.bin")
-    d1 = os.path.join(a.work, "fold.bin")
-    folded = os.path.join(a.work, "trunk-fold")
 
-    print(f"1/3 calibrating against {a.trunk}")
+    print(f"1/4 calibrating against {a.trunk}")
     run([k3, a.shards, "--trunk", a.trunk] + base + ["--calib-dump", cal,
         "--ppl-dump", d0, "--out", os.path.join(a.work, "src.json")],
         os.path.join(a.work, "src.log"))
-
-    print(f"2/3 folding at alpha={a.alpha}, no quantisation")
-    run([sys.executable, os.path.join(REPO, "tools", "awq_trunk.py"), a.trunk, folded,
-         "--calib", cal, "--fold-only", "--force-alpha", str(a.alpha)],
-        os.path.join(a.work, "fold.log"))
-
-    print("3/3 re-running against the folded trunk")
-    run([k3, a.shards, "--trunk", folded] + base + ["--ppl-dump", d1,
-        "--out", os.path.join(a.work, "fold.json")],
-        os.path.join(a.work, "fold.log2"))
-
     x = np.fromfile(d0, dtype=REC)
-    y = np.fromfile(d1, dtype=REC)
-    if len(x) != len(y):
-        print(f"FAIL: {len(x)} vs {len(y)} scored positions")
-        return 1
 
-    delta = np.abs(x["target_lp"].astype(np.float64) - y["target_lp"].astype(np.float64))
-    agree = float((x["top1"] == y["top1"]).mean())
-    ok = delta.max() < TOL_NATS
+    def fold_and_run(alpha, tag):
+        out = os.path.join(a.work, f"trunk-{tag}")
+        dump = os.path.join(a.work, f"{tag}.bin")
+        run([sys.executable, os.path.join(REPO, "tools", "awq_trunk.py"), a.trunk, out,
+             "--calib", cal, "--fold-only", "--force-alpha", str(alpha)],
+            os.path.join(a.work, f"{tag}.log"))
+        run([k3, a.shards, "--trunk", out] + base + ["--ppl-dump", dump,
+            "--out", os.path.join(a.work, f"{tag}.json")],
+            os.path.join(a.work, f"{tag}.run.log"))
+        y = np.fromfile(dump, dtype=REC)
+        if len(x) != len(y):
+            raise SystemExit(f"{len(x)} vs {len(y)} scored positions")
+        return (np.abs(x["target_lp"].astype(np.float64) - y["target_lp"].astype(np.float64)),
+                float((x["top1"] == y["top1"]).mean()))
+
+    print("2/4 stage 1: folding at alpha=0, which must be the identity")
+    d_id, _ = fold_and_run(0.0, "identity")
+    print(f"3/4 stage 2: folding at alpha={a.alpha}")
+    d_sc, agree_sc = fold_and_run(a.alpha, "scaled")
+    print("4/4 comparing")
+
+    exact_ok = d_id.max() == 0.0
+    loose_ok = d_sc.max() < TOL_NATS
 
     print()
-    print(f"  positions            {len(x)}")
-    print(f"  top-1 agreement      {100 * agree:.2f}%")
-    print(f"  max |delta logprob|  {delta.max():.3e} nats  (tolerance {TOL_NATS:.0e})")
-    print(f"  mean |delta|         {delta.mean():.3e} nats")
+    print(f"  positions                  {len(x)}")
+    print(f"  stage 1  alpha=0           max delta {d_id.max():.3e} nats  (must be exactly 0)")
+    print(f"  stage 2  alpha={a.alpha:<4}        max delta {d_sc.max():.3e} nats  "
+          f"(tolerance {TOL_NATS:.0e}), agreement {100 * agree_sc:.2f}%")
     print()
-    if ok:
-        print("FOLD VERIFIED: the scaled trunk reproduces the source to bf16 rounding,")
-        print("so every consumer of every rescaled activation is in awq_trunk's GROUPS.")
+    if exact_ok and loose_ok:
+        print("FOLD VERIFIED.")
+        print("  Stage 1 is exact: the rewrite path -- offsets, alignment, the norm")
+        print("  division, the gate rescale -- introduces nothing at all.")
+        print("  Stage 2 is within a loose bound. It does NOT prove the GROUPS table is")
+        print("  complete; bf16 re-rounding of the scaled weights is larger than a missing")
+        print("  consumer's signature. awq_trunk's coverage audit is what proves that.")
+    elif not exact_ok:
+        print("STAGE 1 FAILED, and it has no tolerance to blame.")
+        print("  At alpha=0 every scale is 1, so the rewrite must reproduce the source")
+        print("  byte for byte. Something in the rewrite itself is wrong: a tensor offset,")
+        print("  the run padding, a dtype conversion, or the norm/gate handling.")
     else:
-        print("FOLD BROKEN: the scaled trunk does NOT reproduce the source.")
-        print("Some tensor reads a rescaled activation without a matching column scale.")
-        print("Check GROUPS in tools/awq_trunk.py against the call sites in k3_ops.c.")
-    return 0 if ok else 1
+        print("STAGE 2 FAILED: the scaled fold is far enough out to be a real error,")
+        print("  not rounding. Check GROUPS in tools/awq_trunk.py against k3_ops.c.")
+    return 0 if (exact_ok and loose_ok) else 1
 
 
 if __name__ == "__main__":

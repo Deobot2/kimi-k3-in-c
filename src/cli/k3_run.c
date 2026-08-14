@@ -1448,13 +1448,34 @@ int main(int argc, char **argv)
         if (have > 0.0) {
             human(have, b1, sizeof b1);
             printf("  available        %s\n", b1);
-            if (need_b > have * 0.95) {
-                human(need_b - have, b2, sizeof b2);
+            /* A 5% headroom, because "available" is a snapshot and the run has to survive
+             * the whole token, not just the allocation. Say which of the two reasons is
+             * refusing, though: the message used to print need - have unconditionally,
+             * which is NEGATIVE for a plan that fits and only fails the margin, and
+             * "a shortfall of -788330496.00 B" tells the reader nothing they can act on. */
+            const double margin = have * 0.95;
+            if (need_b > margin) {
+                const double over = need_b - margin;
+                human(over, b2, sizeof b2);
+                if (need_b > have) {
+                    char b8[32]; human(need_b - have, b8, sizeof b8);
+                    fprintf(stderr,
+                            "\nREFUSING TO START: this needs %s and the machine has %s "
+                            "available, a shortfall of %s.\n", b6, b1, b8);
+                } else {
+                    fprintf(stderr,
+                            "\nREFUSING TO START: this needs %s and the machine has %s "
+                            "available.\nIt fits, but only just: the guard keeps 5%% "
+                            "headroom so a run does not get OOM-killed\npart way through, "
+                            "and this is %s over that line.\n", b6, b1, b2);
+                }
+                /* Give the number to change, not just the name of the knob. */
+                if (w_cache > over)
+                    fprintf(stderr, "Lower --cache-gb by at least %.2f GB (to about "
+                                    "%.2f GB) and it will start.\n",
+                            over / 1e9, (w_cache - over) / 1e9);
                 fprintf(stderr,
-                        "\nREFUSING TO START: this needs %s and the machine has %s "
-                        "available, a shortfall of %s.\n"
-                        "Options: a larger box, a smaller --cache-gb, or fewer --layers.\n",
-                        b6, b1, b2);
+                        "Options: a larger box, a smaller --cache-gb, or fewer --layers.\n");
                 return 1;
             }
         }

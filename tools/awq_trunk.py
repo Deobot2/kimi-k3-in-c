@@ -33,9 +33,10 @@ WHERE THE INVERSE SCALE GOES, WHICH IS THE WHOLE DESIGN QUESTION
         x = (h / rms(h)) * g        so    x / s = (h / rms(h)) * (g / s)
 
     Dividing the norm weight by s is therefore EXACTLY equivalent to dividing the input
-    by s, and it costs nothing at run time. The norm weights are fp32 in the trunk
-    (k3_bind.c reads them elementwise), so the division is exact rather than a second
-    quantisation. THE OUTPUT IS ORDINARY MXFP4. The engine reads it with the kernel it
+    by s, and it costs nothing at run time. The released checkpoint stores those norm
+    weights as BF16 and the binder widens them, so this tool writes the divided ones back
+    as F32 to keep the fold exact rather than re-rounding it -- about 16 MB across the
+    model. THE OUTPUT IS OTHERWISE ORDINARY MXFP4: the engine reads it with the kernel it
     already has, and this tool and mxfp4_trunk.py produce interchangeable containers.
 
     That constraint is also what fixes the grouping. Every tensor reading the same norm
@@ -54,11 +55,13 @@ WHAT IS NOT COVERED, STATED PLAINLY
     rows, which is only sound when that tensor is not itself quantised). Not done here.
     The per-group report below says exactly which tensors got a scale and which did not.
 
-THE ROUTER IS RESCALED TOO, AND EXACTLY
+THE ROUTER IS RESCALED TOO
     block_sparse_moe.gate reads the same post-attention norm output as down_proj and the
-    shared experts. It is fp32 and never quantised, but it still sees the rescaled input,
-    so its columns are multiplied by s. That is lossless in fp32 -- and omitting it would
-    change which experts get routed, which no weight-error metric would show.
+    shared experts. It is never quantised, but it still sees the rescaled input, so its
+    columns are multiplied by s. Omitting that would change which experts get routed, and
+    no weight-error metric would show it. Unlike the norms it keeps its source dtype: it
+    is 1.18 GB as bf16 across the model, and promoting it would add 4% to the output trunk
+    to remove a 0.2% rounding error on a matrix feeding a top-k over 896 experts.
 
 CHOOSING s
     s_j = mean|x_j| ** alpha, normalised to unit geometric mean so the fold does not
@@ -177,6 +180,18 @@ def audit_coverage(lay, stats_for_layer):
 # ------------------------------------------------------------------ formats
 def bf16_to_f32(u16):
     return (u16.astype(np.uint32) << 16).view(np.float32)
+
+
+def load_wide(raw, shape, dtype):
+    """A wide (elementwise) tensor, whatever dtype the container holds it in.
+
+    THE RELEASED CHECKPOINT STORES THESE AS BF16. k3_bind widens them to fp32 at bind
+    time, which is what "reads them elementwise as fp32" means -- it is a statement about
+    the kernel, not about the bytes. Both fixture generators in tools/ write them as F32,
+    so assuming F32 here worked on every fixture and crashed on the first real trunk."""
+    if dtype in ("BF16", "bf16"):
+        return bf16_to_f32(np.frombuffer(raw, dtype=np.uint16)).reshape(shape)
+    return np.frombuffer(raw, dtype="<f4").reshape(shape).copy()
 
 
 def f32_to_bf16(f32):
@@ -404,11 +419,17 @@ def main():
                     and nb == shape[0] * shape[1] * 2)
 
             if name in norm_div:
-                # fp32 norm weight, divided exactly. This is the other half of the
-                # identity and the run is wrong without it.
-                g = np.frombuffer(raw, dtype="<f4").reshape(shape)
+                # The other half of the identity; the run is wrong without it.
+                #
+                # WRITTEN AS F32 even when the source was BF16. g/s re-rounded to bf16
+                # carries ~0.2% relative error, and this tool's entire claim is that the
+                # fold is EXACT while the quantisation is the only approximation. Keeping
+                # that claim costs 4 bytes per hidden channel per norm -- about 16 MB
+                # across the model, against a 30 GB trunk. The binder widens whatever
+                # dtype it finds, so an F32 wide tensor needs no widening at all.
+                g = load_wide(raw, shape, dtype)
                 b = (g / norm_div[name].astype(np.float32)).astype(np.float32).tobytes()
-                tensors[name] = {"off": at, "nbytes": len(b), "dtype": dtype, "shape": shape}
+                tensors[name] = {"off": at, "nbytes": len(b), "dtype": "F32", "shape": shape}
                 n_pass += 1
             elif do_q:
                 W = bf16_to_f32(np.frombuffer(raw, dtype=np.uint16)).reshape(shape)
@@ -427,9 +448,16 @@ def main():
                                      "shape": shape}
                     n_quant += 1
             elif name in scale_of:
-                # An fp32 consumer of a rescaled activation: the router gate. Exact.
-                W = np.frombuffer(raw, dtype="<f4").reshape(shape)
-                b = (W * scale_of[name][None, :].astype(np.float32)).astype(np.float32).tobytes()
+                # A wide consumer of a rescaled activation: the router gate.
+                #
+                # This one keeps its SOURCE dtype. It is 1.18 GB across the model as bf16,
+                # so promoting it to F32 would add that much again to a ~30 GB trunk -- 4%,
+                # to remove a 0.2% rounding error on a matrix whose output is fed to a
+                # top-k over 896 experts. The norms above are 16 MB and get the exact
+                # treatment; this one does not earn it.
+                W = load_wide(raw, shape, dtype)
+                Wv = (W * scale_of[name][None, :].astype(np.float32)).astype(np.float32)
+                b = (f32_to_bf16(Wv) if dtype in ("BF16", "bf16") else Wv).tobytes()
                 tensors[name] = {"off": at, "nbytes": len(b), "dtype": dtype, "shape": shape}
                 n_pass += 1
             else:
