@@ -92,6 +92,17 @@ not needing the bytes at all.
 - Saved state records the KV layout and window geometry and refuses a mismatch: the two
   caches hold different tensors of the same float count, so restoring one as the other
   would be fluent and wrong. State version 1 → 2.
+- **`k3_kda_step` has an AVX2 path.** It was the largest un-vectorised kernel on the
+  non-I/O path (roadmap item 4): plain scalar C, 0.4% of FLOPs but, run serially per head,
+  a majority of non-matmul wall time at high core counts. Every loop in the recurrence
+  walks independent output lanes rather than reducing across them, so vectorising needed
+  no reduction-order change — mul then add, never `_mm256_fmadd_ps`, same as the rest of
+  this file's determinism contract, with the scalar tail loop reused verbatim for the
+  remainder. Checked bit-for-bit against the scalar path (not just fixture tolerance)
+  across a spread of shapes including the zero-gate skip branches; a microbenchmark at the
+  released model's head dimension (128×128) shows 1.78× on the kernel in isolation
+  (14.30 µs → 8.02 µs per call). Falls back to the scalar loop wherever `__AVX2__` is not
+  defined.
 
 ### Fixed
 
