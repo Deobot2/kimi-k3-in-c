@@ -66,10 +66,14 @@ than reducing across them, so the AVX2 path needed no reordering to stay bit-ide
 checked directly against the scalar path, not just fixture tolerance. 1.78× on the kernel
 in isolation at the released model's head dimension.
 
-`k3_matmul_tr`, added for the latent KV cache's query absorption, is what remains: it is a
-strided column sweep with a double accumulator per output and no vector path at all. It
-runs 96 times per MLA layer per token, so it is small next to the recurrence but it is
-new and it is scalar.
+`k3_matmul_tr`, added for the latent KV cache's query absorption, runs 96 times per MLA
+layer per token. **Its bf16 branch is now vectorised too** — four columns at a time,
+since within one row those are contiguous even though the stride between rows is not,
+each lane accumulating in double over rows in the same order the scalar loop uses. 3.53×
+on the kernel in isolation at representative dimensions. The MXFP4 branch (used only when
+`--mla-latent` meets a quantised trunk) and the int8 branch (draft-model only, no
+determinism contract) are still scalar; MXFP4's per-element nibble-and-group-scale decode
+makes it the harder case and it is the one piece of item 4 actually remaining.
 
 ## 5. Sampling
 

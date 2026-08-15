@@ -749,6 +749,43 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 {
     if (wdt == K3_WBF16) {
         const uint16_t *w16 = (const uint16_t *)W;
+        /* Four columns at a time: within one row, j and j+1..j+3 are adjacent in
+         * memory (the stride that hurts is between ROWS, not within one), so four
+         * lanes read contiguously and each lane keeps its own double accumulator
+         * summed over r in index order -- the same per-output reduction the scalar
+         * loop performs, just four of them side by side. MUL THEN ADD, never
+         * _mm256_fmadd_pd, so it stays bit-identical to the scalar path under
+         * -ffp-contract=off, the same rule k3_matmul_bf16 above follows for the same
+         * reason. The remainder in%4 falls through to the untouched scalar loop. */
+#if defined(__AVX2__)
+        const int in4 = in - (in % 4);
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static) if (in4 > 64)
+#endif
+        for (int j = 0; j < in4; j += 4) {
+            __m256d acc = _mm256_setzero_pd();
+            for (int r = 0; r < rows; r++) {
+                const __m128i h = _mm_loadl_epi64((const __m128i *)(w16 + (size_t)r * in + j));
+                const __m256d wv = _mm256_cvtps_pd(
+                    _mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h), 16)));
+                const __m256d xv = _mm256_set1_pd((double)x[r]);
+                acc = _mm256_add_pd(acc, _mm256_mul_pd(xv, wv));
+            }
+            double a[4];
+            _mm256_storeu_pd(a, acc);
+            y[j] = (float)a[0]; y[j + 1] = (float)a[1];
+            y[j + 2] = (float)a[2]; y[j + 3] = (float)a[3];
+        }
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static) if (in - in4 > 64)
+#endif
+        for (int j = in4; j < in; j++) {
+            double acc = 0.0;
+            for (int r = 0; r < rows; r++)
+                acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
+            y[j] = (float)acc;
+        }
+#else
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
@@ -758,6 +795,7 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
                 acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
             y[j] = (float)acc;
         }
+#endif
     } else if (wdt == K3_WMX4) {
         /* A quantised trunk. Column j of row r is the nibble at byte j/2 of that row,
          * scaled by the E8M0 exponent of the group j/32 -- so the transposed sweep needs

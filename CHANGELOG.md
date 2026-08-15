@@ -103,6 +103,16 @@ not needing the bytes at all.
   released model's head dimension (128×128) shows 1.78× on the kernel in isolation
   (14.30 µs → 8.02 µs per call). Falls back to the scalar loop wherever `__AVX2__` is not
   defined.
+- **`k3_matmul_tr`'s bf16 branch has an AVX2 path**, the other kernel roadmap item 4
+  named: the absorbed query projection on the `--mla-latent` path, 96 calls per MLA layer
+  per token. Four output columns at a time, because within one row those four are
+  adjacent in memory (the unfriendly stride is between rows, not within one) — each lane
+  keeps its own double accumulator summed over rows in index order, the same reduction
+  the scalar loop performs, just four side by side. Same mul-then-add discipline as
+  everywhere else in the file, checked bit-for-bit against the scalar path across a grid
+  of `in` x `rows` shapes including remainders on both axes. 3.53× on the kernel in
+  isolation at representative dimensions (512x192, one thread: 135.9 µs → 38.5 µs per
+  call). The MXFP4 and int8 branches are unchanged.
 
 ### Fixed
 
