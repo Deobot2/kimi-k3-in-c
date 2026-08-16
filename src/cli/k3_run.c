@@ -210,7 +210,9 @@ static K3PplDoc *ppl_load_suite(const char *path, int *ndoc, int *maxlen, int vo
         const size_t room = (size_t)(ln - (tab - line)) + 1;
         d[nd].name = strdup(line);
         d[nd].ids  = (int *)malloc(room * sizeof(int));
-        if (!d[nd].name || !d[nd].ids) { bad = 1; break; }
+        if (!d[nd].name || !d[nd].ids) {
+            free(d[nd].name); free(d[nd].ids); bad = 1; break;
+        }
         int n = 0;
         for (const char *p = tab + 1; *p; ) {
             char *end = NULL;
@@ -219,7 +221,7 @@ static K3PplDoc *ppl_load_suite(const char *path, int *ndoc, int *maxlen, int vo
             if (v < 0 || v >= vocab) {
                 fprintf(stderr, "k3: %s:%d (%s) has id %ld outside the vocabulary of %d\n",
                         path, lineno, d[nd].name, v, vocab);
-                bad = 1; break;
+                free(d[nd].name); free(d[nd].ids); bad = 1; break;
             }
             d[nd].ids[n++] = (int)v;
             p = end;
@@ -232,7 +234,7 @@ static K3PplDoc *ppl_load_suite(const char *path, int *ndoc, int *maxlen, int vo
         if (n < 2) {
             fprintf(stderr, "k3: %s:%d (%s) has %d id(s); a document needs at least 2\n",
                     path, lineno, d[nd].name, n);
-            bad = 1; break;
+            free(d[nd].name); free(d[nd].ids); bad = 1; break;
         }
         d[nd].n = n;
         if (n > longest) longest = n;
@@ -373,6 +375,14 @@ static int k3_state_peek(const char *path, K3StateHdr *hd)
                 path, hd->version, K3_STATE_VER);
         return -1;
     }
+    /* nseq becomes `prior` in the caller and feeds Tmax and every buffer size derived
+     * from it. A negative value here (a truncated or hand-edited file) would wrap to a
+     * huge size_t in those casts rather than fail the malloc it should fail, so it is
+     * rejected before anything is sized from it. */
+    if (hd->nseq < 0) {
+        fprintf(stderr, "%s: corrupt state file, nseq is %d\n", path, hd->nseq);
+        return -1;
+    }
     return 0;
 }
 
@@ -387,13 +397,22 @@ static int32_t k3_state_rows(const Weights *w)
 }
 
 static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
-                         int *seq, float *ks, Weights *w)
+                         int *seq, float *ks, Weights *w, int64_t kper)
 {
     int32_t fp[12];
     k3_state_fp(c, fp);
     if (memcmp(fp, hd->fp, sizeof fp) != 0) {
         fprintf(stderr, "REFUSING: %s was written by a different model architecture.\n"
                         "  Restoring it would produce fluent, wrong output.\n", path);
+        return -1;
+    }
+    /* kper is a stored raw field, not re-derived from fp on load, so a file whose fp
+     * matches but whose kper does not (hand-edited or corrupted) would otherwise fread
+     * more floats than `ks` -- sized by the CALLER's trusted kper -- actually holds. */
+    if (hd->kper != kper) {
+        fprintf(stderr, "REFUSING: %s holds %lld recurrent floats per layer, "
+                        "this run expects %lld\n",
+                path, (long long)hd->kper, (long long)kper);
         return -1;
     }
     if (hd->n_bound != w->n_bound || hd->n_mla != w->n_mla) {
@@ -1657,7 +1676,7 @@ int main(int argc, char **argv)
 
         if (load_state) {
             const double tl = now_s();
-            if (k3_state_load(load_state, &c, &shd, seq, ks, &w) != 0)
+            if (k3_state_load(load_state, &c, &shd, seq, ks, &w, (int64_t)kper) != 0)
                 return 1;
             w.cached = shd.cached;
             printf("restored %d positions in %.2f s: decode continues without "
