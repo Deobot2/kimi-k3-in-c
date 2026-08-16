@@ -122,6 +122,7 @@ def main():
     routed_params = 0
     routed_bytes = 0
     per_layer_expert_bytes = collections.Counter()
+    per_layer_expert_ids = collections.defaultdict(set)
     kda_layers, mla_layers = set(), set()
 
     for fp in files:
@@ -157,6 +158,9 @@ def main():
                 lm = re.search(r"layers\.(\d+)\.", name)
                 if lm:
                     per_layer_expert_bytes[int(lm.group(1))] += nb
+                    em = re.search(r"\.experts\.(\d+)\.", name)
+                    if em:
+                        per_layer_expert_ids[int(lm.group(1))].add(int(em.group(1)))
 
     print("%-42s %8s  %12s   %s" % ("CLASS", "TENSORS", "BYTES", "SHARE"))
     print("-" * 82)
@@ -186,34 +190,40 @@ def main():
     print("  bytes                 : %s" % human(routed_bytes))
     print("  bytes per parameter   : %.6f  (MXFP4 predicts %.6f)"
           % (routed_bytes / routed_params, MXFP4_BYTES_PER_PARAM))
+    # Experts per layer, counted from the distinct expert indices actually named in the
+    # shard headers rather than assumed, so a differently-sized model or a partial
+    # checkout (fewer experts present) still reports its own true count.
+    nexp = max((len(ids) for ids in per_layer_expert_ids.values()), default=0)
     nlayers_moe = len(per_layer_expert_bytes)
     if nlayers_moe:
         per = sorted(set(per_layer_expert_bytes.values()))
         print("  MoE layers            : %d" % nlayers_moe)
         print("  bytes per MoE layer   : %s%s"
               % (human(per[0]), "" if len(per) == 1 else "  (VARIES: %d distinct)" % len(per)))
-        nexp = 896
-        print("  bytes per expert      : %s  (%d experts per layer)"
-              % (human(per[0] / nexp), nexp))
+        if nexp:
+            print("  bytes per expert      : %s  (%d experts per layer)"
+                  % (human(per[0] / nexp), nexp))
 
     print("\nlayer map from the checkpoint itself:")
     print("  layers with A_log (KDA)      : %d" % len(kda_layers))
     print("  layers with kv_a/kv_b (MLA)  : %d" % len(mla_layers))
     both = kda_layers & mla_layers
     print("  layers claiming both         : %d%s" % (len(both), "  <-- WRONG" if both else ""))
+    n_layers = len(kda_layers | mla_layers)
     allmoe = sorted(per_layer_expert_bytes)
-    if allmoe:
-        missing = [i for i in range(93) if i not in per_layer_expert_bytes]
+    if allmoe and n_layers:
+        missing = [i for i in range(n_layers) if i not in per_layer_expert_bytes]
         print("  layers WITHOUT routed experts: %s (expect [0], the dense layer)" % missing)
 
-    print("\nwhat this means for hardware:")
-    for ram in (32, 48, 64, 96, 128, 192, 256):
-        fits = ram * 1e9 - resident
-        n = int(fits / (routed_bytes / (nlayers_moe * 896))) if fits > 0 else 0
-        pct = 100.0 * n * (routed_bytes / (nlayers_moe * 896)) / stream if n > 0 else 0.0
-        print("  %3d GB RAM -> %s for experts, about %6d of %d cached (%.1f%%)"
-              % (ram, human(fits) if fits > 0 else "  DOES NOT FIT",
-                 max(n, 0), nlayers_moe * 896, pct))
+    if nexp:
+        print("\nwhat this means for hardware:")
+        for ram in (32, 48, 64, 96, 128, 192, 256):
+            fits = ram * 1e9 - resident
+            n = int(fits / (routed_bytes / (nlayers_moe * nexp))) if fits > 0 else 0
+            pct = 100.0 * n * (routed_bytes / (nlayers_moe * nexp)) / stream if n > 0 else 0.0
+            print("  %3d GB RAM -> %s for experts, about %6d of %d cached (%.1f%%)"
+                  % (ram, human(fits) if fits > 0 else "  DOES NOT FIT",
+                     max(n, 0), nlayers_moe * nexp, pct))
     return 0
 
 
