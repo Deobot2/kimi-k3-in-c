@@ -387,10 +387,11 @@ static void t_router(const char *dir)
         const int hidden = nw / E, rows = ni / hidden;
         int   *gi = (int   *)malloc((size_t)K * sizeof(int));
         float *gw = (float *)malloc((size_t)K * sizeof(float));
+        float *rte = (float *)malloc((size_t)2 * E * sizeof(float));
         int set_ok = 1; double worst_w = 0.0;
 
         for (int rw = 0; rw < rows; rw++) {
-            k3_router(gi, gw, x + (size_t)rw * hidden, W, bias, hidden, E, K, 1, 1.0f);
+            k3_router(gi, gw, x + (size_t)rw * hidden, W, bias, hidden, E, K, 1, 1.0f, rte);
 
             /* compare index SETS */
             for (int a = 0; a < K; a++) {
@@ -419,7 +420,7 @@ static void t_router(const char *dir)
                    set_ok ? "ok" : "MISMATCH", worst_w);
             g_fail++;
         }
-        free(gi); free(gw);
+        free(gi); free(gw); free(rte);
     }
     free(W); free(bias); free(x); free(eidx); free(ewt); free(txt); free(ar);
 }

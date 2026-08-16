@@ -205,11 +205,12 @@ int main(int argc, char **argv)
 
     int *idx = (int *)malloc((size_t)c.topk * sizeof(int));
     float *wt = (float *)malloc((size_t)c.topk * sizeof(float));
+    float *rte = (float *)malloc((size_t)2 * c.n_experts * sizeof(float));
     fprintf(f, ",\"route_idx\":[");
     float *allw = (float *)malloc((size_t)T * c.topk * sizeof(float));
     for (int t = 0; t < T; t++) {
         k3_router(idx, wt, hn + (size_t)t * c.hidden, b.moe.gate, b.moe.bias,
-                  c.hidden, c.n_experts, c.topk, c.moe_renorm, c.routed_scale);
+                  c.hidden, c.n_experts, c.topk, c.moe_renorm, c.routed_scale, rte);
         for (int j = 0; j < c.topk; j++) {
             fprintf(f, "%s%d", (t || j) ? "," : "", idx[j]);
             allw[t * c.topk + j] = wt[j];

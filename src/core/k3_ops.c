@@ -771,14 +771,12 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 /* ---------------------------------------------------------------- router ---- */
 void k3_router(int *idx, float *w, const float *x, const float *W,
                const float *bias, int hidden, int n_experts, int topk,
-               int renorm, float routed_scale)
+               int renorm, float routed_scale, float *scratch)
 {
-    /* Returning early here would leave idx[] and w[] untouched, and k3_moe forms
-     * `w->w1 + idx[j]*I*L` from them one line later -- an arbitrary pointer built from
-     * uninitialised stack. */
-    float *score  = (float *)malloc((size_t)n_experts * sizeof(float));
-    float *choice = (float *)malloc((size_t)n_experts * sizeof(float));
-    if (!score || !choice) k3_fatal_oom("router scores", (size_t)n_experts * sizeof(float) * 2);
+    /* Caller-owned: this runs once per token per MoE layer, and a malloc/free pair
+     * here would be the only per-call heap traffic left on that path. */
+    float *score  = scratch;
+    float *choice = scratch + n_experts;
 
     /* logits in float32 with no bias, then an independent sigmoid per expert. The
      * reference upcasts both operands explicitly; a double accumulator here matches
@@ -826,8 +824,6 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
         for (int j = 0; j < topk; j++) w[j] *= inv;
     }
     for (int j = 0; j < topk; j++) w[j] *= routed_scale;
-
-    free(score); free(choice);
 }
 
 /* --------------------------------------------------------------- AttnRes ---- */
@@ -920,6 +916,7 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
     float *sgu  = edn  + L;             /* [2*SI] shared gate|up            */
     float *sact = sgu  + 2 * SI;        /* [SI]   shared after SiTU         */
     float *sdn  = sact + SI;            /* [E]    shared down-projection    */
+    float *rte  = sdn  + E;             /* [2*n_experts] router score|choice */
 
     /* Before the router has seen anything, tell the source we are here. It knows what
      * this layer wanted last time and can start those reads now, so they overlap the
@@ -935,7 +932,7 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
 
         /* 1. route on the FULL width, before the down-projection */
         k3_router(idx, wt, xt, w->gate, w->bias, E, c->n_experts, c->topk,
-                  c->moe_renorm, c->routed_scale);
+                  c->moe_renorm, c->routed_scale, rte);
 
         int nk = c->topk;
         /* Draft cache-only routing: keep only the top-k experts already resident, and
@@ -1024,7 +1021,8 @@ size_t k3_moe_scratch(const K3Cfg *c)
          + (size_t)3 * c->moe_inter       /* gu (2*I) + act (I) */
          + (size_t)c->latent              /* edn                */
          + (size_t)3 * SI                 /* sgu (2*SI) + sact  */
-         + (size_t)c->hidden;             /* sdn                */
+         + (size_t)c->hidden              /* sdn                */
+         + (size_t)2 * c->n_experts;      /* rte: router score|choice */
 }
 
 /* Batched MoE for PREFILL over a chunk of T tokens, streamed experts only.
@@ -1082,6 +1080,11 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
     const int E = c->hidden, Ll = c->latent, I = c->moe_inter;
     const int SI = I * c->n_shared, K = c->topk;
 
+    /* The tail of `scratch` (sized k3_moe_scratch(c), same as k3_moe's) is unused while
+     * routing runs below -- gu/act/edn only claim its head -- so the router's own
+     * scratch lives there rather than costing another allocation. */
+    float *rte = scratch + k3_moe_scratch(c) - 2 * (size_t)c->n_experts;
+
     /* Per-token routing decisions and latent inputs, plus a contribution buffer holding
      * every routed expert's latent output for every token: [T][K][Ll]. At T=32, K=16,
      * Ll=3584 that is ~7.3 MB, trivial beside the tens of GB already reserved. */
@@ -1105,7 +1108,7 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         int   *it = ridx + (size_t)t * K;
         float *wtt = rwt + (size_t)t * K;
         k3_router(it, wtt, xt, w->gate, w->bias, E, c->n_experts, K,
-                  c->moe_renorm, c->routed_scale);
+                  c->moe_renorm, c->routed_scale, rte);
         k3_mmw(zz + (size_t)t * Ll, xt, w->down, w->wdt, E, Ll);
         for (int j = 0; j < K; j++) {
             const int e = it[j];
