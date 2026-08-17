@@ -36,6 +36,10 @@ def f32_to_bf16(f32):
 
 
 def qdq(f32, bits, group):
+    """Returns (dequantized, used_group): used_group is the group size actually applied,
+    or 0 if this call fell back to per-row scaling because `group` did not divide `cols`
+    -- the caller uses this to warn when one --group value silently mixes granularities
+    across a trunk whose 2D tensors have varying widths (hidden, moe_inter, latent, ...)."""
     rows, cols = f32.shape
     qmax = (1 << (bits - 1)) - 1          # 127 for int8, 7 for int4
     if group and group > 0 and cols % group == 0:
@@ -43,11 +47,11 @@ def qdq(f32, bits, group):
         scale = np.abs(g).max(axis=2, keepdims=True) / qmax
         scale[scale == 0] = 1.0
         q = np.clip(np.rint(g / scale), -qmax, qmax)
-        return (q * scale).reshape(rows, cols).astype(np.float32)
+        return (q * scale).reshape(rows, cols).astype(np.float32), group
     scale = np.abs(f32).max(axis=1, keepdims=True) / qmax
     scale[scale == 0] = 1.0
     q = np.clip(np.rint(f32 / scale), -qmax, qmax)
-    return (q * scale).astype(np.float32)
+    return (q * scale).astype(np.float32), 0
 
 
 def main():
@@ -76,6 +80,7 @@ def main():
     dst = open(os.path.join(args.dst, "trunk.bin"), "r+b")
     done_t = 0
     done_b = 0
+    fallback_cols = set()   # column widths that didn't divide --group, if any
     for lay in man["layers"]:
         base = lay["file_off"]
         for _name, t in lay["tensors"].items():
@@ -92,7 +97,10 @@ def main():
             dst.seek(off)
             raw = np.frombuffer(dst.read(nb), dtype=np.uint16).copy()
             f32 = bf16_to_f32(raw).reshape(rows, cols)
-            out = f32_to_bf16(qdq(f32, args.bits, args.group).ravel())
+            deq, used_group = qdq(f32, args.bits, args.group)
+            if args.group and not used_group:
+                fallback_cols.add(cols)
+            out = f32_to_bf16(deq.ravel())
             dst.seek(off)
             dst.write(out.tobytes())
             done_t += 1
@@ -102,6 +110,11 @@ def main():
     dst.close()
     print("qdq complete: %d tensors, %.1f GB re-quantized at int%d group=%s"
           % (done_t, done_b / 1e9, args.bits, args.group or "row"))
+    if fallback_cols:
+        print("WARNING: --group %d does not divide column width(s) %s; those tensors "
+              "fell back to per-row scaling, so this trunk mixes quantization "
+              "granularities. Pick a --group that divides every 2D tensor's width if "
+              "you need one uniform scheme." % (args.group, sorted(fallback_cols)))
 
 
 if __name__ == "__main__":
