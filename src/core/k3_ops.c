@@ -1013,6 +1013,26 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
     }
 }
 
+/* moe_prefill_chunk (below) batches K3_MOE_PREFILL_CHUNK tokens through one pass and
+ * needs buffers no per-token call needs: per-(token,slot) routing decisions and a
+ * [T][K][latent] contribution matrix. Sizing them here, once, and taking them from the
+ * tail of the same caller-owned scratch every other MoE buffer already lives in avoids
+ * six malloc/free calls -- one of them multi-megabyte -- on every 64-token chunk of
+ * every prefill, the same reason gu/act/edn above are caller-owned rather than local.
+ * ridx/uniq are logically int arrays; they are carved from this float-sized region and
+ * accessed only through an int* over their own bytes, never re-read as float, so this
+ * does not alias the float fields around them. */
+#define K3_MOE_PREFILL_CHUNK 64
+static size_t moe_prefill_words(const K3Cfg *c)
+{
+    const int T = K3_MOE_PREFILL_CHUNK, K = c->topk;
+    return (size_t)2 * T * K            /* ridx, rwt   */
+         + (size_t)T * c->latent        /* zz          */
+         + (size_t)T * K * c->latent    /* contrib     */
+         + (size_t)T * K                /* uniq        */
+         + (size_t)c->n_experts;        /* seen        */
+}
+
 size_t k3_moe_scratch(const K3Cfg *c)
 {
     const int SI = c->moe_inter * c->n_shared;
@@ -1020,7 +1040,8 @@ size_t k3_moe_scratch(const K3Cfg *c)
          + (size_t)3 * c->moe_inter       /* gu (2*I) + act (I) */
          + (size_t)c->latent              /* edn                */
          + (size_t)3 * SI                 /* sgu (2*SI) + sact  */
-         + (size_t)c->hidden;             /* sdn                */
+         + (size_t)c->hidden              /* sdn                */
+         + moe_prefill_words(c);          /* moe_prefill_chunk's own scratch, see below */
 }
 
 /* Batched MoE for PREFILL over a chunk of T tokens, streamed experts only.
@@ -1062,7 +1083,7 @@ void k3_moe_prefill(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
      * how long the prompt is; a 32k prefill would otherwise want 7.3 GB of it. Most of
      * the dedup is already captured at this width: the unique-expert count grows far
      * slower than the request count under near-uniform routing. */
-    const int CHUNK = 64;
+    const int CHUNK = K3_MOE_PREFILL_CHUNK;
     for (int t0 = 0; t0 < T; t0 += CHUNK) {
         const int n = (T - t0) < CHUNK ? (T - t0) : CHUNK;
         if (n == 1) { k3_moe(out + (size_t)t0 * c->hidden, x + (size_t)t0 * c->hidden,
@@ -1080,18 +1101,19 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
 
     /* Per-token routing decisions and latent inputs, plus a contribution buffer holding
      * every routed expert's latent output for every token: [T][K][Ll]. At T=32, K=16,
-     * Ll=3584 that is ~7.3 MB, trivial beside the tens of GB already reserved. */
-    int   *ridx = (int *)  malloc((size_t)T * K * sizeof(int));
-    float *rwt  = (float *)malloc((size_t)T * K * sizeof(float));
-    float *zz   = (float *)malloc((size_t)T * Ll * sizeof(float));
-    float *contrib = (float *)malloc((size_t)T * K * Ll * sizeof(float));
-    if (!ridx || !rwt || !zz || !contrib)
-        k3_fatal_oom("MoE prefill batch", (size_t)T * K * Ll * sizeof(float));
-
-    /* 1. route every token and down-project it, and collect the batch's unique experts. */
-    int  *uniq = (int *)malloc((size_t)T * K * sizeof(int));
-    char *seen = (char *)calloc((size_t)c->n_experts, 1);
-    if (!uniq || !seen) k3_fatal_oom("MoE prefill index", (size_t)c->n_experts);
+     * Ll=3584 that is ~7.3 MB, trivial beside the tens of GB already reserved.
+     *
+     * Carved from the tail of `scratch` (k3_moe_scratch reserves moe_prefill_words(c),
+     * sized for the K3_MOE_PREFILL_CHUNK-token worst case; T here is at most that) rather
+     * than malloc'd fresh every chunk -- see the comment on moe_prefill_words. */
+    float *pf = scratch + k3_moe_scratch(c) - moe_prefill_words(c);
+    int   *ridx = (int *)pf;    pf += (size_t)K3_MOE_PREFILL_CHUNK * K;
+    float *rwt  = pf;           pf += (size_t)K3_MOE_PREFILL_CHUNK * K;
+    float *zz   = pf;           pf += (size_t)K3_MOE_PREFILL_CHUNK * Ll;
+    float *contrib = pf;        pf += (size_t)K3_MOE_PREFILL_CHUNK * K * Ll;
+    int   *uniq = (int *)pf;    pf += (size_t)K3_MOE_PREFILL_CHUNK * K;
+    int   *seen = (int *)pf;
+    for (int e = 0; e < c->n_experts; e++) seen[e] = 0;
     int nu = 0;
     /* Same hint as the per-token path: routing has not happened yet and the source may
      * have a guess worth starting now. */
@@ -1165,8 +1187,6 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
         for (int i = 0; i < E; i++) ot[i] += sdn[i];
     }
-
-    free(ridx); free(rwt); free(zz); free(contrib); free(uniq); free(seen);
 }
 
 /* --------------------------------------------------------- KDA full layer ---- */
