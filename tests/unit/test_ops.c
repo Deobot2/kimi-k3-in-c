@@ -346,6 +346,7 @@ static void t_recur(const char *dir, const char *file)
         float *S = (float *)calloc((size_t)H * dk * dv, sizeof(float));
         float *out = (float *)malloc((size_t)T * H * dv * sizeof(float));
         float *qs_ = (float *)malloc((size_t)dk * sizeof(float));
+        float *u = (float *)malloc((size_t)dv * sizeof(float));
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < H; h++) {
                 const size_t off = ((size_t)t * H + h) * dk;
@@ -354,14 +355,14 @@ static void t_recur(const char *dir, const char *file)
                             out + ((size_t)t * H + h) * dv,
                             qs_, k + off, v + off,
                             al + ((size_t)t * H + h) * dk,
-                            bt[(size_t)t * H + h], dk, dv);
+                            bt[(size_t)t * H + h], dk, dv, u);
             }
         }
         char nm[32]; snprintf(nm, sizeof(nm), "%s_out", file);
         report(nm, out, eo, no);
         snprintf(nm, sizeof(nm), "%s_state", file);
         report(nm, S, es, nso);
-        free(S); free(out); free(qs_);
+        free(S); free(out); free(qs_); free(u);
     }
     free(q); free(k); free(v); free(al); free(bt); free(eo); free(es);
     free(txt); free(ar);

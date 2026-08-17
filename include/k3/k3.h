@@ -205,9 +205,16 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
  *    2. read    u = S^T k
  *    3. write   S += k (beta*(v-u))^T
  *    4. output  o = S^T q          from the ALREADY UPDATED state
- * q must arrive pre-scaled by d_k^-0.5. */
+ * q must arrive pre-scaled by d_k^-0.5.
+ *
+ * u is caller-owned scratch, dv floats, overwritten on every call (its incoming
+ * contents are never read). This runs once per (head, timestep) from k3_kda_layer's
+ * per-head loop -- tens of millions of calls over a long prefill -- so a malloc/free
+ * pair here would be per-step heap traffic inside an OpenMP parallel region, exactly
+ * what every other kernel in this file avoids by taking its scratch from the caller. */
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
-                 const float *v, const float *alpha, float beta, int dk, int dv);
+                 const float *v, const float *alpha, float beta, int dk, int dv,
+                 float *u);
 
 /* y[out] = W[out][in] . x[in].  W is row-major, no bias anywhere in this model. */
 void k3_matmul(float *y, const float *x, const float *W, int in, int out);

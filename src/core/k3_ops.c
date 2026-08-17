@@ -280,7 +280,8 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 
 /* -------------------------------------------------------- KDA recurrence ---- */
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
-                 const float *v, const float *alpha, float beta, int dk, int dv)
+                 const float *v, const float *alpha, float beta, int dk, int dv,
+                 float *u)
 {
     /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
      *    channel, not a scalar, which is what "channel-wise forget gate" means. */
@@ -291,11 +292,7 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     }
 
     /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
-     * would leave the recurrent state permanently scaled but never updated -- silent,
-     * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -320,7 +317,6 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
 }
 
 /* ---------------------------------------------------------------- matmul ---- */
@@ -1192,7 +1188,7 @@ size_t k3_kda_scratch(const K3Cfg *c, int T)
          + 2 * (size_t)T * P        /* z then alpha                  */
          + (size_t)T * c->kda_heads /* beta                          */
          + (size_t)T * P            /* recurrence output             */
-         + 2 * P                    /* gate buffer and one work row  */
+         + 3 * P                    /* gate buffer, one work row, one u row per head */
          + (size_t)c->kda_head_dim; /* f_a output                    */
 }
 
@@ -1206,7 +1202,8 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
     float *v  = k + (size_t)T * P;       float *z  = v + (size_t)T * P;
     float *al = z + (size_t)T * P;       float *bt = al + (size_t)T * P;
     float *o  = bt + (size_t)T * H;      float *gb = o + (size_t)T * P;
-    float *wr = gb + P;                  float *fa = wr + P;
+    float *wr = gb + P;                  float *ub = wr + P;
+    float *fa = ub + P;
 
     /* 1. projections */
     for (int t = 0; t < T; t++) {
@@ -1264,11 +1261,12 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
 #endif
     for (int h = 0; h < H; h++) {
         float *wh = wr + (size_t)h * D;
+        float *uh = ub + (size_t)h * D;
         for (int t = 0; t < T; t++) {
             const size_t off = (size_t)t * P + (size_t)h * D;
             for (int i = 0; i < D; i++) wh[i] = q[off + i] * qscale;
             k3_kda_step(S + (size_t)h * D * D, o + off, wh, k + off, v + off,
-                        al + off, bt[(size_t)t * H + h], D, D);
+                        al + off, bt[(size_t)t * H + h], D, D, uh);
         }
     }
 

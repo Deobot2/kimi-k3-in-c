@@ -1570,7 +1570,8 @@ per channel and per token.
 
 ```c
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
-                 const float *v, const float *alpha, float beta, int dk, int dv)
+                 const float *v, const float *alpha, float beta, int dk, int dv,
+                 float *u)
 {
     /* 1. decay: scale ROW i of S by alpha[i], per key channel */
     for (int i = 0; i < dk; i++) {
@@ -1579,9 +1580,8 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         for (int j = 0; j < dv; j++) row[j] *= a;
     }
 
-    /* 2. read the state along k: u = S^T k */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    /* 2. read the state along k: u = S^T k (u is caller-owned scratch) */
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -1605,7 +1605,6 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
 }
 ```
 
@@ -1674,7 +1673,7 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
             const size_t off = (size_t)t * P + (size_t)h * D;
             for (int i = 0; i < D; i++) wr[i] = q[off + i] * qscale;
             k3_kda_step(S + (size_t)h * D * D, o + off, wr, k + off, v + off,
-                        al + off, bt[(size_t)t * H + h], D, D);
+                        al + off, bt[(size_t)t * H + h], D, D, u);
         }
 
     /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection */
