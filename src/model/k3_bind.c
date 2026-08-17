@@ -393,7 +393,8 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
             w += (size_t)take * 4;
             continue;
         }
-        /* A quantised trunk (tools/mxfp4_trunk.py, selected with --trunk-quant). Rows
+        /* A quantised trunk (tools/mxfp4_trunk.py, auto-detected from trunk.json's
+         * "quant" field when --trunk points at its output directory). Rows
          * carry their own E8M0 scales inline, so the matrix is one tagged pointer and
          * k3_matmul_mx4 consumes it directly -- the same arrangement K3_WI8 uses, and
          * for the same reason.

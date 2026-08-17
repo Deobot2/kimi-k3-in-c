@@ -417,7 +417,9 @@ void k3_attn_res(float *out, const float *src, const float *fold,
  * a fast, non-deterministic kernel. Each row is stored inline as [f32 scale][int8 * in],
  * so a matrix stays a single tagged pointer. Never tagged on the exact model. */
 /* K3_WMX4 is a whole-trunk MXFP4 weight matrix, produced by tools/mxfp4_trunk.py and
- * selected with --trunk-quant. Rows are stored as [packed nibbles][E8M0 scales], the
+ * selected by pointing --trunk at its output directory: k3_trunk_probe reads the
+ * "quant" field in that directory's trunk.json and the engine picks it up automatically,
+ * with no separate flag. Rows are stored as [packed nibbles][E8M0 scales], the
  * same OCP MX FP4 the routed experts already ship in, so it reuses their kernel.
  *
  * UNLIKE EVERY OTHER WEIGHT TYPE HERE, THIS ONE LOSES INFORMATION. bf16 -> fp32 is a
