@@ -187,6 +187,7 @@ static inline void k3_tok_load(Tok *T, const char *files_dir)
     char *cfg = tk_read_file(path, &ncfg);
     char *arena = NULL;
     jval *root = json_parse(cfg, &arena);
+    free(cfg);   /* json_parse copies every string into arena; cfg is not held past this */
     jval *adt  = json_get(root, "added_tokens_decoder");
     if (!adt) {
         fprintf(stderr, "k3_tok: tokenizer_config.json has no added_tokens_decoder\n");
