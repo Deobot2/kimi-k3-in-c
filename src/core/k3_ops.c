@@ -488,12 +488,6 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     #undef K3_ROPE_AT
 }
 
-void k3_mla(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
-            int T, float *scratch)
-{
-    k3_mla_cached(out, x, w, c, T, scratch, NULL, NULL, 0, 0);
-}
-
 /* --------------------------------------------------- MLA over a LATENT cache ---- */
 /* See the long note in k3.h for why the latent form is cheaper in bytes without being
  * more expensive in time, and for what absorption does to exactness. This is the

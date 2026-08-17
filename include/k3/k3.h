@@ -265,13 +265,13 @@ size_t k3_mla_scratch(const K3Cfg *c, int T);
 size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode);
 
 /* MLA with an optional KV cache. kvc is [cap][n_heads*(qk_nope+v_head)] and ropec is
- * [cap][qk_rope]; pass NULL for both to get the self-contained behaviour k3_mla has.
+ * [cap][qk_rope]; pass NULL for both to get self-contained, uncached behaviour (no
+ * production caller does this -- every decoder layer runs through a cache -- but it is
+ * how the unit tests exercise MLA against a fixture with no cache machinery involved).
  * See the definition for why the EXPANDED keys are cached rather than the latent. */
 void   k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                      int T, float *scratch,
                      float *kvc, float *ropec, int cached, int cap);
-void   k3_mla(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
-              int T, float *scratch);
 
 /* ---------------------------------------------------- the MLA KV cache, two ways ----
  * Context is the ONLY thing in this engine that grows without bound, and it grows in

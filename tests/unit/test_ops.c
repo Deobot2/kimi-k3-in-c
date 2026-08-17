@@ -468,7 +468,7 @@ static void t_mla(const char *dir)
         float *scratch = (float *)malloc(k3_mla_scratch(&c, T) * sizeof(float));
         float *y = (float *)malloc((size_t)T * c.hidden * sizeof(float));
         if (scratch && y) {
-            k3_mla(y, x, &w, &c, T, scratch);
+            k3_mla_cached(y, x, &w, &c, T, scratch, NULL, NULL, 0, 0);
             report("mla", y, eo, n_out);
             printf("        H=%d qh=%d (nope %d + rope %d) v=%d kv_lora=%d scale=%.6f\n",
                    c.n_heads, c.qk_nope + c.qk_rope, c.qk_nope, c.qk_rope,

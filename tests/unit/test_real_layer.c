@@ -148,7 +148,7 @@ int main(int argc, char **argv)
      * layer actually is. */
     const int is_mla = k3_is_mla(&c, L);
     t0 = now_s();
-    if (is_mla) k3_mla(att, xn, &b.mla, &c, T, scr);
+    if (is_mla) k3_mla_cached(att, xn, &b.mla, &c, T, scr, NULL, NULL, 0, 0);
     else        k3_kda_layer(att, xn, &b.kda, &c, T, state, scr);
     const double t_attn = now_s() - t0;
     dump_f32(f, "attn_out", att, (int64_t)T * c.hidden, 1);
