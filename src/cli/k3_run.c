@@ -44,6 +44,8 @@
 #define _DARWIN_C_SOURCE
 #endif
 
+#include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -885,6 +887,38 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     return 0;
 }
 
+/* atoi/atof read a leading numeric prefix and silently return 0 for anything else, so a
+ * typo like `--layers abc` used to set want_layers = 0 rather than being rejected -- and
+ * 0 is not even the flag's "unset" sentinel (-1), so it went on to silently mean "no
+ * layers requested" instead of failing loudly. These parse the WHOLE argument and refuse
+ * trailing garbage, matching the rest of this file's policy of refusing bad input rather
+ * than guessing at it. */
+static int parse_int_arg(const char *flag, const char *s, int *out)
+{
+    errno = 0;
+    char *end;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || errno == ERANGE || v < INT_MIN || v > INT_MAX) {
+        fprintf(stderr, "%s: expected an integer, got '%s'\n\n", flag, s);
+        return 0;
+    }
+    *out = (int)v;
+    return 1;
+}
+
+static int parse_double_arg(const char *flag, const char *s, double *out)
+{
+    errno = 0;
+    char *end;
+    double v = strtod(s, &end);
+    if (end == s || *end != '\0' || errno == ERANGE) {
+        fprintf(stderr, "%s: expected a number, got '%s'\n\n", flag, s);
+        return 0;
+    }
+    *out = v;
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     /* Informational flags are answered before anything else, because they must work
@@ -930,12 +964,21 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--prompt-file") && i + 1 < argc) prompt_file = argv[++i];
         else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
-        else if (!strcmp(argv[i], "--gen") && i + 1 < argc) { gen = atoi(argv[++i]); gen_set = 1; }
-        else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--layers") && i + 1 < argc) want_layers = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--gen") && i + 1 < argc) {
+            if (!parse_int_arg("--gen", argv[++i], &gen)) return 2;
+            gen_set = 1;
+        }
+        else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) {
+            if (!parse_double_arg("--cache-gb", argv[++i], &cache_gb)) return 2;
+        }
+        else if (!strcmp(argv[i], "--layers") && i + 1 < argc) {
+            if (!parse_int_arg("--layers", argv[++i], &want_layers)) return 2;
+        }
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
         else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
-        else if (!strcmp(argv[i], "--spec") && i + 1 < argc) spec_n = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--spec") && i + 1 < argc) {
+            if (!parse_int_arg("--spec", argv[++i], &spec_n)) return 2;
+        }
         else if (!strcmp(argv[i], "--tf-check")) tf_check = 1;
         else if (!strcmp(argv[i], "--ppl")) want_ppl = 1;
         else if (!strcmp(argv[i], "--ppl-file") && i + 1 < argc) { ppl_file = argv[++i]; want_ppl = 1; }
@@ -944,17 +987,28 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--load-state") && i + 1 < argc) load_state = argv[++i];
         else if (!strcmp(argv[i], "--save-state") && i + 1 < argc) save_state = argv[++i];
         else if (!strcmp(argv[i], "--draft-trunk") && i + 1 < argc) draft_dir = argv[++i];
-        else if (!strcmp(argv[i], "--draft-trunk-gb") && i + 1 < argc) draft_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--draft-trunk-gb") && i + 1 < argc) {
+            if (!parse_double_arg("--draft-trunk-gb", argv[++i], &draft_gb)) return 2;
+        }
         else if (!strcmp(argv[i], "--trunk-gb") && i + 1 < argc) {
             const char *v = argv[++i];
             if (!strcmp(v, "auto")) budget_auto = 1;
-            else { trunk_gb = atof(v); budget_auto = 0; }
+            else {
+                if (!parse_double_arg("--trunk-gb", v, &trunk_gb)) return 2;
+                budget_auto = 0;
+            }
         }
-        else if (!strcmp(argv[i], "--trunk-ring") && i + 1 < argc) trunk_ring = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--trunk-ring") && i + 1 < argc) {
+            if (!parse_int_arg("--trunk-ring", argv[++i], &trunk_ring)) return 2;
+        }
         else if (!strcmp(argv[i], "--incremental")) incremental = 1;
         else if (!strcmp(argv[i], "--mla-latent")) mla_latent = 1;
-        else if (!strcmp(argv[i], "--kv-window") && i + 1 < argc) kv_window = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--kv-sinks") && i + 1 < argc) kv_sinks = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--kv-window") && i + 1 < argc) {
+            if (!parse_int_arg("--kv-window", argv[++i], &kv_window)) return 2;
+        }
+        else if (!strcmp(argv[i], "--kv-sinks") && i + 1 < argc) {
+            if (!parse_int_arg("--kv-sinks", argv[++i], &kv_sinks)) return 2;
+        }
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) logits_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-cache-trace") && i + 1 < argc) trace_dir = argv[++i];
         else if (!strcmp(argv[i], "--preset") && i + 1 < argc && !strcmp(argv[i + 1], "auto")) {
@@ -1001,6 +1055,14 @@ int main(int argc, char **argv)
             /* Refuse rather than pick: silently preferring one source would make a
              * mistyped invocation run the WRONG prompt for tens of minutes. */
             fprintf(stderr, "--ids, --prompt and --prompt-file are mutually exclusive\n");
+            return 2;
+        }
+        /* Unlike --gen/--kv-window/--kv-sinks below, these three used to sail through
+         * with no range check at all: a negative budget would be multiplied by 1e9,
+         * cast to int64_t and handed straight to k3_trunk_open/k3_cache_init as a
+         * negative byte count. */
+        if (cache_gb < 0.0 || trunk_gb < 0.0 || draft_gb < 0.0) {
+            fprintf(stderr, "--cache-gb, --trunk-gb and --draft-trunk-gb must not be negative\n");
             return 2;
         }
     }
