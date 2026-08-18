@@ -288,6 +288,11 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
                 else for (;;) {
                     int64_t d;
                     if (!i64_(&sc, &d)) goto bad;
+                    if (d < 0) {
+                        fprintf(stderr, "k3_st: %s: %s has a negative shape dimension\n",
+                                path, name);
+                        goto bad;
+                    }
                     if (t.ndim < 4) t.shape[t.ndim] = d;
                     else { fprintf(stderr, "k3_st: %s has rank > 4\n", name); goto bad; }
                     t.ndim++;
@@ -302,6 +307,11 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
                 if (!lit(&sc, ',')) goto bad;
                 if (!i64_(&sc, &o1)) goto bad;
                 if (!lit(&sc, ']')) goto bad;
+                if (o0 < 0 || o1 < o0) {
+                    fprintf(stderr, "k3_st: %s: %s has invalid data_offsets [%lld,%lld]\n",
+                            path, name, (long long)o0, (long long)o1);
+                    goto bad;
+                }
                 have_off = 1;
             } else {
                 if (!skip_value(&sc)) goto bad;
