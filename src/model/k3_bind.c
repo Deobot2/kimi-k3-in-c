@@ -308,7 +308,17 @@ size_t k3_bind_widen_bytes(const K3Cfg *c)
 {
     /* Only the BF16 vectors that kernels read elementwise are copied. Everything else
      * is pointed at in place. The router gate dominates: it is BF16 on disk but stays
-     * fp32 in the engine because k3_router walks it with its own inline matmul. */
+     * fp32 in the engine because k3_router walks it with its own inline matmul.
+     *
+     * NOT COUNTED HERE, and this is load-bearing rather than an oversight: KDA's conv
+     * weights, dt_bias, o_norm and A_log, and gate.e_score_correction_bias. Those ship
+     * F32 on disk on the released checkpoint (confirmed against
+     * tools/make_random_checkpoint.py's wb()/w() split, which mirrors it), so they need
+     * no widening and cost nothing here. If a future checkpoint variant or repacker ever
+     * stored one of them as BF16, this function would silently under-count and the
+     * caller's widen area would be too small -- k3_bind_layer_mem's own bounds check
+     * (below) still catches that at runtime and refuses rather than overrunning, but the
+     * error it prints has no way to name THIS assumption as the reason. */
     const size_t H = (size_t)c->hidden;
     size_t n = 6 * H                       /* in/post norm, attn-res and mlp-res pair  */
              + (size_t)c->q_lora + c->kv_lora   /* MLA q_a/kv_a layernorms             */
