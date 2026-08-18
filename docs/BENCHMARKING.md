@@ -22,8 +22,8 @@ that had already been written down and reasoned about.
 ```bash
 # 3 runs per arm, minimum.
 for r in 1 2 3; do
-  ./bin/k3 $MODEL --trunk $TRUNK --preset server --ids 1008,10484,318,15383,387 \
-           --gen 8 --incremental --out /tmp/arm_a_$r.json | grep 's/token average'
+  ./bin/k3 "$MODEL" --trunk "$TRUNK" --preset server --ids 1008,10484,318,15383,387 \
+           --gen 8 --incremental --out "/tmp/arm_a_$r.json" | grep 's/token average'
 done
 ```
 
