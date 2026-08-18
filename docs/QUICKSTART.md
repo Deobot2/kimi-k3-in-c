@@ -32,8 +32,11 @@ safetensors reader, the config reader, the tokenizer, and the end-to-end oracle 
 
 ## 4. Get the weights
 
+The repository is public, so no token is needed. A token is optional, for a higher rate
+limit:
+
 ```bash
-export HF_TOKEN=...            # a HuggingFace token with access to the model
+export HF_TOKEN=...            # optional
 ./scripts/download-model.sh ~/k3model
 ```
 

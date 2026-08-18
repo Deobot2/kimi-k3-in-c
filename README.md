@@ -300,11 +300,13 @@ repository.
 
 ### Step 4. fetch the checkpoint
 
-**1.56 TB, so hours rather than minutes.** Get a token from
-[huggingface.co/settings/tokens](https://huggingface.co/settings/tokens):
+**1.56 TB, so hours rather than minutes.** The repository is public, so no token is
+needed. A token is optional, for a higher rate limit; get one from
+[huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) if you want it,
+and the `hf` CLI picks it up from `$HF_TOKEN` or `~/.cache/huggingface/token` on its own:
 
 ```bash
-export HF_TOKEN=hf_your_token_here          # read from the environment, never echoed
+export HF_TOKEN=hf_your_token_here          # optional; read from the environment, never echoed
 ./scripts/download-model.sh ~/k3model       # resumable, re-run to continue
 ```
 
