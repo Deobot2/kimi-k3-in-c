@@ -129,6 +129,38 @@ not needing the bytes at all.
   went over what the walk owed. The aggregate byte total could say a run went over and
   never which layers; two explanations for the 13.7% were argued from the pinned set's
   shape before this existed, and both were wrong.
+- `k3_st`'s safetensors header parser accepted negative `shape` dimensions and negative
+  `data_offsets`, which could pass the existing nbytes-vs-shape consistency check (two
+  negatives cancel) and produce a tensor whose reads are silently skipped rather than
+  refused. Both are now rejected outright, with a regression test (`test_st reject`)
+  pinning it.
+- `k3_trunk_open` leaked the open fd, the parsed trunk.json arena, and any
+  already-allocated pinned/ring buffers on most of its error-return paths; every one now
+  routes through `k3_trunk_close`, which was already safe to call on partially-built
+  state. Confirmed leak-free under ASan+LeakSanitizer.
+- `k3_cache_init` could destroy a never-initialised mutex/cond on its OOM path (undefined
+  behaviour per POSIX, though harmless on glibc). `k3_cache_pin` bounds-checked only the
+  combined `(layer, expert)` key, so an out-of-range expert paired with an in-range layer
+  could wrap into a key that decodes to a *different* slot and silently pin the wrong one.
+- `k3_cfg_load_file` leaked the raw config file buffer on every successful load (only the
+  parse-failure path freed it).
+- `k3` CLI: numeric flags (`--gen`, `--cache-gb`, `--layers`, `--trunk-gb`, ...) parsed
+  their argument with bare `atoi`/`atof`, which silently return 0 on garbage input —
+  `--layers abc` ran every layer instead of failing. A negative `--cache-gb`/`--trunk-gb`/
+  `--draft-trunk-gb` also went unchecked, reaching `k3_trunk_open`/`k3_cache_init` as a
+  negative byte budget. Both now fail loudly, and a known flag with a missing value now
+  reports that instead of "unknown option".
+- `tools/tok.py` resolved its repo root one directory too high (an extra `dirname()`), so
+  its "in-repo" and "sibling" candidate paths for the released tokenizer files pointed
+  outside the repository entirely — a checkout with `kimi_k3_hf/files` in the documented
+  location was never found by the default search.
+- `benchmarks/eval/run_eval.py --tok DIR` set `K3_HF_DIR` when launching `tools/tok.py`,
+  but `tok.py` only reads `K3_TOK_FILES`; the override was silently ignored and the
+  tokenizer subprocess fell back to its own default search instead of the requested
+  directory.
+- `tools/budget.py` crashed with `ZeroDivisionError` on a checkout with no routed-expert
+  shards present (e.g. only the dense layer-0 shard), contradicting its own claim that
+  "a partial checkout still gives an exact answer for the shards that are present."
 
 ## [1.0.0] - 2026-08-07
 
