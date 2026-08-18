@@ -429,6 +429,43 @@ static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
                         "  Raise --gen or shorten the prompt.\n", path, hd->cached, w->kv_cap);
         return -1;
     }
+    /* hd->kper/kvpp/ropepp size every read below (`ks`, and the expanded-mode KV/rope
+     * caches), and none of them were otherwise checked against what this run's own
+     * config implies -- only kv_row_floats, in the latent branch, was. A corrupted or
+     * hand-edited header could claim a wider row than `ks`/w->kvc/w->ropec were actually
+     * allocated for and drive an over-long fread straight past the end of the
+     * destination buffer, well before the fingerprint mismatch (which covers the
+     * architecture, not these derived sizes) would ever catch it. Recompute the same
+     * values k3_state_save derived and refuse rather than trust the file's copy. */
+    {
+        const int P = c->kda_heads * c->kda_head_dim;
+        const int64_t want_kper = (int64_t)P * c->kda_head_dim
+                                 + (int64_t)3 * P * (c->conv_k - 1);
+        if (hd->kper != want_kper) {
+            fprintf(stderr, "REFUSING: %s holds %lld KDA floats per layer, this "
+                            "config implies %lld\n",
+                    path, (long long)hd->kper, (long long)want_kper);
+            return -1;
+        }
+        if (w->kv_mode != K3_KV_LATENT) {
+            const int64_t want_kvpp   = (int64_t)c->n_heads * (c->qk_nope + c->v_head);
+            const int64_t want_ropepp = (int64_t)c->qk_rope;
+            if (hd->kvpp != want_kvpp || hd->ropepp != want_ropepp) {
+                fprintf(stderr, "REFUSING: %s holds %lld kv / %lld rope floats per "
+                                "position, this config implies %lld / %lld\n",
+                        path, (long long)hd->kvpp, (long long)hd->ropepp,
+                        (long long)want_kvpp, (long long)want_ropepp);
+                return -1;
+            }
+            /* The latent branch already refuses hd->kv_rows > w->kv_slots; the expanded
+             * layout has the same shape of hazard and had no equivalent check at all. */
+            if (hd->kv_rows > w->kv_cap) {
+                fprintf(stderr, "REFUSING: %s holds %d KV rows, this run's cache is %d\n",
+                        path, hd->kv_rows, w->kv_cap);
+                return -1;
+            }
+        }
+    }
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return -1; }
     if (fseek(f, (long)sizeof *hd, SEEK_SET) != 0) { fclose(f); return -1; }
@@ -1632,7 +1669,25 @@ int main(int argc, char **argv)
             return 2;
         }
         if (k3_state_peek(load_state, &shd) != 0) return 1;
+        /* shd.nseq comes straight from the file and is about to become a pointer offset
+         * (`seq + prior` below) and a term in every buffer size for the rest of this
+         * run. A corrupted or hand-edited state file with a negative nseq would write
+         * before the start of `seq`'s allocation; an implausibly large one would
+         * overflow the Tmax/seq size arithmetic. Refuse rather than trust it, the same
+         * way --gen and the prompt length are bounded a few lines up. */
+        if (shd.nseq < 0 || shd.nseq > K3_MAX_PROMPT + K3_MAX_GEN) {
+            fprintf(stderr, "REFUSING: %s claims %d prior positions, which is outside "
+                            "[0, %d]. The file is corrupt or was not written by this "
+                            "build.\n", load_state, shd.nseq, K3_MAX_PROMPT + K3_MAX_GEN);
+            return 1;
+        }
         prior = shd.nseq;
+        if (prior + np + gen + 1 > K3_MAX_PROMPT + K3_MAX_GEN) {
+            fprintf(stderr, "REFUSING: %d prior + %d new + %d gen + 1 exceeds the %d-"
+                            "position ceiling\n",
+                    prior, np, gen, K3_MAX_PROMPT + K3_MAX_GEN);
+            return 2;
+        }
         printf("resuming from %s: %d prior positions, %d new\n\n", load_state, prior, np);
     }
     const int Tmax = prior + np + gen + 1;
