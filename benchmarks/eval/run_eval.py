@@ -103,7 +103,7 @@ def tokenize(tok_dir: str, text: str) -> list[int]:
     the released tiktoken.model. Shelling out keeps one implementation rather than two."""
     r = subprocess.run([sys.executable, os.path.join(REPO, "tools", "tok.py"), "encode", text],
                        capture_output=True, text=True,
-                       env={**os.environ, "K3_HF_DIR": tok_dir})
+                       env={**os.environ, "K3_TOK_FILES": tok_dir})
     if r.returncode != 0:
         raise SystemExit(f"tok.py failed: {r.stderr.strip()}")
     return [int(x) for x in r.stdout.strip().split(",") if x.strip()]
