@@ -277,9 +277,7 @@ def main():
     h = rms(h, sh.get(PRE + "norm.weight"), eps)
 
     last = h.view(T, H)[-1].numpy().astype(np.float32)
-    lm_name = "lm_head.weight" if sh.has("lm_head.weight") else PRE + "lm_head.weight"
-    if not sh.has(lm_name):
-        lm_name = "language_model.lm_head.weight"
+    lm_name = "lm_head.weight" if sh.has("lm_head.weight") else "language_model.lm_head.weight"
     p, dt, shape, off, _nb = sh.index[lm_name]
     V = shape[0]
     logits = np.empty(V, dtype=np.float32)
