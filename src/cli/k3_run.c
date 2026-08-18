@@ -1037,7 +1037,28 @@ int main(int argc, char **argv)
             return 0;
         }
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
-        else { fprintf(stderr, "unknown option %s\n\n", argv[i]); usage(stderr); return 2; }
+        else {
+            /* Every branch above that takes a value is guarded by `i + 1 < argc`, so a
+             * known flag with its value missing (a trailing `--gen` with nothing after
+             * it) falls all the way down here too, and would otherwise be reported as
+             * "unknown option" -- true of the token, but not the actual mistake. Keep
+             * this list matching the value-taking flags above. */
+            static const char *value_flags[] = {
+                "--ids", "--prompt", "--prompt-file", "--tok", "--config", "--gen",
+                "--cache-gb", "--layers", "--out", "--trunk", "--spec", "--ppl-file",
+                "--ppl-dump", "--calib-dump", "--load-state", "--save-state",
+                "--draft-trunk", "--draft-trunk-gb", "--trunk-gb", "--trunk-ring",
+                "--kv-window", "--kv-sinks", "--dump-logits", "--dump-cache-trace",
+                "--preset", NULL
+            };
+            int known = 0;
+            for (int k = 0; value_flags[k]; k++)
+                if (!strcmp(argv[i], value_flags[k])) { known = 1; break; }
+            if (known) fprintf(stderr, "%s: missing argument\n\n", argv[i]);
+            else       fprintf(stderr, "unknown option %s\n\n", argv[i]);
+            usage(stderr);
+            return 2;
+        }
     }
     {
         int nsrc = (ids_s != NULL) + (prompt_text != NULL) + (prompt_file != NULL);
