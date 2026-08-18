@@ -589,6 +589,14 @@ static int cache_get(K3ExpertSrc *self, int layer, int expert, K3ExpertQ *out)
 int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_bytes)
 {
     memset(c, 0, sizeof *c);
+    /* Initialised up front, before any allocation that can fail, so k3_cache_free is
+     * safe to call from every error path below -- including the OOM path a few hundred
+     * lines down, which used to run before these existed and destroyed a mutex/cond
+     * that had only ever been zeroed by the memset above. Harmless on glibc's
+     * zero-valued default objects, but destroying a never-initialised pthread_mutex_t
+     * is undefined behaviour per POSIX. */
+    pthread_mutex_init(&c->mu, NULL);
+    pthread_cond_init(&c->cv, NULL);
     c->src.get = cache_get;
     c->src.resident = cache_resident;
     /* K3_NOPREFETCH=1 disables the batch path at runtime. An A/B between two BUILDS
@@ -744,9 +752,6 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
         if (c->s_target < 1) c->s_target = 1;
         c->working_set = (int32_t)(ws > INT32_MAX ? INT32_MAX : ws);
     }
-
-    pthread_mutex_init(&c->mu, NULL);
-    pthread_cond_init(&c->cv, NULL);
 
     /* Speculation needs room for the guessed set AND the set the router actually picks,
      * on top of what the current layer is using. Below that it would evict what this
