@@ -228,8 +228,13 @@ $(BIN)/test_real_layer: tests/unit/test_real_layer.c $(ENGINE_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 ## tok: tokenizer parity against the reference implementation
+# TOK_FILES is this Makefile's variable; tools/tok.py (imported by tok_parity.py) reads
+# the environment variable K3_TOK_FILES, a different name. `make tok TOK_FILES=DIR`
+# looked like it worked -- DIR was a real directory, the command didn't error -- but the
+# value never reached tok.py, which silently fell back to its own default search
+# instead. Export it under the name tok.py actually reads.
 tok: $(BIN)/test_tok
-	@$(PYTHON) tools/tok_parity.py ./$(BIN)/test_tok
+	@K3_TOK_FILES=$(TOK_FILES) $(PYTHON) tools/tok_parity.py ./$(BIN)/test_tok
 
 ## cfg: config reader against both supported config layouts
 cfg: $(BIN)/test_cfg
