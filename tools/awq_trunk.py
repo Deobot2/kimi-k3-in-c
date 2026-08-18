@@ -85,6 +85,8 @@ import sys
 
 import numpy as np
 
+from _bf16 import bf16_to_f32, f32_to_bf16
+
 GROUP = 32
 E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                  -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=np.float32)
@@ -178,10 +180,6 @@ def audit_coverage(lay, stats_for_layer):
 
 
 # ------------------------------------------------------------------ formats
-def bf16_to_f32(u16):
-    return (u16.astype(np.uint32) << 16).view(np.float32)
-
-
 def load_wide(raw, shape, dtype):
     """A wide (elementwise) tensor, whatever dtype the container holds it in.
 
@@ -192,11 +190,6 @@ def load_wide(raw, shape, dtype):
     if dtype in ("BF16", "bf16"):
         return bf16_to_f32(np.frombuffer(raw, dtype=np.uint16)).reshape(shape)
     return np.frombuffer(raw, dtype="<f4").reshape(shape).copy()
-
-
-def f32_to_bf16(f32):
-    u = np.ascontiguousarray(f32, dtype=np.float32).view(np.uint32)
-    return (((u + 0x7FFF + ((u >> 16) & 1)) >> 16)).astype(np.uint16)
 
 
 def quantize_mx4(f32):

@@ -59,6 +59,8 @@ import sys
 
 import numpy as np
 
+from _bf16 import bf16_to_f32
+
 GROUP = 32
 # The sixteen E2M1 values, indexed by nibble; bit 3 is the sign. Must match K3_E2M1 in
 # src/core/k3_ops.c exactly -- this table and that one are the same specification.
@@ -69,10 +71,6 @@ MAG = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
 
 # Read elementwise as fp32 by k3_router, despite being a large 2D bf16 matrix.
 DENY_SUFFIX = (".block_sparse_moe.gate.weight",)
-
-
-def bf16_to_f32(u16):
-    return (u16.astype(np.uint32) << 16).view(np.float32)
 
 
 def quantize_mx4(f32):

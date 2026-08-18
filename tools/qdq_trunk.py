@@ -23,16 +23,7 @@ import sys
 
 import numpy as np
 
-
-def bf16_to_f32(u16):
-    return (u16.astype(np.uint32) << 16).view(np.float32)
-
-
-def f32_to_bf16(f32):
-    u = f32.view(np.uint32)
-    # round-to-nearest-even on the dropped mantissa bits, matching torch's cast
-    rounding = ((u >> 16) & 1) + 0x7FFF
-    return ((u + rounding) >> 16).astype(np.uint16)
+from _bf16 import bf16_to_f32, f32_to_bf16
 
 
 def qdq(f32, bits, group):

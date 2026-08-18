@@ -22,12 +22,10 @@ import sys
 
 import numpy as np
 
+from _bf16 import bf16_to_f32
+
 ALIGN = 4096
 CHUNK = 64 << 20
-
-
-def bf16_to_f32(u16):
-    return (u16.astype(np.uint32) << 16).view(np.float32)
 
 
 def quant_row_int8(f32_2d):
