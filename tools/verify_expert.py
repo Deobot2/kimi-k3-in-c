@@ -59,43 +59,60 @@ def main():
 
     fails = []
 
+    # A short fixture is a fixture/dump mismatch, not a match: slicing the fixture to
+    # cp.size below would silently compare against fewer elements than the dump has, or
+    # raise an unhelpful shape-mismatch ValueError from numpy instead of this tool's own
+    # diagnostic if the fixture is shorter still. Check first, on all three arrays.
+    def size_ok(name, have, want):
+        if have < want:
+            fails.append("%s: fixture has %d elements, dump has %d -- fixture/dump "
+                         "mismatch, not a byte difference" % (name, have, want))
+            return False
+        return True
+
     # ---- 1. raw packed bytes: did the reader find the right place in the file? -------
     cp = np.array(d["packed"], dtype=np.uint8)
-    fp = np.array(fx["packed"]["data"], dtype=np.uint8)[: cp.size]
-    nbad = int((cp != fp).sum())
-    if nbad:
-        i = int(np.argmax(cp != fp))
-        fails.append("packed bytes: %d/%d differ, first at [%d] C=%d fixture=%d"
-                     % (nbad, cp.size, i, cp[i], fp[i]))
-    else:
-        print("\n  packed bytes : %d/%d IDENTICAL  -> k3_st found the right offset"
-              % (cp.size, cp.size))
+    fp_full = np.array(fx["packed"]["data"], dtype=np.uint8)
+    if size_ok("packed", fp_full.size, cp.size):
+        fp = fp_full[: cp.size]
+        nbad = int((cp != fp).sum())
+        if nbad:
+            i = int(np.argmax(cp != fp))
+            fails.append("packed bytes: %d/%d differ, first at [%d] C=%d fixture=%d"
+                         % (nbad, cp.size, i, cp[i], fp[i]))
+        else:
+            print("\n  packed bytes : %d/%d IDENTICAL  -> k3_st found the right offset"
+                  % (cp.size, cp.size))
 
     # ---- 2. scale bytes -------------------------------------------------------------
     cs = np.array(d["scales"], dtype=np.uint8)
-    fs = np.array(fx["scales"]["data"], dtype=np.uint8)[: cs.size]
-    nbad = int((cs != fs).sum())
-    if nbad:
-        i = int(np.argmax(cs != fs))
-        fails.append("scale bytes: %d/%d differ, first at [%d] C=%d fixture=%d"
-                     % (nbad, cs.size, i, cs[i], fs[i]))
-    else:
-        print("  scale bytes  : %d/%d IDENTICAL  -> the scale tensor offset is right"
-              % (cs.size, cs.size))
+    fs_full = np.array(fx["scales"]["data"], dtype=np.uint8)
+    if size_ok("scales", fs_full.size, cs.size):
+        fs = fs_full[: cs.size]
+        nbad = int((cs != fs).sum())
+        if nbad:
+            i = int(np.argmax(cs != fs))
+            fails.append("scale bytes: %d/%d differ, first at [%d] C=%d fixture=%d"
+                         % (nbad, cs.size, i, cs[i], fs[i]))
+        else:
+            print("  scale bytes  : %d/%d IDENTICAL  -> the scale tensor offset is right"
+                  % (cs.size, cs.size))
 
     # ---- 3. dequantised floats, compared as bit patterns ----------------------------
     cb = np.array(d["bits"], dtype=np.uint32)
-    ref = np.array(fx["expected"]["data"], dtype=np.float32)[: cb.size]
-    rb = ref.view(np.uint32)
-    nbad = int((cb != rb).sum())
-    if nbad:
-        i = int(np.argmax(cb != rb))
-        cf = cb[i : i + 1].view(np.float32)[0]
-        fails.append("float bits: %d/%d differ, first at [%d] C=%.9g (0x%08x) "
-                     "fixture=%.9g (0x%08x)" % (nbad, cb.size, i, cf, cb[i], ref[i], rb[i]))
-    else:
-        print("  float bits   : %d/%d IDENTICAL  -> dequantisation is exact end to end"
-              % (cb.size, cb.size))
+    ref_full = np.array(fx["expected"]["data"], dtype=np.float32)
+    if size_ok("expected", ref_full.size, cb.size):
+        ref = ref_full[: cb.size]
+        rb = ref.view(np.uint32)
+        nbad = int((cb != rb).sum())
+        if nbad:
+            i = int(np.argmax(cb != rb))
+            cf = cb[i : i + 1].view(np.float32)[0]
+            fails.append("float bits: %d/%d differ, first at [%d] C=%.9g (0x%08x) "
+                         "fixture=%.9g (0x%08x)" % (nbad, cb.size, i, cf, cb[i], ref[i], rb[i]))
+        else:
+            print("  float bits   : %d/%d IDENTICAL  -> dequantisation is exact end to end"
+                  % (cb.size, cb.size))
 
     # ---- the nibble-order trap, checked rather than assumed -------------------------
     swapped = np.array(fx["expected_swapped_nibbles"]["first64"], dtype=np.float32)
