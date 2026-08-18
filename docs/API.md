@@ -187,7 +187,11 @@ if (k3_expert_drops) {
 ## Thread safety
 
 The kernels are reentrant and parallelise internally with OpenMP. They hold no global
-state except `k3_expert_drops`.
+state except `k3_expert_drops` and the activation-calibration sink (`k3_calib_begin` /
+`k3_calib_observe` / ...; see the note in `include/k3/k3.h`). The calibration sink is
+off unless `k3_calib_begin` has been called and is a file-scope accumulator, not
+per-instance state, so it is another reason two inference loops must not run at once
+from the same process.
 
 The safetensors index is **not** thread-safe. One inference at a time per instance.
 
