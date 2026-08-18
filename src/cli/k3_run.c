@@ -2273,12 +2273,18 @@ int main(int argc, char **argv)
         }
     }
 
-    if (dw.trunk && hyb_rounds > 0) {
-        printf("\nhybrid decode: %ld rounds, %ld drafted, %ld accepted (%.1f%%), "
-               "mean accepted run %.2f\n",
-               hyb_rounds, hyb_drafted, hyb_accepted,
-               hyb_drafted ? 100.0 * hyb_accepted / hyb_drafted : 0.0,
-               (double)hyb_accepted / hyb_rounds);
+    if (dw.trunk) {
+        /* Cleanup is unconditional on dw.trunk alone: with --draft-trunk and a short
+         * enough --gen, the incremental loop's drafting branch (where hyb_rounds is
+         * incremented) may never run at all, and these resources were still allocated
+         * when the draft trunk was opened. Gating cleanup on hyb_rounds too, as before,
+         * skipped it entirely in that case. */
+        if (hyb_rounds > 0)
+            printf("\nhybrid decode: %ld rounds, %ld drafted, %ld accepted (%.1f%%), "
+                   "mean accepted run %.2f\n",
+                   hyb_rounds, hyb_drafted, hyb_accepted,
+                   hyb_drafted ? 100.0 * hyb_accepted / hyb_drafted : 0.0,
+                   (double)hyb_accepted / hyb_rounds);
         k3_trunk_close(&trunk_d);
         free(dw.lay); free(dks); free(dsnap); free(dw.kvc); free(dw.ropec); free(dw.latc);
     }
