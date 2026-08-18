@@ -271,6 +271,16 @@ awq-check: $(BIN)/k3
 	python3 tools/pack_trunk.py $(BUILD)/awqck $(BUILD)/awqtrunk 13
 	python3 tools/verify_awq_fold.py $(BUILD)/awqck $(BUILD)/awqtrunk --work $(BUILD)/awqwork
 
+# A --load-state file is untrusted input (a bad shutdown, a hand edit, a copy from an
+# incompatible build) and k3_state_load must refuse a malformed one rather than let its
+# header fields drive pointer/buffer-size arithmetic. Needs numpy and a checkpoint of
+# random weights, so not part of `make test`; run after touching k3_state_load,
+# k3_state_save or K3StateHdr. See tools/verify_state_reject.py.
+.PHONY: state-check
+state-check: $(BIN)/k3
+	python3 tools/make_random_checkpoint.py $(BUILD)/stateck --layers 4 --hidden 64
+	python3 tools/verify_state_reject.py $(BIN)/k3 $(BUILD)/stateck
+
 asan:
 	$(MAKE) CFLAGS="-O1 -g -std=gnu99 $(WARN) -fsanitize=address,undefined -fno-omit-frame-pointer" \
 	        LDFLAGS="-lm -fsanitize=address,undefined" ARCH= all
