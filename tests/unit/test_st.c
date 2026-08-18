@@ -9,6 +9,12 @@
  *          <dir>          directory of .safetensors shards
  *          index.json     where to write the full index (default st_index.json)
  *          tensor_name    zero or more tensors to read and dump values for
+ *
+ *        test_st reject <dir>
+ *          <dir>          directory holding exactly one malformed shard; the open
+ *                          MUST fail rather than index a tensor with a bogus byte
+ *                          range. tools/make_st_fixture.py writes these under
+ *                          tests/fixtures/st/reject/.
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -61,6 +67,20 @@ static void put_json_str(FILE *f, const char *s)
 int main(int argc, char **argv)
 {
     if (argc < 2) { fprintf(stderr, "usage: test_st <dir> [index.json] [tensor ...]\n"); return 2; }
+
+    if (!strcmp(argv[1], "reject")) {
+        if (argc < 3) { fprintf(stderr, "usage: test_st reject <dir>\n"); return 2; }
+        K3St s;
+        int ok = (k3_st_open(&s, argv[2]) == 0);
+        if (ok) {
+            printf("  FAIL  expected rejection, but %s opened\n", argv[2]);
+            k3_st_close(&s);
+            return 1;
+        }
+        printf("  ok    correctly rejected %s\n", argv[2]);
+        return 0;
+    }
+
     const char *dir = argv[1];
     const char *out = argc > 2 ? argv[2] : "st_index.json";
 

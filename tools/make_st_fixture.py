@@ -56,6 +56,18 @@ def write_shard(path: str, tensors: dict, metadata: dict | None = None) -> dict:
     return header
 
 
+def write_raw_shard(path: str, header: dict, payload: bytes = b"") -> None:
+    """Write a header VERBATIM, with no derivation from real data. write_shard() always
+    computes data_offsets/shape from an actual array, so it cannot produce the malformed
+    headers scan_shard() (src/io/k3_st.c) must refuse -- a negative data_offsets pair, or
+    a negative shape dimension. This writes exactly the bytes asked for instead."""
+    hj = json.dumps(header).encode("utf-8")
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(hj)))
+        f.write(hj)
+        f.write(payload)
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     rng = np.random.default_rng(7)
@@ -122,6 +134,26 @@ def main():
         if k == "__metadata__":
             continue
         print("  %-72s %-5s %s" % (k, v["dtype"], v["shape"]))
+
+    # ---- reject fixtures: one malformed shard per directory, k3_st_open must refuse
+    # each rather than index a tensor with a bogus byte range. Each lives in its own
+    # subdirectory so scanning it cannot also pull in the well-formed shards above. ----
+    reject = os.path.join(OUT, "reject")
+
+    negative_offsets = os.path.join(reject, "negative_offsets")
+    os.makedirs(negative_offsets, exist_ok=True)
+    write_raw_shard(
+        os.path.join(negative_offsets, "model-00001-of-00001.safetensors"),
+        {"bad.tensor": {"dtype": "F32", "shape": [4], "data_offsets": [-16, 0]}})
+
+    negative_shape = os.path.join(reject, "negative_shape")
+    os.makedirs(negative_shape, exist_ok=True)
+    write_raw_shard(
+        os.path.join(negative_shape, "model-00001-of-00001.safetensors"),
+        {"bad.tensor": {"dtype": "F32", "shape": [-4], "data_offsets": [0, 16]}},
+        payload=b"\x00" * 16)
+
+    print("wrote 2 reject fixtures under %s" % reject)
 
 
 if __name__ == "__main__":
