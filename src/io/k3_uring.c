@@ -249,6 +249,12 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
             const int res = cqe->res;
             chead++;
             posted--;
+            /* Should be unreachable: every SQE this call posts carries an idx in
+             * [0, nchunk), and the drain below guarantees this call never returns
+             * while a completion for one of its own SQEs is still outstanding. Kept
+             * as a guard anyway, because the alternative to skipping a bad idx here
+             * is ck[idx] as an out-of-bounds write. */
+            if (idx < 0 || idx >= nchunk) continue;
             if (res < 0) {
                 if (res == -EINTR || res == -EAGAIN) { again[nagain++] = idx; continue; }
                 failed = 1;
@@ -260,6 +266,57 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
             if (ck[idx].done < ck[idx].len) again[nagain++] = idx;
         }
         __atomic_store_n(u->cq_head, chead, __ATOMIC_RELEASE);
+    }
+
+    /* On any failure above, this must not return while `posted` requests are still
+     * owned by the kernel. Two things go wrong if it does:
+     *
+     *   - load_run_to (k3_trunk.c) treats -1 as EXPECTED -- "io_uring refused this
+     *     transfer, fall through to pread" -- and preads into the SAME destination
+     *     buffer that an outstanding kernel read may still be DMAing into: a ring
+     *     slot ends up a mix of two reads, with no diagnostic.
+     *   - the next k3_uring_read on this same ring reaps whatever CQEs arrive next
+     *     by indexing THIS call's ck[] via cqe->user_data -- an array freed a few
+     *     lines down and, on the next call, reallocated at a possibly different
+     *     size. A stale completion for an in-flight request this call abandoned is
+     *     then an out-of-bounds ck[idx] write in a call that has nothing to do with
+     *     it, and posted-- in that call can go negative.
+     *
+     * So drain: keep re-entering (recomputing to_submit from the ring, exactly as
+     * the main loop does, since some of `posted` may still be sitting unconsumed in
+     * the SQ array rather than already accepted by the kernel) until every request
+     * this call posted has completed. A few consecutive attempts that make no
+     * progress at all mean the ring itself is no longer answering -- at that point
+     * there is no correct value to return: the kernel may still hold a write into
+     * `buf` that nothing can now wait for, and letting the caller reuse it would be
+     * exactly the silent corruption this drain exists to prevent. */
+    if (failed && posted > 0) {
+        int stall = 0;
+        while (posted > 0 && stall < 8) {
+            unsigned tail = __atomic_load_n(u->sq_tail, __ATOMIC_RELAXED);
+            unsigned head = __atomic_load_n(u->sq_head, __ATOMIC_ACQUIRE);
+            const unsigned to_submit = tail - head;
+            int r;
+            do {
+                r = sys_io_uring_enter(u->fd, to_submit, 1u, IORING_ENTER_GETEVENTS);
+            } while (r < 0 && errno == EINTR);
+            if (r < 0) { stall++; continue; }
+
+            unsigned chead = __atomic_load_n(u->cq_head, __ATOMIC_RELAXED);
+            const unsigned ctail = __atomic_load_n(u->cq_tail, __ATOMIC_ACQUIRE);
+            if (chead == ctail) { stall++; continue; }
+            stall = 0;
+            while (chead != ctail) { chead++; posted--; }
+            __atomic_store_n(u->cq_head, chead, __ATOMIC_RELEASE);
+        }
+        if (posted > 0) {
+            fprintf(stderr,
+                    "k3_uring: %d request(s) still owned by the kernel after a failed "
+                    "read and the ring stopped answering; cannot safely release the "
+                    "destination buffer, refusing to continue\n", posted);
+            free(ck); free(again);
+            abort();
+        }
     }
 
     free(ck); free(again);
