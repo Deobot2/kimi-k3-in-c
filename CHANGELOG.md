@@ -129,6 +129,58 @@ not needing the bytes at all.
   went over what the walk owed. The aggregate byte total could say a run went over and
   never which layers; two explanations for the 13.7% were argued from the pinned set's
   shape before this existed, and both were wrong.
+- **`--load-state` trusted its own file's header more than its contract required.**
+  `k3_state_peek` checked magic and version and nothing else; `nseq` then sized a
+  `malloc` and a `memcpy` offset in the caller before `k3_state_load` ever ran, and
+  `kper`/`kvpp`/`ropepp` sized `fread` element counts with no cross-check against the
+  fingerprinted config — a state file is exactly the kind of input that gets copied,
+  shared, or truncated. `k3_state_peek` now refuses a negative or oversized `nseq` and
+  any negative sizing field; `k3_state_load` recomputes `kper`/`kvpp`/`ropepp` from the
+  current config and refuses a mismatch, and bounds `kv_rows` against `kv_cap` on the
+  expanded path (only the latent path checked it before). Three hand-corrupted files
+  (a forged `kper`, a negative `nseq`, an `nseq` of 2e9) are now refused with a specific
+  message instead of reading past the intended buffers.
+- `k3_uring_read` could return failure while requests it had posted were still owned by
+  the kernel. `load_run_to` treats `-1` as expected and falls through to `pread` **into
+  the same destination buffer**, and the next call on the same ring reaps whatever CQEs
+  arrive next by indexing the failed call's (already freed) chunk array — an
+  out-of-bounds write in a call that has nothing to do with the abandoned request. Now
+  drains every outstanding request before returning on failure, and aborts with a
+  message rather than returning if the ring stops answering entirely.
+- `k3_bind_layer_mem`'s mixed-format refusal (`!narrowed_all && !i8_seen && !mx4_seen`)
+  let a mis-typed tensor through whenever some OTHER tensor in the same layer happened
+  to be I8R or MX4: an F32 "narrow" tensor plus any MX4 weight passed both checks, the
+  layer got tagged MXFP4 from its other tensors, and the F32 matrix was then read by the
+  kernel as packed nibbles. `narrowed_all == 0` is already unconditional evidence of an
+  undescribable tensor regardless of the rest of the layer; the extra terms are gone.
+- `moe_prefill_chunk`'s per-token contribution buffer was `malloc`ed, not `calloc`ed. An
+  `EXPERT DROP` left that expert's rows unwritten, and the aggregation step summed them
+  anyway — computing from uninitialised memory, which can produce NaN/Inf that corrupts
+  every later layer, on a path whose intent (matching `k3_moe`'s per-token drop
+  handling) was to contribute nothing.
+- A handful of unchecked allocations that are dereferenced or written through
+  immediately after: the trunk ring's `layer_of` table, the shard scan's
+  `realloc`/`malloc` in `k3_st_open` (also fixes a classic `p = realloc(p, ...)` leak
+  on failure), and `slurp()`'s use of `ftell()` without checking for `-1` (a heap
+  overflow on a non-seekable path fed to `--trunk-cfg`).
+- `--gen 0` divided by zero computing seconds-per-token, printing `nan` to stdout and
+  writing a bare `nan` into the `--out` JSON (not valid JSON). Guarded.
+- `ppl_load_suite` leaked a document's `name`/`ids` on every `--ppl-file` parse error
+  after the first (a bad token id, a too-short document), since they were assigned
+  before the count that the cleanup loop walks was incremented.
+- `k3_mla_cached` guarded `kvc == NULL` but not `ropec == NULL` alone; the two caches
+  are allocated and sized together, and one without the other would silently alias an
+  unallocated scratch region and index it by absolute position. No caller does this
+  today; now refused defensively rather than left to accident.
+- `k3_bind_widen_bytes` hand-duplicated `plan_layer`'s list of elementwise-fp32
+  tensors and omitted five (KDA's conv weights, `A_log`, `dt_bias`, `o_norm`, and the
+  MoE router's bias). Harmless only because those happen to be F32 in the released
+  checkpoint; a future checkpoint shipping any of them as BF16 would have undersized
+  the widen buffer and failed loudly mid-load. Now sums every term from both branches.
+- `k3_cache_init` initialised its mutex/cond only after a block of allocations that can
+  fail into `k3_cache_free`, which unconditionally destroys them — destroying a
+  never-initialised pthread mutex/cond is undefined behaviour. Moved the inits earlier.
+  Also removed an `if (0) { ... }` dead branch left over from an earlier rewrite.
 
 ## [1.0.0] - 2026-08-07
 
