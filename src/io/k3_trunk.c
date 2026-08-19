@@ -102,7 +102,9 @@ static char *slurp(const char *p, size_t *n)
 {
     FILE *f = fopen(p, "rb");
     if (!f) return NULL;
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long sz = ftell(f);
+    if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
     char *b = (char *)malloc((size_t)sz + 1);
     if (!b) { fclose(f); return NULL; }
     if (fread(b, 1, (size_t)sz, f) != (size_t)sz) { free(b); fclose(f); return NULL; }
@@ -408,6 +410,10 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
         return -1;
     }
     tr->layer_of = (int *)malloc((size_t)RING * sizeof(int));
+    if (!tr->layer_of) {
+        fprintf(stderr, "k3_trunk: cannot allocate the %d-slot layer_of table\n", RING);
+        return -1;
+    }
     for (int i = 0; i < RING; i++) tr->layer_of[i] = -1;
     tr->widen_bytes = (int64_t)widen;
 
