@@ -589,6 +589,12 @@ static int cache_get(K3ExpertSrc *self, int layer, int expert, K3ExpertQ *out)
 int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_bytes)
 {
     memset(c, 0, sizeof *c);
+    /* Initialised up front, before any allocation that can fail into k3_cache_free:
+     * that teardown unconditionally destroys c->mu/c->cv, and destroying a pthread
+     * mutex/cond that was never init'd is undefined behaviour (harmless on glibc,
+     * where a zeroed mutex reads as PTHREAD_MUTEX_INITIALIZER, but not portable). */
+    pthread_mutex_init(&c->mu, NULL);
+    pthread_cond_init(&c->cv, NULL);
     c->src.get = cache_get;
     c->src.resident = cache_resident;
     /* K3_NOPREFETCH=1 disables the batch path at runtime. An A/B between two BUILDS
@@ -665,11 +671,6 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
         if (huge) madvise(c->arena, want, MADV_HUGEPAGE);
 #endif
     }
-    if (0) {
-        fprintf(stderr, "k3_cache: cannot allocate %.2f GB arena\n",
-                (double)c->nslot * c->slot_bytes / 1e9);
-        return -1;
-    }
 
     const size_t nkey = (size_t)c->n_layers * c->n_experts;
     c->slot_of = (int32_t *)malloc(nkey * sizeof(int32_t));
@@ -744,9 +745,6 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
         if (c->s_target < 1) c->s_target = 1;
         c->working_set = (int32_t)(ws > INT32_MAX ? INT32_MAX : ws);
     }
-
-    pthread_mutex_init(&c->mu, NULL);
-    pthread_cond_init(&c->cv, NULL);
 
     /* Speculation needs room for the guessed set AND the set the router actually picks,
      * on top of what the current layer is using. Below that it would evict what this
