@@ -409,7 +409,13 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     const int kvw = c->kv_lora + qr;              /* 576: latent + shared rope slot */
     const int kvd = qn + vh;                      /* 256: cached width per head    */
     const float scale = 1.0f / sqrtf((float)qh);  /* :359, over qh not qn           */
-    if (!kvc) cached = 0;
+    /* The two caches are allocated and sized together (k3_mla_scratch_cached(..., 1)
+     * reserves no [T][H][kvd]/[T][qr] scratch fallback when caching is on) and must be
+     * supplied together. kvc without ropec would alias rps onto kvs -- unallocated in
+     * cached mode -- and then index it by ABSOLUTE position via K3_ROPE_AT, not the
+     * relative t the scratch fallback assumes: a silent out-of-bounds write past the
+     * first token. No caller does this today; refuse rather than leave it to accident. */
+    if (!kvc || !ropec) { kvc = NULL; ropec = NULL; cached = 0; }
     const int last = cached + T - 1;              /* highest absolute position      */
     if (kvc && last >= cap)
         k3_fatal_bound("MLA KV cache position", (long)last, (long)cap - 1);
