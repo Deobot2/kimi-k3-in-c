@@ -1088,7 +1088,12 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
     int   *ridx = (int *)  malloc((size_t)T * K * sizeof(int));
     float *rwt  = (float *)malloc((size_t)T * K * sizeof(float));
     float *zz   = (float *)malloc((size_t)T * Ll * sizeof(float));
-    float *contrib = (float *)malloc((size_t)T * K * Ll * sizeof(float));
+    /* calloc, not malloc: step 2 below writes a (t, j) row only when its expert loads
+     * successfully. On an EXPERT DROP it `continue`s and leaves that row unwritten, and
+     * step 3 sums every row unconditionally -- k3_moe's per-token equivalent (above)
+     * skips the accumulation for a dropped expert entirely, i.e. contributes zero, so
+     * this must start at zero rather than fold whatever malloc happened to return. */
+    float *contrib = (float *)calloc((size_t)T * K * Ll, sizeof(float));
     if (!ridx || !rwt || !zz || !contrib)
         k3_fatal_oom("MoE prefill batch", (size_t)T * K * Ll * sizeof(float));
 
