@@ -377,6 +377,29 @@ static int k3_state_peek(const char *path, K3StateHdr *hd)
                 path, hd->version, K3_STATE_VER);
         return -1;
     }
+    /* Every numeric field below eventually sizes an allocation, a memcpy destination
+     * offset, or a fread element count -- k3_run's caller trusts hd->nseq enough to
+     * `malloc((prior + np + gen + 8) * sizeof(int))` and then `memcpy(seq + prior, ...)`
+     * before k3_state_load is ever called. A negative or absurdly large field here
+     * (a truncated file, a bit flip, a hand-edited one) must be refused NOW, before it
+     * reaches arithmetic that can overflow into a too-small allocation or index before
+     * the start of one -- not left to the bounds checks deeper in k3_state_load, which
+     * run after the caller has already sized buffers from the same unchecked value. */
+    if (hd->nseq < 0 || hd->nseq > K3_MAX_PROMPT + K3_MAX_GEN) {
+        fprintf(stderr, "%s: %d prior positions is outside 0..%d\n",
+                path, hd->nseq, K3_MAX_PROMPT + K3_MAX_GEN);
+        return -1;
+    }
+    if (hd->n_bound < 0 || hd->n_mla < 0 || hd->cached < 0 || hd->kper < 0 ||
+        hd->kvpp < 0 || hd->ropepp < 0 || hd->kv_rows < 0 || hd->kv_row_floats < 0) {
+        fprintf(stderr, "%s: a negative field in the header, refusing\n", path);
+        return -1;
+    }
+    if (hd->cached > hd->nseq) {
+        fprintf(stderr, "%s: %d cached positions exceeds %d saved ids\n",
+                path, hd->cached, hd->nseq);
+        return -1;
+    }
     return 0;
 }
 
@@ -430,6 +453,41 @@ static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
         fprintf(stderr, "REFUSING: %s holds %d positions, this run's KV cache is %d.\n"
                         "  Raise --gen or shorten the prompt.\n", path, hd->cached, w->kv_cap);
         return -1;
+    }
+    /* hd->kper, hd->kvpp and hd->ropepp each size a fread element count and a memcpy
+     * destination stride below, and none of them is otherwise implied by the fp[]
+     * fingerprint or the checks above: fp covers the config fields these are DERIVED
+     * from, but nothing forces the derived field stored in the file to actually equal
+     * that derivation. A file whose fp matches but whose kper/kvpp/ropepp were altered
+     * (truncation, a flipped bit, a hand-edited header) would otherwise pass every check
+     * above and then fread more floats than ks/kvc/ropec were allocated for -- a heap
+     * overflow sized by the file rather than by this run's own config. Recompute each
+     * from `c`, exactly as k3_state_save derived them, and refuse on any mismatch. */
+    {
+        const int64_t P = (int64_t)c->kda_heads * c->kda_head_dim;
+        const int64_t want_kper = P * c->kda_head_dim + 3 * P * (c->conv_k - 1);
+        if (hd->kper != want_kper) {
+            fprintf(stderr, "REFUSING: %s has %lld recurrent floats per layer, "
+                            "this config computes %lld\n",
+                    path, (long long)hd->kper, (long long)want_kper);
+            return -1;
+        }
+    }
+    if (w->kv_mode != K3_KV_LATENT) {
+        const int64_t want_kvpp   = (int64_t)c->n_heads * (c->qk_nope + c->v_head);
+        const int64_t want_ropepp = c->qk_rope;
+        if (hd->kvpp != want_kvpp || hd->ropepp != want_ropepp) {
+            fprintf(stderr, "REFUSING: %s has kv/rope strides %lld/%lld, "
+                            "this config computes %lld/%lld\n",
+                    path, (long long)hd->kvpp, (long long)hd->ropepp,
+                    (long long)want_kvpp, (long long)want_ropepp);
+            return -1;
+        }
+        if (hd->kv_rows > w->kv_cap) {
+            fprintf(stderr, "REFUSING: %s holds %d KV rows, this run's cache is %d\n",
+                    path, hd->kv_rows, w->kv_cap);
+            return -1;
+        }
     }
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return -1; }
