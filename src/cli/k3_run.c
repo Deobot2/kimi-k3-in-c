@@ -2140,8 +2140,12 @@ int main(int argc, char **argv)
         free(dw.lay); free(dks); free(dsnap); free(dw.kvc); free(dw.ropec); free(dw.latc);
     }
     free(spec_snap);
+    /* nout can be 0 with --gen 0 (a valid, if useless, request): guard the division so
+     * the summary prints 0.00 instead of nan, and so the JSON written below stays
+     * valid JSON rather than embedding a bare `nan` token no parser accepts. */
+    const double spt = nout > 0 ? t_total / nout : 0.0;
     printf("--------------------------------------------------------------------\n");
-    printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total, t_total / nout);
+    printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total, spt);
 
     /* Decoded text, when a tokenizer is loaded. Printed as a distinct block rather than
      * streamed per token: a partially-decoded multi-byte sequence is not valid UTF-8, so
@@ -2170,7 +2174,7 @@ int main(int argc, char **argv)
         for (int i = 0; i < nout; i++) fprintf(f, "%s%d", i ? "," : "", outtok[i]);
         fprintf(f, "],\"full_ids\":[");
         for (int i = 0; i < T; i++) fprintf(f, "%s%d", i ? "," : "", seq[i]);
-        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f}\n", NL, t_total / nout);
+        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f}\n", NL, spt);
         fclose(f);
         printf("\nwrote %s\n", outp);
     }
