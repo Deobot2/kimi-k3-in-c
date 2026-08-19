@@ -458,9 +458,20 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
         w += (size_t)q->take * 4;
     }
 
-    if (!narrowed_all && !i8_seen && !mx4_seen) {
-        /* A large matrix was not BF16 in the packed run. The tag is per struct, so this
-         * cannot be described; refuse rather than read fp32 bytes as bf16. */
+    if (!narrowed_all) {
+        /* A narrow (matmul) tensor was some dtype other than BF16, I8R or MX4 -- those
+         * three each `continue` before reaching the assignment that clears this flag, so
+         * narrowed_all == 0 is already unconditional evidence of an undescribable tensor,
+         * regardless of what format anything ELSE in the layer took. The tag is per
+         * struct, so this cannot be described; refuse rather than read the bytes wrong.
+         *
+         * This must NOT be `&& !i8_seen && !mx4_seen`: that let the offending tensor
+         * through whenever some OTHER narrow tensor in the same layer happened to be I8R
+         * or MX4, because such a tensor falls through to the generic "wanted as fp32"
+         * path below and gets pointed at directly -- an F32 matrix bound as if it were
+         * whatever quantised format the rest of the layer set (K3_WMX4/K3_WI8), then read
+         * as packed nibbles or scale-interleaved int8. Right byte count, plausible
+         * numbers, wrong model. */
         fprintf(stderr, "k3_bind_mem: layer %d has a non-BF16 large tensor\n", L);
         return -1;
     }
