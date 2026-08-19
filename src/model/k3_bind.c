@@ -308,12 +308,32 @@ size_t k3_bind_widen_bytes(const K3Cfg *c)
 {
     /* Only the BF16 vectors that kernels read elementwise are copied. Everything else
      * is pointed at in place. The router gate dominates: it is BF16 on disk but stays
-     * fp32 in the engine because k3_router walks it with its own inline matmul. */
+     * fp32 in the engine because k3_router walks it with its own inline matmul.
+     *
+     * This has to be a bound on ANY single layer plan_layer can produce, so it sums
+     * EVERY elementwise-fp32 (reqw) tensor across BOTH branches -- MLA and KDA, dense
+     * and MoE -- rather than picking the one that applies to the layer actually being
+     * bound: this function is called once, from k3_cfg, before any layer's dtypes are
+     * known, and every ring slot's widen region is sized from its answer. On the
+     * released checkpoint the KDA-only and MoE-bias terms below cost nothing (those
+     * tensors are F32 on disk, so plan_load points at them directly and never touches
+     * the widen buffer at all), which is exactly why their omission here was invisible:
+     * a checkpoint or repacking tool that ships any of them as BF16 would silently
+     * undersize this buffer, and k3_bind_layer_mem would refuse with "widen area too
+     * small" only after the memory plan was printed and the multi-hundred-GB trunk
+     * opened. This list must stay in sync with plan_layer's reqw() calls, not the other
+     * way around. */
     const size_t H = (size_t)c->hidden;
-    size_t n = 6 * H                       /* in/post norm, attn-res and mlp-res pair  */
-             + (size_t)c->q_lora + c->kv_lora   /* MLA q_a/kv_a layernorms             */
-             + (size_t)c->latent                /* routed_expert_norm                  */
-             + (size_t)c->n_experts * H;        /* router gate                          */
+    const size_t P = (size_t)c->kda_heads * c->kda_head_dim;
+    size_t n = 6 * H                             /* in/post norm, attn-res and mlp-res pair */
+             + (size_t)c->q_lora + c->kv_lora    /* MLA: q_a/kv_a layernorms                */
+             + 3 * P * (size_t)c->conv_k          /* KDA: q_conv, k_conv, v_conv             */
+             + P                                  /* KDA: A_log (kda_head_dim * kda_heads)   */
+             + P                                  /* KDA: dt_bias                            */
+             + (size_t)c->kda_head_dim            /* KDA: o_norm                             */
+             + (size_t)c->latent                  /* MoE: routed_expert_norm                 */
+             + (size_t)c->n_experts * H           /* MoE: router gate                        */
+             + (size_t)c->n_experts;              /* MoE: gate.e_score_correction_bias       */
     return n * sizeof(float) + 4096;       /* slack for per-tensor 8-byte alignment    */
 }
 
