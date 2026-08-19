@@ -208,9 +208,14 @@ static K3PplDoc *ppl_load_suite(const char *path, int *ndoc, int *maxlen, int vo
         /* An upper bound on the id count: every id needs at least one separator byte
          * after the first, so the remaining text length always covers it. */
         const size_t room = (size_t)(ln - (tab - line)) + 1;
+        /* nd is incremented as soon as name/ids are assigned (even if one of the
+         * mallocs failed and left the other NULL) so the cleanup loop below, which
+         * only walks [0, nd), frees this pair on every later `bad = 1; break;` in
+         * this iteration instead of leaking it. */
         d[nd].name = strdup(line);
         d[nd].ids  = (int *)malloc(room * sizeof(int));
-        if (!d[nd].name || !d[nd].ids) { bad = 1; break; }
+        const size_t cur = nd++;
+        if (!d[cur].name || !d[cur].ids) { bad = 1; break; }
         int n = 0;
         for (const char *p = tab + 1; *p; ) {
             char *end = NULL;
@@ -218,10 +223,10 @@ static K3PplDoc *ppl_load_suite(const char *path, int *ndoc, int *maxlen, int vo
             if (end == p) break;
             if (v < 0 || v >= vocab) {
                 fprintf(stderr, "k3: %s:%d (%s) has id %ld outside the vocabulary of %d\n",
-                        path, lineno, d[nd].name, v, vocab);
+                        path, lineno, d[cur].name, v, vocab);
                 bad = 1; break;
             }
-            d[nd].ids[n++] = (int)v;
+            d[cur].ids[n++] = (int)v;
             p = end;
             while (*p == ',' || *p == ' ') p++;
         }
@@ -231,12 +236,11 @@ static K3PplDoc *ppl_load_suite(const char *path, int *ndoc, int *maxlen, int vo
          * the document count it is averaged over. */
         if (n < 2) {
             fprintf(stderr, "k3: %s:%d (%s) has %d id(s); a document needs at least 2\n",
-                    path, lineno, d[nd].name, n);
+                    path, lineno, d[cur].name, n);
             bad = 1; break;
         }
-        d[nd].n = n;
+        d[cur].n = n;
         if (n > longest) longest = n;
-        nd++;
     }
     free(line);
     fclose(f);
