@@ -183,6 +183,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
 
     jval *jl = json_get(root, "layers");
     if (!jl || jl->t != J_ARR) { fprintf(stderr, "k3_trunk: no layers array\n"); goto bad; }
+    if (jl->len <= 0) { fprintf(stderr, "k3_trunk: layers array is empty\n"); goto bad; }
     tr->n_layers = jl->len;
     tr->lay = (K3TrunkLayer *)calloc((size_t)tr->n_layers, sizeof(K3TrunkLayer));
     if (!tr->lay) goto bad;
@@ -206,6 +207,18 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
             if ((v = json_get(o, "off"))    && v->t == J_NUM) t->off    = (int64_t)v->num;
             if ((v = json_get(o, "nbytes")) && v->t == J_NUM) t->nbytes = (int64_t)v->num;
             if ((v = json_get(o, "dtype"))  && v->t == J_STR) t->dtype  = dt_of(v->str);
+            /* A tensor whose declared span runs past its layer's packed bytes would hand
+             * k3_bind_layer_mem a pointer into whatever follows the layer run -- scratch
+             * memory or the next allocation -- and the matmul kernels would multiply it
+             * as if it were weights. Refuse the manifest instead of trusting it. */
+            if (t->off < 0 || t->nbytes < 0 || t->off + t->nbytes > L->nbytes) {
+                fprintf(stderr,
+                        "k3_trunk: layer %d tensor '%s' off=%lld nbytes=%lld "
+                        "exceeds the layer's %lld packed bytes\n",
+                        i, t->name, (long long)t->off, (long long)t->nbytes,
+                        (long long)L->nbytes);
+                goto bad;
+            }
         }
     }
     free(txt);                      /* arena holds the strings; txt itself is done */
@@ -506,6 +519,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
     return 0;
 bad:
     free(txt);
+    k3_trunk_close(tr);   /* safe on a partially-built tr: every field is NULL/-1 or real */
     return -1;
 }
 

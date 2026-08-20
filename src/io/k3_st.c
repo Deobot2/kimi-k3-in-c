@@ -313,6 +313,16 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
             goto bad;
         }
 
+        /* A negative or reversed data_offsets pair still passes the byte-count check
+         * below whenever o1-o0 happens to equal the shape's implied size, and would
+         * otherwise point base+o0 at the JSON header instead of the tensor's own bytes
+         * -- silently, since the read itself would still succeed. */
+        if (o0 < 0 || o1 < o0) {
+            fprintf(stderr, "k3_st: %s: %s has invalid data_offsets [%lld, %lld]\n",
+                    path, name, (long long)o0, (long long)o1);
+            goto bad;
+        }
+
         /* Consistency: the byte span must equal elements times element size. A mismatch
          * means the shape and the data disagree, and every later read of this tensor
          * would be silently misaligned. Refuse rather than load it. */
