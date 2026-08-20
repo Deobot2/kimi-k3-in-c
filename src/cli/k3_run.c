@@ -210,7 +210,9 @@ static K3PplDoc *ppl_load_suite(const char *path, int *ndoc, int *maxlen, int vo
         const size_t room = (size_t)(ln - (tab - line)) + 1;
         d[nd].name = strdup(line);
         d[nd].ids  = (int *)malloc(room * sizeof(int));
-        if (!d[nd].name || !d[nd].ids) { bad = 1; break; }
+        if (!d[nd].name || !d[nd].ids) {
+            free(d[nd].name); free(d[nd].ids); bad = 1; break;
+        }
         int n = 0;
         for (const char *p = tab + 1; *p; ) {
             char *end = NULL;
@@ -219,7 +221,7 @@ static K3PplDoc *ppl_load_suite(const char *path, int *ndoc, int *maxlen, int vo
             if (v < 0 || v >= vocab) {
                 fprintf(stderr, "k3: %s:%d (%s) has id %ld outside the vocabulary of %d\n",
                         path, lineno, d[nd].name, v, vocab);
-                bad = 1; break;
+                free(d[nd].name); free(d[nd].ids); bad = 1; break;
             }
             d[nd].ids[n++] = (int)v;
             p = end;
@@ -232,7 +234,7 @@ static K3PplDoc *ppl_load_suite(const char *path, int *ndoc, int *maxlen, int vo
         if (n < 2) {
             fprintf(stderr, "k3: %s:%d (%s) has %d id(s); a document needs at least 2\n",
                     path, lineno, d[nd].name, n);
-            bad = 1; break;
+            free(d[nd].name); free(d[nd].ids); bad = 1; break;
         }
         d[nd].n = n;
         if (n > longest) longest = n;
@@ -1081,7 +1083,19 @@ int main(int argc, char **argv)
         printf("  tokenized: %ld bytes -> %d ids\n", plen, np);
     } else {
         for (const char *p = ids_s; *p && np < K3_MAX_PROMPT; ) {
-            prompt[np++] = (int)strtol(p, (char **)&p, 10);
+            char *end = NULL;
+            const long v = strtol(p, &end, 10);
+            /* strtol on a non-numeric byte returns 0 with end == p: the loop would
+             * otherwise keep re-entering at the same position forever, silently
+             * padding the prompt with token id 0 up to K3_MAX_PROMPT rather than
+             * refusing the malformed --ids string. */
+            if (end == p) {
+                fprintf(stderr, "--ids: cannot parse '%s' as an id list at \"%.20s\"\n",
+                        ids_s, p);
+                return 2;
+            }
+            prompt[np++] = (int)v;
+            p = end;
             while (*p == ',' || *p == ' ') p++;
         }
     }
@@ -1100,6 +1114,23 @@ int main(int argc, char **argv)
     if (gen < 0 || gen > K3_MAX_GEN) {
         fprintf(stderr, "--gen %d is out of range: this build generates at most %d "
                         "tokens (outtok[%d])\n", gen, K3_MAX_GEN, K3_MAX_GEN);
+        return 2;
+    }
+    /* A non-positive budget does not fail the same way in every consumer: k3_cache_init
+     * refuses it but with a confusing "budget -5.00 GB gives -3 slots" message, while
+     * k3_trunk_open silently degrades to a 1-slot ring with nothing pinned and returns
+     * success -- and the same negative trunk_gb then understates need_b in the memory
+     * plan below, undermining the "REFUSING TO START" guard that block exists to give. */
+    if (!budget_auto && trunk_gb < 0) {
+        fprintf(stderr, "--trunk-gb %.2f must not be negative\n", trunk_gb);
+        return 2;
+    }
+    if (cache_gb <= 0) {
+        fprintf(stderr, "--cache-gb %.2f must be positive\n", cache_gb);
+        return 2;
+    }
+    if (draft_dir && draft_gb <= 0) {
+        fprintf(stderr, "--draft-trunk-gb %.2f must be positive\n", draft_gb);
         return 2;
     }
     if (np > K3_MAX_PROMPT) {
@@ -2137,7 +2168,8 @@ int main(int argc, char **argv)
     }
     free(spec_snap);
     printf("--------------------------------------------------------------------\n");
-    printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total, t_total / nout);
+    printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total,
+           nout ? t_total / nout : 0.0);
 
     /* Decoded text, when a tokenizer is loaded. Printed as a distinct block rather than
      * streamed per token: a partially-decoded multi-byte sequence is not valid UTF-8, so
@@ -2166,7 +2198,8 @@ int main(int argc, char **argv)
         for (int i = 0; i < nout; i++) fprintf(f, "%s%d", i ? "," : "", outtok[i]);
         fprintf(f, "],\"full_ids\":[");
         for (int i = 0; i < T; i++) fprintf(f, "%s%d", i ? "," : "", seq[i]);
-        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f}\n", NL, t_total / nout);
+        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f}\n", NL,
+                nout ? t_total / nout : 0.0);
         fclose(f);
         printf("\nwrote %s\n", outp);
     }
