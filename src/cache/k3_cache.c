@@ -279,6 +279,8 @@ static void publish(K3Cache *c, int32_t key, int slot, int64_t got, int64_t pad,
  * mutex; this takes it, and drops it around the read so other threads can work. */
 static int admit(K3Cache *c, int layer, int expert, int count_stats)
 {
+    if (layer < 0 || layer >= c->n_layers || expert < 0 || expert >= c->n_experts)
+        return -1;
     const int32_t key = layer * c->n_experts + expert;
     K3ExpertRef r;
 
@@ -665,12 +667,6 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
         if (huge) madvise(c->arena, want, MADV_HUGEPAGE);
 #endif
     }
-    if (0) {
-        fprintf(stderr, "k3_cache: cannot allocate %.2f GB arena\n",
-                (double)c->nslot * c->slot_bytes / 1e9);
-        return -1;
-    }
-
     const size_t nkey = (size_t)c->n_layers * c->n_experts;
     c->slot_of = (int32_t *)malloc(nkey * sizeof(int32_t));
     c->inflight_of = (int32_t *)malloc(nkey * sizeof(int32_t));
@@ -804,8 +800,8 @@ int k3_cache_dump_trace(const K3Cache *c, const char *path)
 
 int k3_cache_pin(K3Cache *c, int layer, int expert, int pin)
 {
+    if (layer < 0 || layer >= c->n_layers || expert < 0 || expert >= c->n_experts) return 0;
     const int32_t key = layer * c->n_experts + expert;
-    if (key < 0 || key >= c->n_layers * c->n_experts) return 0;
     pthread_mutex_lock(&c->mu);
     const int slot = c->slot_of[key];
     if (slot >= 0) c->pinned[slot] = pin ? 1 : 0;
