@@ -198,8 +198,18 @@ static inline void k3_tok_load(Tok *T, const char *files_dir)
     if (!T->sp) { fprintf(stderr, "k3_tok: OOM on %d specials\n", T->nsp); exit(1); }
 
     for (int k = 0; k < adt->len; k++) {
-        /* keys are the ids, as strings: {"163584": {"content": "[BOS]", ...}} */
-        int id = atoi(adt->keys[k]);
+        /* keys are the ids, as strings: {"163584": {"content": "[BOS]", ...}}. atoi
+         * returns 0 for anything non-numeric, which would silently alias a malformed
+         * key onto id 0 instead of refusing -- the same "runs and is wrong" failure
+         * mode this loader exists to avoid at every other trap. */
+        char *end;
+        long idl = strtol(adt->keys[k], &end, 10);
+        if (*end != '\0' || end == adt->keys[k]) {
+            fprintf(stderr, "k3_tok: added token key '%s' is not an integer\n",
+                    adt->keys[k]);
+            exit(1);
+        }
+        int id = (int)idl;
         jval *e  = adt->kids[k];
         jval *jc = json_get(e, "content");
         if (!jc || jc->t != J_STR || !jc->str) {
