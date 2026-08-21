@@ -623,6 +623,11 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
     c->n_layers = cfg->n_layers;
     c->n_experts = cfg->n_experts;
 
+    /* Before any allocation that can fail: every failure path below calls
+     * k3_cache_free, which unconditionally destroys these. */
+    pthread_mutex_init(&c->mu, NULL);
+    pthread_cond_init(&c->cv, NULL);
+
     /* Size a slot from the checkpoint rather than from arithmetic: find any expert and
      * ask how many bytes it actually occupies. */
     K3ExpertRef probe;
@@ -675,11 +680,6 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
 #if defined(MADV_HUGEPAGE)
         if (huge) madvise(c->arena, want, MADV_HUGEPAGE);
 #endif
-    }
-    if (0) {
-        fprintf(stderr, "k3_cache: cannot allocate %.2f GB arena\n",
-                (double)c->nslot * c->slot_bytes / 1e9);
-        return -1;
     }
 
     const size_t nkey = (size_t)c->n_layers * c->n_experts;
@@ -755,9 +755,6 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
         if (c->s_target < 1) c->s_target = 1;
         c->working_set = (int32_t)(ws > INT32_MAX ? INT32_MAX : ws);
     }
-
-    pthread_mutex_init(&c->mu, NULL);
-    pthread_cond_init(&c->cv, NULL);
 
     /* Speculation needs room for the guessed set AND the set the router actually picks,
      * on top of what the current layer is using. Below that it would evict what this
