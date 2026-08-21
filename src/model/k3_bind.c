@@ -338,8 +338,9 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
      * refusal below fire on every correctly packed MXFP4 trunk -- all its narrow tensors
      * took the MX4 exit, nothing cleared the flag, and the layer was reported as mixing
      * BF16 with MX4 when it contained no bf16 matmul weight at all. */
-    int bf16_seen = 0, i8_seen = 0, mx4_seen = 0;
+    int bf16_seen = 0, i8_seen = 0, mx4_seen = 0, f32n_seen = 0;
     const char *bf16_name = NULL;
+    const char *f32n_name = NULL;
     for (int i = 0; i < p.n; i++) {
         Req *q = &p.r[i];
         int64_t off = 0, nb = 0; int dt = 0;
@@ -439,7 +440,19 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
 
         /* Wanted as fp32. If it is already F32 on disk, point at it; a prefix take
          * (A_log) is just the front of the same array, so that is free too. */
-        if (dt == K3_DT_F32) { *q->dest = run + off; continue; }
+        if (dt == K3_DT_F32) {
+            *q->dest = run + off;
+            /* A NARROW tensor that happens to be stored F32 binds correctly here (it is
+             * still a pointer to its own bytes, read elementwise), but it must still be
+             * counted: the mixed-format check below only ever saw bf16/i8/mx4, so a
+             * layer with this tensor plus another narrow tensor that IS quantised (mx4
+             * or i8) skipped that check entirely -- mx4_seen or i8_seen was already
+             * nonzero, so the "no recognised format" refusal never fired, and the layer
+             * got tagged for the OTHER format while this tensor's raw fp32 bytes sat
+             * behind that pointer, to be read as packed nibbles or int8 rows. */
+            if (q->narrow && !f32n_seen) { f32n_seen = 1; f32n_name = q->name; }
+            continue;
+        }
 
         if (dt != K3_DT_BF16) {
             fprintf(stderr, "k3_bind_mem: %s has dtype %d, cannot widen\n", q->name, dt);
@@ -464,23 +477,27 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
         fprintf(stderr, "k3_bind_mem: layer %d has a non-BF16 large tensor\n", L);
         return -1;
     }
-    if (bf16_seen + i8_seen + mx4_seen > 1) {
+    if (bf16_seen + i8_seen + mx4_seen + f32n_seen > 1) {
         /* MIXED FORMATS IN ONE LAYER. The dtype tag lives on the STRUCT, not the field,
          * so a layer holding both bf16 and MXFP4 matmul weights cannot be described --
          * whichever tag is chosen, the other format is read as the wrong bytes and the
          * model runs and is wrong. A packer that quantised only some of a layer's narrow
          * tensors produces exactly this.
          *
-         * The bf16 tensor is NAMED, because that is the actionable half: it says which
-         * tensor the packer skipped, and therefore which rule in it was wrong. "layer 0
-         * mixes formats" on its own leaves the reader to diff two containers by hand. */
-        fprintf(stderr, "k3_bind_mem: layer %d mixes weight formats (%s%s%s); a packed "
+         * The bf16/f32 tensor is NAMED, because that is the actionable half: it says
+         * which tensor the packer skipped, and therefore which rule in it was wrong.
+         * "layer 0 mixes formats" on its own leaves the reader to diff two containers
+         * by hand. */
+        fprintf(stderr, "k3_bind_mem: layer %d mixes weight formats (%s%s%s%s); a packed "
                         "trunk must quantise ALL of a layer's matmul weights or none.\n",
                 L, bf16_seen ? "BF16 " : "", i8_seen ? "I8R " : "",
-                mx4_seen ? "MX4" : "");
+                mx4_seen ? "MX4 " : "", f32n_seen ? "F32" : "");
         if (bf16_seen && bf16_name)
             fprintf(stderr, "             the first bf16 matmul weight here is %s; the "
                             "packer skipped it\n", bf16_name);
+        if (f32n_seen && f32n_name)
+            fprintf(stderr, "             the first unquantised (f32) matmul weight here "
+                            "is %s; the packer skipped it\n", f32n_name);
         return -1;
     }
 
