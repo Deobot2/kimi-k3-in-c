@@ -389,7 +389,8 @@ typedef struct { int slot; int expert; K3ExpertRef r; int64_t got, pad; } Work;
  * thread. `spec` only changes which counter the bytes land in. */
 static int batch_load(K3Cache *c, int layer, const int *ids, int n, int spec)
 {
-    /* One entry per expert in a batch prefetch, so it is bounded by top-k. */
+    /* Bounds how many reads this one call has in flight at once, not how many ids the
+     * caller may pass -- cache_getmany slices larger id lists into batches of this size. */
     Work w[K3_MAX_TOPK];
     int nw = 0;
     const int cap = (int)(sizeof w / sizeof *w);
@@ -484,7 +485,17 @@ static int cache_getmany(K3ExpertSrc *self, int layer, const int *ids, int n)
         c->last_n[layer] = keep;
         pthread_mutex_unlock(&c->mu);
     }
-    return batch_load(c, layer, ids, n, 0);
+    /* batch_load's in-flight set is bounded by K3_MAX_TOPK (see its own comment), but a
+     * prefill chunk's unique-expert count is not -- it can run into the hundreds. Slice
+     * so every id still gets a concurrent read instead of silently falling off the end
+     * of a single batch and dropping to a queue depth of one via the caller's serial
+     * `get()` fallback. */
+    int ok = 0;
+    for (int at = 0; at < n; at += K3_MAX_TOPK) {
+        const int m = (n - at) < K3_MAX_TOPK ? (n - at) : K3_MAX_TOPK;
+        ok += batch_load(c, layer, ids + at, m, 0);
+    }
+    return ok;
 }
 
 /* ------------------------------------------------- speculative prefetch ------ */

@@ -1126,6 +1126,16 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
             k3_expert_drops++;
             fprintf(stderr, "EXPERT DROP: layer %d expert %d failed to load; "
                             "this chunk is CORRUPT\n", w->layer, e);
+            /* k3_moe's serial path drops a missing expert by never adding to the
+             * accumulator, i.e. a zero contribution. Match that here: contrib's rows
+             * for this expert are otherwise never written, and summing them raw would
+             * fold malloc garbage into every token that routed to it. */
+            for (int t = 0; t < T; t++) {
+                const int *it = ridx + (size_t)t * K;
+                for (int j = 0; j < K; j++)
+                    if (it[j] == e)
+                        memset(contrib + ((size_t)t * K + j) * Ll, 0, (size_t)Ll * sizeof(float));
+            }
             continue;
         }
         for (int t = 0; t < T; t++) {
