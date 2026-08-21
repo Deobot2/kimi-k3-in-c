@@ -1532,10 +1532,17 @@ int main(int argc, char **argv)
         printf("peak RSS after loading weights: %s  (the plan above is a forecast, "
                "this is measured)\n", rb);
     }
-    printf("expert cache: %d slots x %.2f MB = %.2f GB (%.2f%% of the 1.45 TB expert pool)\n\n",
-           cache.nslot, (double)cache.slot_bytes / 1e6,
-           (double)cache.nslot * cache.slot_bytes / 1e9,
-           100.0 * cache.nslot / (double)(92 * c.n_experts));
+    {
+        /* Total experts in the pool, derived from this config rather than the released
+         * model's layer count, so the percentage still means something on the tiny
+         * fixture model or a partial --layers run. */
+        int moe_layers = 0;
+        for (int L = 0; L < c.n_layers; L++) if (!k3_is_dense(&c, L)) moe_layers++;
+        printf("expert cache: %d slots x %.2f MB = %.2f GB (%.2f%% of the %d-layer expert pool)\n\n",
+               cache.nslot, (double)cache.slot_bytes / 1e6,
+               (double)cache.nslot * cache.slot_bytes / 1e9,
+               100.0 * cache.nslot / (double)(moe_layers * c.n_experts), moe_layers);
+    }
 
     /* ---- buffers ----
      * A resumed session must hold the saved history as well as the new tokens, so the
@@ -2132,12 +2139,19 @@ int main(int argc, char **argv)
                hyb_rounds, hyb_drafted, hyb_accepted,
                hyb_drafted ? 100.0 * hyb_accepted / hyb_drafted : 0.0,
                (double)hyb_accepted / hyb_rounds);
+    }
+    /* Teardown must not be gated on hyb_rounds: a short run can set up the draft trunk
+     * (dw.trunk et al, above) and still take zero hybrid rounds, in which case the
+     * reader thread, its io_uring, and the ring arena would otherwise never be torn
+     * down. */
+    if (dw.trunk) {
         k3_trunk_close(&trunk_d);
         free(dw.lay); free(dks); free(dsnap); free(dw.kvc); free(dw.ropec); free(dw.latc);
     }
     free(spec_snap);
     printf("--------------------------------------------------------------------\n");
-    printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total, t_total / nout);
+    printf("%d tokens in %.1f s, %.2f s/token average\n",
+           nout, t_total, nout ? t_total / nout : 0.0);
 
     /* Decoded text, when a tokenizer is loaded. Printed as a distinct block rather than
      * streamed per token: a partially-decoded multi-byte sequence is not valid UTF-8, so
@@ -2166,7 +2180,8 @@ int main(int argc, char **argv)
         for (int i = 0; i < nout; i++) fprintf(f, "%s%d", i ? "," : "", outtok[i]);
         fprintf(f, "],\"full_ids\":[");
         for (int i = 0; i < T; i++) fprintf(f, "%s%d", i ? "," : "", seq[i]);
-        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f}\n", NL, t_total / nout);
+        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f}\n",
+                NL, nout ? t_total / nout : 0.0);
         fclose(f);
         printf("\nwrote %s\n", outp);
     }

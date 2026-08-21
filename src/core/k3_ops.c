@@ -1247,7 +1247,7 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
 
     /* 2. ShortConv with fused SiLU, carrying state across calls */
     float *cs = state ? state + (size_t)H * D * D : NULL;
-    k3_shortconv(q, q, w->q_conv, cs ? cs : NULL, P, K, T);
+    k3_shortconv(q, q, w->q_conv, cs, P, K, T);
     k3_shortconv(k, k, w->k_conv, cs ? cs + (size_t)P * hist : NULL, P, K, T);
     k3_shortconv(v, v, w->v_conv, cs ? cs + (size_t)2 * P * hist : NULL, P, K, T);
 
