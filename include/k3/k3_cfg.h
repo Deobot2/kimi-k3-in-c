@@ -247,9 +247,10 @@ static inline int k3_cfg_load(K3Cfg *c, int *fa, int fa_max, jval *root, const c
     return 1;
 }
 
-/* Convenience: read and parse a config file, then load it. The returned arena is left
- * allocated because K3Cfg does not copy the strings it does not own; callers keep it
- * for the process lifetime, which every caller here does. */
+/* Convenience: read and parse a config file, then load it. K3Cfg copies out only the
+ * ints/floats/layer-map it needs (k3cfg_i/k3cfg_f above) and keeps no pointer into the
+ * parsed tree, so both the source text and the tree are freed here once loading is
+ * done, same as k3_trunk_open does with its own json_parse/json_free pair. */
 static inline int k3_cfg_load_file(K3Cfg *c, int *fa, int fa_max, const char *path)
 {
     FILE *f = fopen(path, "rb");
@@ -269,8 +270,11 @@ static inline int k3_cfg_load_file(K3Cfg *c, int *fa, int fa_max, const char *pa
 
     char *arena = NULL;
     jval *root = json_parse(txt, &arena);
-    if (!root) { fprintf(stderr, "%s: not valid JSON\n", path); free(txt); return 0; }
-    return k3_cfg_load(c, fa, fa_max, root, path);
+    free(txt);                       /* json_parse gives every string its own allocation */
+    if (!root) { fprintf(stderr, "%s: not valid JSON\n", path); return 0; }
+    const int ok = k3_cfg_load(c, fa, fa_max, root, path);
+    json_free(root);
+    return ok;
 }
 
 #endif /* K3_CFG_H */
