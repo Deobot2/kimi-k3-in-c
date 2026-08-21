@@ -262,6 +262,27 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
         __atomic_store_n(u->cq_head, chead, __ATOMIC_RELEASE);
     }
 
+    /* On a failure exit above, `posted` can still be nonzero: reads already handed to
+     * the kernel that this loop never waited for a completion of. A -1 return tells the
+     * caller this transfer did not happen, and k3_trunk.c's fallback then reads the same
+     * range into the SAME buffer with pread -- so a completion the kernel delivers after
+     * we return would write into memory the caller now considers safe to overwrite (or
+     * free). Drain every outstanding completion, discarding it, before returning; this
+     * is a no-op when the loop above finished normally, since posted is already 0. */
+    while (posted > 0) {
+        unsigned chead = __atomic_load_n(u->cq_head, __ATOMIC_RELAXED);
+        const unsigned ctail = __atomic_load_n(u->cq_tail, __ATOMIC_ACQUIRE);
+        if (chead == ctail) {
+            int r;
+            do { r = sys_io_uring_enter(u->fd, 0, 1u, IORING_ENTER_GETEVENTS); }
+            while (r < 0 && errno == EINTR);
+            if (r < 0) break;   /* kernel will not report more; nothing else to do */
+            continue;
+        }
+        while (chead != ctail) { chead++; posted--; }
+        __atomic_store_n(u->cq_head, chead, __ATOMIC_RELEASE);
+    }
+
     free(ck); free(again);
     if (failed) return -1;
     return got;
