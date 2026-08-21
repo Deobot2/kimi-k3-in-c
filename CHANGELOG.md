@@ -129,6 +129,55 @@ not needing the bytes at all.
   went over what the walk owed. The aggregate byte total could say a run went over and
   never which layers; two explanations for the 13.7% were argued from the pinned set's
   shape before this existed, and both were wrong.
+- **The batched expert prefetch only ever loaded the first 64 unique experts of a
+  prefill chunk.** `cache_getmany` handed a whole chunk's unique-expert set to
+  `batch_load` in one call, but that call's in-flight array is bounded by
+  `K3_MAX_TOPK` (64); past that the reservation loop just stopped considering ids, no
+  error. A 64-token prefill chunk routinely has several hundred unique experts, so most
+  of them silently fell back to the caller's serial `get()` at queue depth one — the
+  exact NVMe-starving pattern the batch path exists to avoid. Now sliced into
+  `K3_MAX_TOPK`-sized batches.
+- **A dropped expert during batched prefill folded uninitialised memory into the
+  output**, instead of the exact zero contribution the per-token path gives a drop.
+  `moe_prefill_chunk`'s contribution buffer was written per (token, slot) by the expert
+  loop; a load failure skipped straight past those rows without zeroing them, and they
+  were then summed as if they held real data — malloc garbage, or worse a NaN, poisoning
+  every later token through the KV cache.
+- `k3_matmul_tr`'s MXFP4 sweep called `ldexpf()` inside its innermost loop instead of
+  using the precomputed `K3_E8M0` table the other MXFP4 kernels already share — roughly
+  150 million redundant calls per token on the `--mla-latent` query-absorption path over
+  a quantised trunk, and it also blocked the loop from vectorising.
+- `k3_cache_init` destroyed its mutex and condition variable on an early failure path
+  before either had been initialised (UB, benign only by glibc coincidence): both are
+  now set up before the first fallible allocation. Also removed a dead `if (0)` block
+  left over from an earlier version of the arena-allocation check.
+- `k3_st_open`'s shard-file scan had three unchecked allocations per file found; a
+  failure would null-deref on the next line instead of reporting out of memory like the
+  rest of the loader.
+- `k3_cfg_load_file` kept its parsed JSON tree and source text allocated for the
+  process lifetime, on a comment claiming `K3Cfg` holds pointers into it — it doesn't;
+  every value it needs is copied out as an int, float, or into the caller's layer-map
+  array. Now freed the same way `k3_trunk_open` frees its own parse.
+- `--gen 0` printed `-nan` into both the run summary and `k3_run.json`'s
+  `seconds_per_token` (invalid JSON), from dividing elapsed time by zero tokens
+  generated.
+- The draft trunk's reader thread, io_uring, and ring arena were only torn down when at
+  least one hybrid-decode round had fired; a `--draft` run whose `--gen` finished before
+  the first round leaked all three.
+- `k3_uring_read` could return failure while other chunks of the same transfer were
+  still submitted to the kernel and not yet complete. The caller (`k3_trunk.c`) treats
+  -1 as "retry this range with `pread` into the same buffer", so a completion the kernel
+  delivered after that point could write into memory the caller now considered safe to
+  refill or free. Failure paths now drain and discard every outstanding completion
+  before returning.
+- `k3_bind_layer_mem`'s mixed-weight-format refusal missed the case of a narrow tensor
+  stored as plain F32 sitting alongside others that were genuinely MXFP4 or int8-row
+  quantised in the same layer: the F32 tensor bound correctly as a raw pointer, but
+  nothing recorded that a narrow tensor had taken that path, so the "no recognised
+  format" refusal never fired and the layer was tagged for the quantised format instead
+  — leaving that one tensor's fp32 bytes to be read as packed nibbles. Not reachable by
+  the current packers, but the whole point of this check is that a packer bug fails
+  loudly rather than binding wrong bytes to an unannounced model.
 
 ## [1.0.0] - 2026-08-07
 
