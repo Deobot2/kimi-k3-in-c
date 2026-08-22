@@ -748,6 +748,7 @@ int k3_trunk_fetch(K3Trunk *tr, int L, unsigned char **out)
 
     if (tr->pin_of[L] >= 0) {
         base = tr->pin[tr->pin_of[L]];
+        int was_hit = 0;
         if (tr->slot_of[L] < 0) {            /* first touch: load once, keep forever */
             double secs = 0.0; int64_t bytes = 0;
             /* tr->uring, NOT io->ur. An io_uring is a shared-memory protocol between one
@@ -764,9 +765,10 @@ int k3_trunk_fetch(K3Trunk *tr, int L, unsigned char **out)
             pthread_mutex_unlock(&io->mu);
             if (rc != 0) return -1;
         } else {
-            tr->hits++;
+            was_hit = 1;
         }
         pthread_mutex_lock(&io->mu);
+        if (was_hit) tr->hits++;             /* counted under the lock, like every other writer of hits/misses */
         io->held = -1;                       /* no ring slot is in use */
         pthread_cond_broadcast(&io->cv_done);
         pthread_mutex_unlock(&io->mu);
