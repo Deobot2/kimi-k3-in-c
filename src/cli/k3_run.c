@@ -280,6 +280,18 @@ static size_t kv_latent_width(const K3Cfg *c)
     return (size_t)c->kv_lora + (size_t)c->qk_rope;
 }
 
+/* Floats of carried recurrent state per KDA layer: the P x kda_head_dim decay matrix
+ * plus three (query/key/value) ShortConv histories of conv_k-1 positions each, P wide.
+ * One place computes this so the four sites that size a kstate/snapshot/spec-rollback
+ * buffer against it (main's allocation, the auto-budget estimate under both presets,
+ * and forward()'s own per-layer stride) cannot drift apart and undersize the buffer
+ * relative to what k3_kda_layer actually writes. */
+static size_t k3_kda_state_floats(const K3Cfg *c)
+{
+    const size_t P = (size_t)c->kda_heads * c->kda_head_dim;
+    return P * c->kda_head_dim + 3 * P * (c->conv_k - 1);
+}
+
 /* Describe this layer's slice of whichever cache is in use. One place builds the
  * descriptor so the two layouts cannot drift apart in the offsets they imply. */
 static void kv_for_layer(const Weights *w, const K3Cfg *c, int mi, K3KvCache *kv)
@@ -779,8 +791,7 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     long   *nll_n = ppl ? &ppl->n  : NULL;
     const int E = c->hidden;
     const int maxb = c->n_layers / c->attn_res_block + 2;
-    const int P = c->kda_heads * c->kda_head_dim;
-    const size_t kper = (size_t)P * c->kda_head_dim + (size_t)3 * P * (c->conv_k - 1);
+    const size_t kper = k3_kda_state_floats(c);
 
     for (int t = 0; t < T; t++)
         k3_embed_row(h + (size_t)t * E, w->mb.embed, w->mb.wdt, ids[t], E);
@@ -1264,14 +1275,12 @@ int main(int argc, char **argv)
         }
         const int64_t E64 = c.hidden;
         const int Tm = np + gen + 1;
-        const int Pp = c.kda_heads * c.kda_head_dim;
         const int mb_ = c.n_layers / c.attn_res_block + 2;
 
         /* Everything that lives outside both budgets, from the config rather than from
          * memory of one checkpoint. */
         const double w_model = 2.0 * (double)c.vocab * E64 * 2 + 3.0 * E64 * 4;
-        const double w_state = (double)((size_t)Pp * c.kda_head_dim
-                             + (size_t)3 * Pp * (c.conv_k - 1)) * c.n_layers * 4;
+        const double w_state = (double)k3_kda_state_floats(&c) * c.n_layers * 4;
         const double w_buf = ((double)Tm * E64 + (double)Tm * mb_ * E64
                             + (double)k3_layer_scratch(&c, Tm) + (double)c.vocab) * 4;
         int n_mla_ = 0, n_moe_ = 0;
@@ -1427,9 +1436,7 @@ int main(int argc, char **argv)
         const double w_cache = cache_gb * 1e9;
         const int Tm = np + gen + 1;
         const int mb = c.n_layers / c.attn_res_block + 2;
-        const int Pp = c.kda_heads * c.kda_head_dim;
-        const double w_state = (double)((size_t)Pp * c.kda_head_dim
-                              + (size_t)3 * Pp * (c.conv_k - 1)) * NL * 4;
+        const double w_state = (double)k3_kda_state_floats(&c) * NL * 4;
         const double w_buf = ((double)Tm * E64 + (double)Tm * mb * E64
                               + (double)k3_layer_scratch(&c, Tm) + (double)c.vocab) * 4;
         /* The KV cache MUST be in this total: it is the only term that grows with
@@ -1568,8 +1575,7 @@ int main(int argc, char **argv)
     const int Tmax = prior + np + gen + 1;
     const int E = c.hidden;
     const int maxb = c.n_layers / c.attn_res_block + 2;
-    const int P = c.kda_heads * c.kda_head_dim;
-    const size_t kper = (size_t)P * c.kda_head_dim + (size_t)3 * P * (c.conv_k - 1);
+    const size_t kper = k3_kda_state_floats(&c);
 
     /* The model-level aggregator lays out fold[E] followed by (nb+1) source rows of E
      * inside scratch, and nb reaches n_layers/attn_res_block = 8 at full depth. So
@@ -1686,8 +1692,7 @@ int main(int argc, char **argv)
      * partially-rejected draft batch: the recurrent state is updated in place and is
      * not positional, so the only sound recovery is restore-and-replay the accepted
      * prefix. The snapshot is one memcpy; the replay is one short batched sweep. */
-    const size_t kperP  = (size_t)c.kda_heads * c.kda_head_dim;
-    const size_t kper_f = kperP * c.kda_head_dim + 3 * kperP * (c.conv_k - 1);
+    const size_t kper_f = k3_kda_state_floats(&c);
     float *spec_snap = NULL;
     if (spec_n > 0) {
         if (!incremental) {
