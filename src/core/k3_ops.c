@@ -31,6 +31,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Below this many independent output rows/columns, spinning up an OpenMP team costs
+ * more than the serial loop it would replace. One named threshold so the nine `if
+ * (... > 64)` guards on the parallel matmul/router loops below can't drift apart. */
+#define K3_OMP_MIN_WORK 64
+
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
  * scratch without changing a published signature. They are hundreds of bytes to a few
@@ -355,7 +360,7 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
 void k3_matmul(float *y, const float *x, const float *W, int in, int out)
 {
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
+#pragma omp parallel for schedule(static) if (out > K3_OMP_MIN_WORK)
 #endif
     for (int o = 0; o < out; o++) {
         const float *row = W + (size_t)o * in;
@@ -707,7 +712,7 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
     if (wdt == K3_WBF16) {
         const uint16_t *w16 = (const uint16_t *)W;
 #ifdef _OPENMP
-#       pragma omp parallel for schedule(static) if (in > 64)
+#       pragma omp parallel for schedule(static) if (in > K3_OMP_MIN_WORK)
 #endif
         for (int j = 0; j < in; j++) {
             double acc = 0.0;
@@ -731,7 +736,7 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
         const unsigned char *base = (const unsigned char *)W;
         if (!k3_e8m0_ready) k3_e8m0_init();
 #ifdef _OPENMP
-#       pragma omp parallel for schedule(static) if (in > 64)
+#       pragma omp parallel for schedule(static) if (in > K3_OMP_MIN_WORK)
 #endif
         for (int j = 0; j < in; j++) {
             const size_t byte = (size_t)j >> 1;
@@ -753,7 +758,7 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
         const size_t stride = k3_row_bytes(K3_WI8, in);
         const unsigned char *base = (const unsigned char *)W;
 #ifdef _OPENMP
-#       pragma omp parallel for schedule(static) if (in > 64)
+#       pragma omp parallel for schedule(static) if (in > K3_OMP_MIN_WORK)
 #endif
         for (int j = 0; j < in; j++) {
             double acc = 0.0;
@@ -767,7 +772,7 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
     } else {
         const float *wf = (const float *)W;
 #ifdef _OPENMP
-#       pragma omp parallel for schedule(static) if (in > 64)
+#       pragma omp parallel for schedule(static) if (in > K3_OMP_MIN_WORK)
 #endif
         for (int j = 0; j < in; j++) {
             double acc = 0.0;
@@ -1510,7 +1515,7 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
 {
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
+#pragma omp parallel for schedule(static) if (out > K3_OMP_MIN_WORK)
 #endif
     for (int o = 0; o < out; o++) {
         const uint16_t *row = W + (size_t)o * in;
@@ -1582,7 +1587,7 @@ void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
     const unsigned char *base = (const unsigned char *)W;
     const size_t rowb = (size_t)4 + (size_t)in;
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
+#pragma omp parallel for schedule(static) if (out > K3_OMP_MIN_WORK)
 #endif
     for (int o = 0; o < out; o++) {
         const unsigned char *row = base + (size_t)o * rowb;
@@ -1780,7 +1785,7 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
     if (!k3_e8m0_ready)  k3_e8m0_init();
 
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (rows > 64)
+#pragma omp parallel for schedule(static) if (rows > K3_OMP_MIN_WORK)
 #endif
     for (int r = 0; r < rows; r++)
         y[r] = (float)mxfp4_rowdot(x, packed + (size_t)r * pcols,
@@ -1801,7 +1806,7 @@ void k3_matmul_mx4(float *y, const float *x, const void *W, int in, int out)
     if (!k3_e8m0_ready)  k3_e8m0_init();
 
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
+#pragma omp parallel for schedule(static) if (out > K3_OMP_MIN_WORK)
 #endif
     for (int r = 0; r < out; r++) {
         const unsigned char *row = base + (size_t)r * rb;
