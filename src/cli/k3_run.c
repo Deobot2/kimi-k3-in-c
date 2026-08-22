@@ -1158,6 +1158,23 @@ int main(int argc, char **argv)
                 kv_sinks, kv_window);
         return 2;
     }
+    if (incremental && (want_ppl || tf_check)) {
+        /* REFUSED, and this is a correctness limit rather than a policy.
+         *
+         * The --ppl/--ppl-file document loop scores each document from what its own
+         * comment calls "a clean slate: no carried KV cache and no carried recurrent
+         * state" -- true only because forward() clears the recurrent state and starts
+         * the KV cache at position 0 whenever w.kv_on is false. --incremental sets
+         * w.kv_on = 1 once, before that loop runs, and nothing resets it or w.cached
+         * between documents. Document 2 onward would then silently attend over the
+         * previous document's cached KV rows and carried KDA state instead of starting
+         * fresh, corrupting every perplexity number after the first. */
+        fprintf(stderr,
+            "--incremental cannot be combined with --ppl, --ppl-file or --tf-check.\n"
+            "  Those score each document from a clean per-document state, which only\n"
+            "  holds when nothing carries a KV cache or recurrent state across them.\n");
+        return 2;
+    }
     if (kv_window > 0 && (spec_n > 0 || draft_dir)) {
         /* REFUSED, and this is a correctness limit rather than a policy.
          *
