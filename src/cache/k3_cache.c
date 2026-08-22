@@ -665,12 +665,6 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
         if (huge) madvise(c->arena, want, MADV_HUGEPAGE);
 #endif
     }
-    if (0) {
-        fprintf(stderr, "k3_cache: cannot allocate %.2f GB arena\n",
-                (double)c->nslot * c->slot_bytes / 1e9);
-        return -1;
-    }
-
     const size_t nkey = (size_t)c->n_layers * c->n_experts;
     c->slot_of = (int32_t *)malloc(nkey * sizeof(int32_t));
     c->inflight_of = (int32_t *)malloc(nkey * sizeof(int32_t));
@@ -815,6 +809,13 @@ int k3_cache_pin(K3Cache *c, int layer, int expert, int pin)
 
 int k3_cache_prefetch(K3Cache *c, int layer, int expert)
 {
+    /* admit() indexes slot_of[]/inflight_of[] by layer*n_experts+expert with no bounds
+     * check of its own -- cache_get validates before calling it, and this public entry
+     * point must too, or an out-of-range layer/expert reaches those arrays directly. */
+    if (layer < 0 || layer >= c->n_layers || expert < 0 || expert >= c->n_experts) {
+        fprintf(stderr, "k3_cache: prefetch out of range L%d expert %d\n", layer, expert);
+        return -1;
+    }
     /* Warming the cache is not a model request, so it must not move the hit rate. */
     return admit(c, layer, expert, 0) >= 0 ? 0 : -1;
 }
