@@ -1081,7 +1081,20 @@ int main(int argc, char **argv)
         printf("  tokenized: %ld bytes -> %d ids\n", plen, np);
     } else {
         for (const char *p = ids_s; *p && np < K3_MAX_PROMPT; ) {
-            prompt[np++] = (int)strtol(p, (char **)&p, 10);
+            char *end = NULL;
+            const long v = strtol(p, &end, 10);
+            /* strtol leaves end == p and returns 0 on anything it cannot parse (a stray
+             * letter, a malformed number). Without this check the loop never advances
+             * past that point either, so it would append 0 forever until np hits
+             * K3_MAX_PROMPT -- silently running a huge, mostly-zero prompt instead of
+             * reporting the typo, exactly what ppl_load_suite refuses to do above. */
+            if (end == p) {
+                fprintf(stderr, "k3: --ids has a malformed id at \"%.16s%s\"\n",
+                        p, strlen(p) > 16 ? "..." : "");
+                return 2;
+            }
+            prompt[np++] = (int)v;
+            p = end;
             while (*p == ',' || *p == ' ') p++;
         }
     }
