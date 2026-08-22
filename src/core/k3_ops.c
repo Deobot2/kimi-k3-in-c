@@ -1088,7 +1088,12 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
     int   *ridx = (int *)  malloc((size_t)T * K * sizeof(int));
     float *rwt  = (float *)malloc((size_t)T * K * sizeof(float));
     float *zz   = (float *)malloc((size_t)T * Ll * sizeof(float));
-    float *contrib = (float *)malloc((size_t)T * K * Ll * sizeof(float));
+    /* calloc, not malloc: a fetch failure below (see EXPERT DROP) leaves this expert's
+     * (t, j) slots unwritten, and step 3 reads every slot unconditionally. Zeroed memory
+     * makes a drop's contribution deterministically zero, matching k3_moe's per-token
+     * path (which skips the accL += entirely on a miss); malloc would blend uninitialized
+     * heap bytes into the output instead. */
+    float *contrib = (float *)calloc((size_t)T * K * Ll, sizeof(float));
     if (!ridx || !rwt || !zz || !contrib)
         k3_fatal_oom("MoE prefill batch", (size_t)T * K * Ll * sizeof(float));
 
