@@ -57,6 +57,15 @@ static const float K3_E2M1[16] = {
    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
 };
 
+/* K3_E8M0 is the analogous per-group exponent lookup (2^(byte-127), NaN-scale at 255
+ * mapped to 0), defined and lazily filled in near the MXFP4 kernels below. Forward
+ * declared here so k3_matmul_tr's WMX4 branch can use the table instead of calling
+ * ldexpf() once per (row, column) in its innermost loop -- ldexpf(1.0f, e) for an
+ * integer e is bit-identical to the precomputed value, so this changes no output. */
+static float K3_E8M0[256];
+static int   k3_e8m0_ready;
+static void  k3_e8m0_init(void);
+
 static void k3_fatal_oom(const char *what, size_t bytes)
 {
     fprintf(stderr,
@@ -720,6 +729,7 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
         const size_t stride = k3_row_bytes(K3_WMX4, in);
         const size_t pn = (size_t)in / 2u;
         const unsigned char *base = (const unsigned char *)W;
+        if (!k3_e8m0_ready) k3_e8m0_init();
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
@@ -733,7 +743,7 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
                 const unsigned char sb = row[pn + grp];
                 if (sb == 255) continue;              /* NaN scale: contributes nothing */
                 const unsigned char nib = odd ? (row[byte] >> 4) : (row[byte] & 0x0F);
-                acc += (double)x[r] * (double)K3_E2M1[nib] * (double)ldexpf(1.0f, (int)sb - 127);
+                acc += (double)x[r] * (double)K3_E2M1[nib] * (double)K3_E8M0[sb];
             }
             y[j] = (float)acc;
         }
