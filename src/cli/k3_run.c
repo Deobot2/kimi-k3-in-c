@@ -1694,7 +1694,16 @@ int main(int argc, char **argv)
             fprintf(stderr, "--spec needs --incremental; ignoring --spec\n");
             spec_n = 0;
         } else {
-            if (spec_n > K3_SPEC_MAX) spec_n = K3_SPEC_MAX;
+            /* --gen refuses rather than clamps out-of-range values ("a caller who asks
+             * for more ... should be told, not quietly handed fewer"); --spec is a
+             * performance knob rather than a correctness one (every draft is verified
+             * exactly, so a smaller depth just drafts less per sweep), so it clamps --
+             * but silently, unlike --gen, was still a footgun. Say so instead. */
+            if (spec_n > K3_SPEC_MAX) {
+                fprintf(stderr, "--spec %d exceeds this build's K3_SPEC_MAX of %d; "
+                                "using %d\n", spec_n, K3_SPEC_MAX, K3_SPEC_MAX);
+                spec_n = K3_SPEC_MAX;
+            }
             spec_snap = (float *)malloc(kper_f * (size_t)w.n_bound * sizeof(float));
             if (!spec_snap) { fprintf(stderr, "OOM for the --spec snapshot\n"); return 1; }
             printf("speculative decode: up to %d drafted tokens per sweep, n-gram lookup, "
