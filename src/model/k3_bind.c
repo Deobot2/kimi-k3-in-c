@@ -34,6 +34,7 @@ typedef struct {
     int  bad;
     int  narrow_ok;            /* 0 forces everything to fp32 (see k3_bind_layer)    */
     int  demoted;              /* a reqn() tensor was not BF16 after all             */
+    char demoted_name[224];    /* name of the FIRST one, for the fallback message    */
 } Plan;
 
 static void req_(Plan *p, const void **dest, int narrow, int64_t want, int64_t take,
@@ -105,7 +106,11 @@ static int64_t plan_resolve(Plan *p, const K3St *s)
          * wholesale. Right byte count, finite plausible numbers, wrong model is exactly
          * the failure this file's element-count check exists to prevent, and it would
          * be reintroduced one level down. */
-        if (q->narrow && q->t->dtype != K3_DT_BF16) { q->narrow = 0; p->demoted++; }
+        if (q->narrow && q->t->dtype != K3_DT_BF16) {
+            q->narrow = 0;
+            if (!p->demoted) strncpy(p->demoted_name, q->name, sizeof p->demoted_name - 1);
+            p->demoted++;
+        }
 
         /* reqn() always takes the whole tensor. If that ever changes, plan_load's raw
          * branch would write nbytes into a region sized take*2 and run off the end. */
@@ -262,8 +267,9 @@ int k3_bind_layer(const K3St *s, const K3Cfg *c, int L, K3LayerBind *b)
     /* If any large matrix is not BF16, redo the whole layer at fp32.
      * The tag is per struct, so a mixed layer cannot be described. */
     if (p.demoted) {
-        fprintf(stderr, "k3_bind: layer %d has %d large tensor(s) that are not BF16; "
-                        "binding the whole layer at fp32 instead\n", L, p.demoted);
+        fprintf(stderr, "k3_bind: layer %d has %d large tensor(s) that are not BF16 "
+                        "(first: %s); binding the whole layer at fp32 instead\n",
+                        L, p.demoted, p.demoted_name);
         memset(b, 0, sizeof *b);
         b->layer = L;
         memset(&p, 0, sizeof p);
@@ -521,8 +527,9 @@ int k3_bind_model(const K3St *s, const K3Cfg *c, int want_lm_head, K3ModelBind *
     int64_t need = plan_resolve(&p, s);
     if (need < 0) return -1;
     if (p.demoted) {                       /* same wholesale fallback as k3_bind_layer */
-        fprintf(stderr, "k3_bind: %d model-level tensor(s) are not BF16; binding the "
-                        "model-level weights at fp32 instead\n", p.demoted);
+        fprintf(stderr, "k3_bind: %d model-level tensor(s) are not BF16 (first: %s); "
+                        "binding the model-level weights at fp32 instead\n",
+                        p.demoted, p.demoted_name);
         memset(m, 0, sizeof *m);
         memset(&p, 0, sizeof p);
         p.narrow_ok = 0;
