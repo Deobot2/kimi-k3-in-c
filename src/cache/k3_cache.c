@@ -799,8 +799,12 @@ int k3_cache_dump_trace(const K3Cache *c, const char *path)
 
 int k3_cache_pin(K3Cache *c, int layer, int expert, int pin)
 {
+    /* Bounds-check layer and expert SEPARATELY: an out-of-range expert (e.g.
+     * expert == n_experts) would otherwise still land inside 0..n_layers*n_experts once
+     * folded into key, silently pinning/unpinning the wrong layer's expert 0 instead of
+     * being rejected. */
+    if (layer < 0 || layer >= c->n_layers || expert < 0 || expert >= c->n_experts) return 0;
     const int32_t key = layer * c->n_experts + expert;
-    if (key < 0 || key >= c->n_layers * c->n_experts) return 0;
     pthread_mutex_lock(&c->mu);
     const int slot = c->slot_of[key];
     if (slot >= 0) c->pinned[slot] = pin ? 1 : 0;
