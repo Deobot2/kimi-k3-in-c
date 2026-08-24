@@ -77,7 +77,12 @@ def main():
         for name, t in items:
             o, nb, dt, shape = t["off"], t["nbytes"], t["dtype"], t.get("shape", [])
             raw = run[o:o + nb]
-            if dt == "BF16" and len(shape) == 2:
+            # Same guard mxfp4_trunk.py and qdq_trunk.py use before treating raw bytes
+            # as a dense [rows, cols] array: a BF16 2D tensor whose byte count doesn't
+            # match rows*cols*2 has an unexpected layout, so reshape would either throw
+            # or (were the count divisible some other way) quietly quantize the wrong
+            # bytes into the wrong shape. Left untouched, it's copied through verbatim.
+            if dt == "BF16" and len(shape) == 2 and nb == shape[0] * shape[1] * 2:
                 f = bf16_to_f32(np.frombuffer(raw, dtype=np.uint16)).reshape(shape[0], shape[1])
                 enc, enb = quant_row_int8(f)
                 outp.write(enc)

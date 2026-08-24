@@ -366,6 +366,12 @@ def main():
         # ---- decide a scale per group, from this layer's own activations ----
         scale_of = {}          # tensor name -> s over its input dimension
         norm_div = {}          # norm tensor name -> s to divide by
+        # Every tensor widened here to search for a scale is widened AGAIN below to
+        # apply it (bf16_to_f32 is a full-tensor pass, ~16 of these per layer). Cache
+        # what the search already computed so the rebuild loop can reuse it instead of
+        # re-reading the same raw bytes; popped as each tensor is rebuilt so this never
+        # holds more than one layer's worth at once.
+        layer_W = {}
         for slot, spec in GROUPS.items():
             st = stats[li][slot] if li < len(stats) else None
             if st is None:
@@ -384,6 +390,7 @@ def main():
                 # not a consumer of it and must be left alone.
                 if W is not None and W.ndim == 2 and W.shape[1] == mean_abs.size:
                     mats.append((n, W))
+                    layer_W[n] = W
             if not mats:
                 continue
             if a.force_alpha is not None:
@@ -432,7 +439,9 @@ def main():
                 tensors[name] = {"off": at, "nbytes": len(b), "dtype": "F32", "shape": shape}
                 n_pass += 1
             elif do_q:
-                W = bf16_to_f32(np.frombuffer(raw, dtype=np.uint16)).reshape(shape)
+                W = layer_W.pop(name, None)
+                if W is None:
+                    W = bf16_to_f32(np.frombuffer(raw, dtype=np.uint16)).reshape(shape)
                 s = scale_of.get(name)
                 if s is not None:
                     W = (W * s[None, :].astype(np.float32)).astype(np.float32)
