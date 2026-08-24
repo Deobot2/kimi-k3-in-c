@@ -1557,6 +1557,10 @@ int main(int argc, char **argv)
 
     K3Cache cache;
     if (k3_cache_init(&cache, &st, &c, (int64_t)(cache_gb * 1e9)) != 0) return 1;
+    /* Only pay for the access trace when it will actually be read: --dump-cache-trace
+     * is the one consumer (tools/sim_cache.py), and recording is otherwise dead weight
+     * on the hottest lock in the cache. */
+    cache.trace_enabled = (trace_dir != NULL);
     {   /* The plan is a forecast. This is the outcome. */
         char rb[32];
         human(peak_rss_bytes(), rb, sizeof rb);

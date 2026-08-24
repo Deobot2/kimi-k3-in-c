@@ -115,6 +115,7 @@ int main(int argc, char **argv)
     /* ---- the expert cache ---- */
     K3Cache cache;
     if (k3_cache_init(&cache, &st, &c, (int64_t)(cache_gb * 1e9)) != 0) return 1;
+    cache.trace_enabled = 1;   /* this test dumps expert_trace.bin below */
     printf("expert cache: %d slots x %.2f MB = %.2f GB\n\n",
            cache.nslot, (double)cache.slot_bytes / 1e6,
            (double)cache.nslot * cache.slot_bytes / 1e9);

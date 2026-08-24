@@ -568,15 +568,23 @@ static int cache_get(K3ExpertSrc *self, int layer, int expert, K3ExpertQ *out)
 
     /* Record the request before serving it. The trace must reflect what the MODEL
      * asked for, independent of what the cache happened to hold, or replaying it at a
-     * different capacity would be meaningless. */
-    if (c->ntrace + 2 > c->captrace) {
-        int64_t nc = c->captrace ? c->captrace * 2 : (1 << 16);
-        int32_t *nt = (int32_t *)realloc(c->trace, (size_t)nc * sizeof(int32_t));
-        if (nt) { c->trace = nt; c->captrace = nc; }
-    }
-    if (c->ntrace + 2 <= c->captrace) {
-        c->trace[c->ntrace++] = layer;
-        c->trace[c->ntrace++] = expert;
+     * different capacity would be meaningless.
+     *
+     * Gated on trace_enabled: this runs on every request (1,472/token on the released
+     * model) while holding the same mutex admit()/reserve()/publish() and the
+     * speculation thread all serialize on, and the buffer it grows into is uncapped —
+     * an unwanted cost on every ordinary run, not just the --dump-cache-trace ones the
+     * trace is actually for. */
+    if (c->trace_enabled) {
+        if (c->ntrace + 2 > c->captrace) {
+            int64_t nc = c->captrace ? c->captrace * 2 : (1 << 16);
+            int32_t *nt = (int32_t *)realloc(c->trace, (size_t)nc * sizeof(int32_t));
+            if (nt) { c->trace = nt; c->captrace = nc; }
+        }
+        if (c->ntrace + 2 <= c->captrace) {
+            c->trace[c->ntrace++] = layer;
+            c->trace[c->ntrace++] = expert;
+        }
     }
     pthread_mutex_unlock(&c->mu);
 
@@ -664,11 +672,6 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
 #if defined(MADV_HUGEPAGE)
         if (huge) madvise(c->arena, want, MADV_HUGEPAGE);
 #endif
-    }
-    if (0) {
-        fprintf(stderr, "k3_cache: cannot allocate %.2f GB arena\n",
-                (double)c->nslot * c->slot_bytes / 1e9);
-        return -1;
     }
 
     const size_t nkey = (size_t)c->n_layers * c->n_experts;

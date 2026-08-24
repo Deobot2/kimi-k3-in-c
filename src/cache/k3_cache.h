@@ -209,6 +209,11 @@ typedef struct {
      * each, is 12 KB per token. */
     int32_t     *trace;
     int64_t      ntrace, captrace;
+    /* Off by default: recording runs on every request (1,472/token on the released
+     * model) under c->mu, and the buffer that grows to hold them all is never capped.
+     * The caller sets this right after k3_cache_init, once it knows whether
+     * --dump-cache-trace was actually requested. */
+    int          trace_enabled;
 } K3Cache;
 
 /* budget_bytes is the arena size; it is rounded down to whole experts. Fails if that
