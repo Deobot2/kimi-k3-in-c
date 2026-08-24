@@ -983,7 +983,29 @@ int main(int argc, char **argv)
             return 0;
         }
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
-        else { fprintf(stderr, "unknown option %s\n\n", argv[i]); usage(stderr); return 2; }
+        else {
+            /* Every option above that takes a value is gated on i + 1 < argc, so a
+             * recognized flag with its value omitted (e.g. a trailing "--gen") falls
+             * through to here indistinguishable from a genuinely unknown option. Name
+             * it correctly instead of blaming the flag itself. */
+            static const char *needs_arg[] = {
+                "--ids", "--prompt", "--prompt-file", "--tok", "--config", "--gen",
+                "--cache-gb", "--layers", "--out", "--trunk", "--spec", "--ppl-file",
+                "--ppl-dump", "--calib-dump", "--load-state", "--save-state",
+                "--draft-trunk", "--draft-trunk-gb", "--trunk-gb", "--trunk-ring",
+                "--kv-window", "--kv-sinks", "--dump-logits", "--dump-cache-trace",
+                "--preset",
+            };
+            int known = 0;
+            for (size_t k = 0; k < sizeof(needs_arg) / sizeof(needs_arg[0]); k++)
+                if (!strcmp(argv[i], needs_arg[k])) { known = 1; break; }
+            if (known && i + 1 >= argc)
+                fprintf(stderr, "%s requires an argument\n\n", argv[i]);
+            else
+                fprintf(stderr, "unknown option %s\n\n", argv[i]);
+            usage(stderr);
+            return 2;
+        }
     }
     {
         int nsrc = (ids_s != NULL) + (prompt_text != NULL) + (prompt_file != NULL);
