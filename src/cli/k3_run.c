@@ -1080,9 +1080,18 @@ int main(int argc, char **argv)
         free(ptext);
         printf("  tokenized: %ld bytes -> %d ids\n", plen, np);
     } else {
-        for (const char *p = ids_s; *p && np < K3_MAX_PROMPT; ) {
+        const char *p = ids_s;
+        while (*p && np < K3_MAX_PROMPT) {
             prompt[np++] = (int)strtol(p, (char **)&p, 10);
             while (*p == ',' || *p == ' ') p++;
+        }
+        /* Refuse rather than clamp (see the K3_MAX_PROMPT check below): if the loop
+         * stopped because it hit the cap rather than running out of input, *p is still
+         * non-NUL and the rest of --ids was silently dropped. */
+        if (*p) {
+            fprintf(stderr, "--ids has more than %d ids: this build's prompt ceiling "
+                            "is seq[%d]\n", K3_MAX_PROMPT, K3_MAX_PROMPT);
+            return 2;
         }
     }
     if (np == 0) { fprintf(stderr, "no prompt ids parsed\n"); return 2; }
@@ -2137,7 +2146,8 @@ int main(int argc, char **argv)
     }
     free(spec_snap);
     printf("--------------------------------------------------------------------\n");
-    printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total, t_total / nout);
+    printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total,
+           nout > 0 ? t_total / nout : 0.0);
 
     /* Decoded text, when a tokenizer is loaded. Printed as a distinct block rather than
      * streamed per token: a partially-decoded multi-byte sequence is not valid UTF-8, so
@@ -2166,7 +2176,8 @@ int main(int argc, char **argv)
         for (int i = 0; i < nout; i++) fprintf(f, "%s%d", i ? "," : "", outtok[i]);
         fprintf(f, "],\"full_ids\":[");
         for (int i = 0; i < T; i++) fprintf(f, "%s%d", i ? "," : "", seq[i]);
-        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f}\n", NL, t_total / nout);
+        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f}\n", NL,
+                nout > 0 ? t_total / nout : 0.0);
         fclose(f);
         printf("\nwrote %s\n", outp);
     }
