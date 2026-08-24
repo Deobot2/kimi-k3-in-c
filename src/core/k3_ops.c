@@ -1088,7 +1088,13 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
     int   *ridx = (int *)  malloc((size_t)T * K * sizeof(int));
     float *rwt  = (float *)malloc((size_t)T * K * sizeof(float));
     float *zz   = (float *)malloc((size_t)T * Ll * sizeof(float));
-    float *contrib = (float *)malloc((size_t)T * K * Ll * sizeof(float));
+    /* calloc, not malloc: a dropped expert (see EXPERT DROP below) leaves its (t,j)
+     * slots unwritten, and step 3 sums every slot unconditionally. Zeroing here makes
+     * an unwritten slot contribute nothing to the weighted sum, matching the "missing
+     * mass" semantics of the per-token path (k3_moe above), which simply skips the
+     * accumulation for a dropped expert. Without this, step 3 would fold uninitialised
+     * heap memory into the output. */
+    float *contrib = (float *)calloc((size_t)T * K * Ll, sizeof(float));
     if (!ridx || !rwt || !zz || !contrib)
         k3_fatal_oom("MoE prefill batch", (size_t)T * K * Ll * sizeof(float));
 
