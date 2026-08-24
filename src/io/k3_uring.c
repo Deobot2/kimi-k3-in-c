@@ -21,6 +21,7 @@
 
 #if defined(__linux__)
 #include <errno.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -242,7 +243,11 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
         /* ---- reap ---- */
         unsigned chead = __atomic_load_n(u->cq_head, __ATOMIC_RELAXED);
         const unsigned ctail = __atomic_load_n(u->cq_tail, __ATOMIC_ACQUIRE);
-        if (chead == ctail && posted > 0 && u->sqpoll) continue;  /* spin for SQPOLL */
+        /* SQPOLL is documented (k3_uring.h) as costing one spinning kernel thread; a bare
+         * `continue` here would spin THIS thread too, at 100% CPU, mirroring the kernel
+         * poller instead of just waiting on it. Yielding the timeslice between checks
+         * keeps that cost where the docs say it is. */
+        if (chead == ctail && posted > 0 && u->sqpoll) { sched_yield(); continue; }
         while (chead != ctail) {
             const struct io_uring_cqe *cqe = &u->cqes[chead & *u->cq_mask];
             const int64_t idx = (int64_t)cqe->user_data;
