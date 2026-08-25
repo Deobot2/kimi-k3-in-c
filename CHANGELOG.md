@@ -129,6 +129,35 @@ not needing the bytes at all.
   went over what the walk owed. The aggregate byte total could say a run went over and
   never which layers; two explanations for the 13.7% were argued from the pinned set's
   shape before this existed, and both were wrong.
+- **`--load-state`'s prior positions were invisible to every pre-flight memory guard.**
+  The KV-cache-affordability check, the position-ceiling check and both memory-plan
+  guards all sized themselves from `np + gen + 1`, but `prior` — the resumed
+  conversation's already-cached position count — was not read from the state file until
+  after all four had already run. A long resumed conversation could therefore pass every
+  guard on the new prompt alone and still hit the OOM-40-minutes-in failure they exist to
+  prevent; the actual buffer allocation was already correctly sized, so this was a false
+  negative in the guards rather than memory corruption. The state header is now peeked
+  before any of them.
+- `--preset auto` followed later by an explicit `--cache-gb` or a concrete `--preset
+  NAME` silently kept auto-sizing both budgets instead of honouring the explicit one,
+  because only a literal `--trunk-gb` cleared the `auto` flag. Both now clear it, so the
+  three flags stay order-dependent the way the surrounding comment already claimed.
+- Three unchecked allocations on OOM paths in the safetensors and trunk readers: `fd[]`/
+  `dfd[]` in `k3_st_open` were zero-filled only after both were allocated, so a partial
+  failure could close a garbage file descriptor; the directory scan's `realloc`/`malloc`
+  and `k3_trunk_open`'s ring-layer array had no NULL check at all, unlike every other
+  allocation around them.
+- Two unreachable code paths: an `if (0)` block in `k3_cache_init` duplicating the error
+  message above it, and three option branches in `k3_run.c`'s argument loop
+  (`--help`/`--version`/`--list-presets`) that the informational-flag scan earlier in
+  `main` had already made impossible to reach.
+
+### Changed
+
+- `docs/API.md` documented `k3_expert_drops` as the only global state the kernels hold,
+  and claimed no hidden global state at all in its opening paragraph. Both were wrong:
+  the activation-calibration API has carried its own file-scope sink since it was added,
+  undocumented until now.
 
 ## [1.0.0] - 2026-08-07
 
