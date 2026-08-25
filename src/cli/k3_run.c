@@ -1101,6 +1101,23 @@ int main(int argc, char **argv)
             return 2;
         }
 
+    /* Read ahead of every size guard below: a resumed session's already-cached
+     * positions (`prior`) have to be included in each of them, or a long --load-state
+     * conversation can sail past every check here on `np` alone and then hit the same
+     * OOM-40-minutes-in failure these guards exist to prevent. k3_state_peek reads only
+     * the header, so doing this before validation costs nothing; the payload is still
+     * restored later, in its original place right before the buffers it fills. */
+    K3StateHdr shd;
+    int prior = 0;
+    if (load_state) {
+        if (!incremental) {
+            fprintf(stderr, "--load-state needs --incremental\n");
+            return 2;
+        }
+        if (k3_state_peek(load_state, &shd) != 0) return 1;
+        prior = shd.nseq;
+    }
+
     /* Validate the request before allocating anything.
      *
      * Refuse rather than clamp: a caller who asks for more tokens than this build
@@ -1116,9 +1133,9 @@ int main(int argc, char **argv)
                 np, K3_MAX_PROMPT, K3_MAX_PROMPT + K3_MAX_GEN);
         return 2;
     }
-    if (np + gen + 1 > K3_MAX_PROMPT + K3_MAX_GEN) {
-        fprintf(stderr, "prompt %d + gen %d + 1 exceeds the %d-position ceiling\n",
-                np, gen, K3_MAX_PROMPT + K3_MAX_GEN);
+    if (prior + np + gen + 1 > K3_MAX_PROMPT + K3_MAX_GEN) {
+        fprintf(stderr, "prior %d + prompt %d + gen %d + 1 exceeds the %d-position "
+                        "ceiling\n", prior, np, gen, K3_MAX_PROMPT + K3_MAX_GEN);
         return 2;
     }
     /* THE REAL CONTEXT LIMIT is the MLA KV cache, not any array size. Check it against
@@ -1161,7 +1178,7 @@ int main(int argc, char **argv)
         return 2;
     }
     if (incremental) {
-        const int npos = np + gen + 1;
+        const int npos = prior + np + gen + 1;
         const double per_pos = mla_latent ? K3_KV_LATENT_BYTES_PER_POS
                                           : K3_KV_BYTES_PER_POS;
         const int held = (kv_window > 0 && kv_window < npos) ? kv_window : npos;
@@ -1259,7 +1276,7 @@ int main(int argc, char **argv)
             return 2;
         }
         const int64_t E64 = c.hidden;
-        const int Tm = np + gen + 1;
+        const int Tm = prior + np + gen + 1;
         const int Pp = c.kda_heads * c.kda_head_dim;
         const int mb_ = c.n_layers / c.attn_res_block + 2;
 
@@ -1421,7 +1438,7 @@ int main(int argc, char **argv)
         const double w_model = 2.0 * (double)c.vocab * E64 * 2    /* embed + lm_head, bf16 */
                              + 3.0 * E64 * 4;                     /* norms, aggregator */
         const double w_cache = cache_gb * 1e9;
-        const int Tm = np + gen + 1;
+        const int Tm = prior + np + gen + 1;
         const int mb = c.n_layers / c.attn_res_block + 2;
         const int Pp = c.kda_heads * c.kda_head_dim;
         const double w_state = (double)((size_t)Pp * c.kda_head_dim
@@ -1548,19 +1565,12 @@ int main(int argc, char **argv)
 
     /* ---- buffers ----
      * A resumed session must hold the saved history as well as the new tokens, so the
-     * KV cache and every per-position buffer are sized for both. The header is read
-     * here, before anything is allocated; the payload is restored after. */
-    K3StateHdr shd;
-    int prior = 0;
-    if (load_state) {
-        if (!incremental) {
-            fprintf(stderr, "--load-state needs --incremental\n");
-            return 2;
-        }
-        if (k3_state_peek(load_state, &shd) != 0) return 1;
-        prior = shd.nseq;
+     * KV cache and every per-position buffer are sized for both. `shd`/`prior` were
+     * already read, well before this point, so every size guard between here and there
+     * could see them too; the payload itself is still restored below, right before the
+     * buffers it fills. */
+    if (load_state)
         printf("resuming from %s: %d prior positions, %d new\n\n", load_state, prior, np);
-    }
     const int Tmax = prior + np + gen + 1;
     const int E = c.hidden;
     const int maxb = c.n_layers / c.attn_res_block + 2;
