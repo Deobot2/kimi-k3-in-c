@@ -931,7 +931,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) { gen = atoi(argv[++i]); gen_set = 1; }
-        else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) {
+            cache_gb = atof(argv[++i]);
+            budget_auto = 0;   /* an explicit size always wins, like --trunk-gb */
+        }
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) want_layers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
         else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
@@ -971,11 +974,15 @@ int main(int argc, char **argv)
                 k3_preset_list(stderr);
                 return 2;
             }
-            /* A preset sets the budget; an explicit --trunk-gb/--cache-gb after it still
-             * wins, because the flags are applied in argv order. */
+            /* A preset sets the budget; an explicit --trunk-gb/--cache-gb/--preset after
+             * it still wins, because the flags are applied in argv order. That order-
+             * dependence only holds if THIS branch also clears budget_auto: without it,
+             * "--preset auto --preset laptop" left auto sticky, and the auto sizing
+             * further down silently overwrote the laptop budget it had just printed. */
             trunk_gb = p->trunk_gb;
             cache_gb = p->cache_gb;
             preset_name = p->name;
+            budget_auto = 0;
         }
         /* --list-presets, --version, --help/-h are handled by the scan above, which
          * covers this whole range (i=1..argc-1) before this loop ever runs, so a branch
