@@ -9,8 +9,8 @@ For embedding the engine rather than using the `k3` binary. The public surface i
 ```
 
 The API is deliberately small: a configuration struct, weight-binding structs, and the
-kernels. There is no context object and no hidden global state, everything a call needs
-is passed to it.
+kernels. There is no context object; almost everything a call needs is passed to it. The
+two exceptions are opt-in and documented under Thread safety below.
 
 ## Configuration
 
@@ -166,6 +166,22 @@ Experts stay in packed MXFP4 throughout. `k3_matmul_mxfp4` consumes nibbles dire
 never materialises a dequantised matrix, one expert is 17.5 MB packed against 132 MB
 expanded, and a token touches 1,472 of them.
 
+## Activation calibration
+
+```c
+k3_calib_begin(cfg.n_layers);
+/* run the model over a representative document set; k3_decoder_layer_kv calls
+   k3_calib_layer and k3_calib_observe internally whenever collection is on */
+k3_calib_write("calib.bin");
+k3_calib_end();
+```
+
+Off unless `k3_calib_begin` has been called (`k3_calib_active` reports which), this
+accumulates per-input-channel activation statistics for `tools/awq_trunk.py`. It is a
+deliberate **file-scope sink** rather than a context threaded through the hot kernels,
+so it costs one NULL test per call when off; see the note beside the `K3_CAL_*` enum in
+`include/k3/k3.h` for why. Not reentrant: one calibration pass at a time per process.
+
 ## Error handling
 
 Two failure modes need explicit attention from callers.
@@ -187,7 +203,8 @@ if (k3_expert_drops) {
 ## Thread safety
 
 The kernels are reentrant and parallelise internally with OpenMP. They hold no global
-state except `k3_expert_drops`.
+state except `k3_expert_drops` and the activation-calibration sink (above), which is
+inert unless `k3_calib_begin` has been called.
 
 The safetensors index is **not** thread-safe. One inference at a time per instance.
 
