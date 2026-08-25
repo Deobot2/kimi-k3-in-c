@@ -373,9 +373,23 @@ int k3_st_open(K3St *s, const char *dir)
     while ((e = readdir(d))) {
         size_t n = strlen(e->d_name);
         if (n < 12 || strcmp(e->d_name + n - 12, ".safetensors")) continue;
-        if (nf == cf) { cf = cf ? cf * 2 : 32; files = (char **)realloc(files, cf * sizeof *files); }
+        if (nf == cf) {
+            cf = cf ? cf * 2 : 32;
+            char **nfiles = (char **)realloc(files, cf * sizeof *files);
+            if (!nfiles) {
+                fprintf(stderr, "k3_st: out of memory listing %s\n", dir);
+                for (int i = 0; i < nf; i++) free(files[i]);
+                free(files); closedir(d); return -1;
+            }
+            files = nfiles;
+        }
         size_t len = strlen(dir) + 1 + n + 1;
         files[nf] = (char *)malloc(len);
+        if (!files[nf]) {
+            fprintf(stderr, "k3_st: out of memory listing %s\n", dir);
+            for (int i = 0; i < nf; i++) free(files[i]);
+            free(files); closedir(d); return -1;
+        }
         snprintf(files[nf], len, "%s/%s", dir, e->d_name);
         nf++;
     }
@@ -386,13 +400,19 @@ int k3_st_open(K3St *s, const char *dir)
     qsort(files, nf, sizeof *files, cmp_str);
 
     s->path = files; s->nshard = nf;
+    /* Each array is initialised right after its OWN allocation, not after both. If fd
+     * succeeds and dfd fails, k3_st_close below still walks fd[0..nf) looking for
+     * entries >= 0 to close(); leaving it uninitialised until after this check would
+     * make that a read of garbage malloc bytes, and closing whatever descriptor one of
+     * them happens to resemble. */
     s->fd  = (int *)malloc(nf * sizeof(int));
+    if (s->fd) for (int i = 0; i < nf; i++) s->fd[i] = -1;
     s->dfd = (int *)malloc(nf * sizeof(int));
+    if (s->dfd) for (int i = 0; i < nf; i++) s->dfd[i] = -1;
     /* k3_st_close, not free(files): s->path was aliased to `files` two lines above, so
      * freeing it here leaves s->path dangling and k3_st_close would free it a second
      * time. Let the one function that owns the teardown do all of it. */
     if (!s->fd || !s->dfd) { k3_st_close(s); return -1; }
-    for (int i = 0; i < nf; i++) { s->fd[i] = -1; s->dfd[i] = -1; }
 
     Build b; memset(&b, 0, sizeof b);
     for (int i = 0; i < nf; i++) {
