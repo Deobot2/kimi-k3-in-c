@@ -431,6 +431,37 @@ static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
     if (!f) { perror(path); return -1; }
     if (fseek(f, (long)sizeof *hd, SEEK_SET) != 0) { fclose(f); return -1; }
 
+    /* hd->kper, hd->kvpp and hd->ropepp are read from the file and otherwise feed
+     * straight into fread() sizes and destination offsets against buffers sized by the
+     * LOCAL config (kper by the caller's malloc, kvpp/ropepp by k3_run's kvper/rpper
+     * calloc). A file claiming a larger per-layer stride than this run's config would
+     * overrun those buffers; the config fingerprint check above already proves this
+     * layer geometry is a function of the config, so a mismatch here means a truncated,
+     * corrupted, or hand-edited header, and is refused the same way the latent
+     * kv_row_floats mismatch already is below. */
+    {
+        const int64_t p_local = (int64_t)c->kda_heads * c->kda_head_dim;
+        const int64_t kper_local = p_local * c->kda_head_dim
+                                  + 3 * p_local * (c->conv_k - 1);
+        if (hd->nseq < 0 || hd->kper != kper_local) {
+            fprintf(stderr, "REFUSING: %s has an invalid or mismatched recurrent-state "
+                            "layout (kper %lld, expected %lld).\n",
+                    path, (long long)hd->kper, (long long)kper_local);
+            fclose(f); return -1;
+        }
+        if (w->kv_mode == K3_KV_EXPANDED) {
+            const int64_t kvpp_local = (int64_t)c->n_heads * (c->qk_nope + c->v_head);
+            const int64_t ropepp_local = c->qk_rope;
+            if (hd->kvpp != kvpp_local || hd->ropepp != ropepp_local) {
+                fprintf(stderr, "REFUSING: %s has a mismatched KV layout "
+                                "(kvpp %lld/%lld, ropepp %lld/%lld).\n",
+                        path, (long long)hd->kvpp, (long long)kvpp_local,
+                        (long long)hd->ropepp, (long long)ropepp_local);
+                fclose(f); return -1;
+            }
+        }
+    }
+
     int rc = 0;
     if (fread(seq, sizeof(int), (size_t)hd->nseq, f) != (size_t)hd->nseq) rc = -1;
     if (!rc && fread(ks, sizeof(float), (size_t)hd->kper * w->n_bound, f)
