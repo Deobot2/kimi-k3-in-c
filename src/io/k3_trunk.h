@@ -161,6 +161,13 @@ typedef struct {
      * both wrong. k3_trunk_report prints the offenders. */
     uint32_t    *reads_of;
     double       load_seconds;
+    /* Wall clock around the whole of k3_trunk_bind, and of that, the widen loop's own
+     * share; bind_wall - load_seconds - widen_wall is time neither the pread loop nor
+     * the widen loop accounts for. Per-instance rather than global: a hybrid run opens a
+     * second K3Trunk for --draft-trunk, and a global would mix the draft trunk's binds
+     * into the main trunk's report. */
+    double       bind_wall, widen_wall;
+    long         binds;
 } K3Trunk;
 
 /* Read ONLY the manifest: total packed bytes, layer count, and whether the weights were
