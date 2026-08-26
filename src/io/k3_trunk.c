@@ -503,7 +503,11 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
            "a pinned SET is used instead)\n", 100.0 * npin / tr->n_layers);
     return 0;
 bad:
+    /* By the time any goto here fires, tr->json_root/json_arena and possibly tr->lay
+     * (with some layers' tensor arrays) are already set; k3_trunk_close frees all of it
+     * and tolerates the NULL sub-pointers nothing has reached yet. */
     free(txt);
+    k3_trunk_close(tr);
     return -1;
 }
 
