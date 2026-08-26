@@ -962,7 +962,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) { gen = atoi(argv[++i]); gen_set = 1; }
-        else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) { cache_gb = atof(argv[++i]); budget_auto = 0; }
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) want_layers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
         else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
@@ -1003,10 +1003,13 @@ int main(int argc, char **argv)
                 return 2;
             }
             /* A preset sets the budget; an explicit --trunk-gb/--cache-gb after it still
-             * wins, because the flags are applied in argv order. */
+             * wins, because the flags are applied in argv order. Also clears budget_auto
+             * so a `--preset auto` earlier on the line doesn't override this preset's
+             * fixed numbers with a freshly computed auto budget below. */
             trunk_gb = p->trunk_gb;
             cache_gb = p->cache_gb;
             preset_name = p->name;
+            budget_auto = 0;
         }
         else if (!strcmp(argv[i], "--list-presets")) { k3_preset_list(stdout); return 0; }
         else if (!strcmp(argv[i], "--version")) {
@@ -1148,6 +1151,10 @@ int main(int argc, char **argv)
      * than letting a long prompt get 40 minutes into a run and then be OOM-killed. Only
      * incremental decode allocates the KV cache; full recompute carries no cache. */
     /* ---- KV layout, and the flags that only make sense together ---- */
+    if (load_state && !incremental) {
+        fprintf(stderr, "--load-state needs --incremental\n");
+        return 2;
+    }
     if (mla_latent && !incremental) {
         fprintf(stderr, "--mla-latent needs --incremental: without a carried cache "
                         "there is no KV layout to choose\n");
@@ -1575,10 +1582,6 @@ int main(int argc, char **argv)
     K3StateHdr shd;
     int prior = 0;
     if (load_state) {
-        if (!incremental) {
-            fprintf(stderr, "--load-state needs --incremental\n");
-            return 2;
-        }
         if (k3_state_peek(load_state, &shd) != 0) return 1;
         prior = shd.nseq;
         printf("resuming from %s: %d prior positions, %d new\n\n", load_state, prior, np);
