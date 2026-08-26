@@ -396,6 +396,27 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
  * from x and caches nothing. Both paths must produce identical output; the op fixtures
  * gate the uncached path and tests/unit/k3_model.c gates them against each other.
  */
+/* Shared prefix of k3_mla_cached and k3_mla_latent: project one token's input into its
+ * query and its pre-norm compressed KV latent (kv_lora floats) plus the shared,
+ * unrotated rope slot (qr floats) that follows it in ct. Identical in both callers up
+ * to exactly this point -- they diverge only in what happens to ct next: the expanded
+ * path runs it through kv_b into the KV cache, the latent path caches ct itself. Kept
+ * as one function so the two paths cannot drift apart by a missed edit to one copy. */
+static void k3_mla_project(float *q_row, float *ct, float *ql, const float *xt,
+                           const K3MlaW *w, const K3Cfg *c, int H, int qh, int kvw)
+{
+    k3_mmw(ql, xt, w->q_a, w->wdt, c->hidden, c->q_lora);
+    k3_rmsnorm(ql, ql, w->q_a_norm, c->q_lora, c->rms_eps);
+    if (g_cal) k3_calib_observe(K3_CAL_QA, ql, 1, c->q_lora);
+    k3_mmw(q_row, ql, w->q_b, w->wdt, c->q_lora, H * qh);
+
+    /* ONE projection emits the compressed latent AND the shared rope slot */
+    k3_mmw(ct, xt, w->kv_a, w->wdt, c->hidden, kvw);
+    /* the norm covers the latent only, never the rope slot */
+    k3_rmsnorm(ct, ct, w->kv_a_norm, c->kv_lora, c->rms_eps);
+    if (g_cal) k3_calib_observe(K3_CAL_KVA, ct, 1, c->kv_lora);
+}
+
 void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                    int T, float *scratch,
                    float *kvc, float *ropec, int cached, int cap)
@@ -433,16 +454,7 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
         const float *xt = x + (size_t)t * E;
-        k3_mmw(ql, xt, w->q_a, w->wdt, E, c->q_lora);
-        k3_rmsnorm(ql, ql, w->q_a_norm, c->q_lora, c->rms_eps);
-        if (g_cal) k3_calib_observe(K3_CAL_QA, ql, 1, c->q_lora);
-        k3_mmw(q + (size_t)t * H * qh, ql, w->q_b, w->wdt, c->q_lora, H * qh);
-
-        /* ONE projection emits the compressed latent AND the shared rope slot */
-        k3_mmw(ct, xt, w->kv_a, w->wdt, E, kvw);
-        /* the norm covers the latent only, never the rope slot */
-        k3_rmsnorm(ct, ct, w->kv_a_norm, c->kv_lora, c->rms_eps);
-        if (g_cal) k3_calib_observe(K3_CAL_KVA, ct, 1, c->kv_lora);
+        k3_mla_project(q + (size_t)t * H * qh, ct, ql, xt, w, c, H, qh, kvw);
         memcpy(K3_ROPE_AT(p), ct + c->kv_lora, (size_t)qr * sizeof(float));
         k3_mmw(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, H * kvd);
     }
@@ -544,18 +556,11 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         const float *xt = x + (size_t)t * E;
 
         /* ---- projections. Identical to the expanded path up to the point where it
-         * would have called kv_b, which is exactly the call absorption removes. ---- */
-        k3_mmw(ql, xt, w->q_a, w->wdt, E, c->q_lora);
-        k3_rmsnorm(ql, ql, w->q_a_norm, c->q_lora, c->rms_eps);
-        if (g_cal) k3_calib_observe(K3_CAL_QA, ql, 1, c->q_lora);
-        k3_mmw(q + (size_t)t * H * qh, ql, w->q_b, w->wdt, c->q_lora, H * qh);
-
-        k3_mmw(ct, xt, w->kv_a, w->wdt, E, kvw);
-        /* the norm covers the latent only, never the rope slot -- so the 576 floats
-         * stored below are byte-for-byte what the expanded path fed to kv_b and to the
-         * rope row, and a cache written by one layout means the same thing to the other */
-        k3_rmsnorm(ct, ct, w->kv_a_norm, c->kv_lora, c->rms_eps);
-        if (g_cal) k3_calib_observe(K3_CAL_KVA, ct, 1, c->kv_lora);
+         * would have called kv_b, which is exactly the call absorption removes: the
+         * 576 floats k3_mla_project leaves in ct are byte-for-byte what the expanded
+         * path feeds to kv_b and to the rope row, so a cache written by one layout
+         * means the same thing to the other. ---- */
+        k3_mla_project(q + (size_t)t * H * qh, ct, ql, xt, w, c, H, qh, kvw);
         {
             const int slot = k3_kv_slot(kv, p);
             if (slot < 0)
