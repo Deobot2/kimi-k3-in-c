@@ -92,6 +92,22 @@ not needing the bytes at all.
 - Saved state records the KV layout and window geometry and refuses a mismatch: the two
   caches hold different tensors of the same float count, so restoring one as the other
   would be fluent and wrong. State version 1 → 2.
+- **Three hot kernels no longer malloc/free a scratch temporary on every call.**
+  `k3_kda_step` (H×T calls per KDA layer), `k3_router` (once per token per MoE layer)
+  and `k3_attn_res` (up to twice per token per layer) together were on the order of 270
+  malloc/free pairs per decoded token. All three now take a caller-owned scratch buffer
+  instead, sized by the same `k3_*_scratch()` functions callers already use to size
+  everything else. No numerical change — same arithmetic, same accumulation order,
+  verified bit-exact against their op fixtures and the full-model oracle.
+- `k3_mla_cached` and `k3_mla_latent` shared their query / KV-latent projection code
+  verbatim, including the calibration-observe calls. Factored into `k3_mla_project()`
+  so a future fix to one path cannot silently miss the other.
+- `--preset auto`'s budget sizing and the pre-flight admission check computed the same
+  memory estimate with two formulas that had already drifted — auto sized the recurrent
+  state by the config's full layer count where the admission check correctly used the
+  layers actually bound under `--layers`. Unified into one `k3_mem_estimate()`.
+- Removed a dead, unreachable `if (0)` error branch in `k3_cache_init`, a refactor
+  leftover duplicating the real allocation-failure message right above it.
 
 ### Fixed
 
@@ -129,6 +145,32 @@ not needing the bytes at all.
   went over what the walk owed. The aggregate byte total could say a run went over and
   never which layers; two explanations for the 13.7% were argued from the pinned set's
   shape before this existed, and both were wrong.
+- **`--load-state` could overrun its recurrent-state and expanded-KV buffers on a
+  truncated, corrupted, or hand-edited state file.** `hd->kper` (recurrent state
+  stride) and, on the expanded KV path, `hd->kvpp`/`hd->ropepp` fed straight into
+  `fread()` sizes and destination-offset multipliers against buffers sized by the local
+  config; only the latent path's `kv_row_floats` was ever checked for a mismatch. Now
+  refused the same way the latent path already was.
+- `--load-state` without `--incremental` was only caught after the trunk was bound and
+  the expert cache initialized — a multi-minute, 100+ GB operation on the released
+  checkpoint. Moved next to `--mla-latent`'s own `--incremental` requirement, before
+  anything is allocated.
+- `budget_auto` (set by `--trunk-gb auto` or `--preset auto`) was only ever cleared by a
+  later `--trunk-gb NUM`. `--cache-gb` and a later named `--preset` left it set, so e.g.
+  `--preset auto --cache-gb 30` silently discarded the explicit `--cache-gb` once
+  auto-sizing ran. Both branches now clear it too.
+- `K3Trunk`'s bind-timing counters (`bind_wall`/`widen_wall`/`binds`) were process-global
+  rather than per-instance, so a hybrid `--draft-trunk` run's second `K3Trunk` inflated
+  the bind count and timing breakdown `k3_trunk_report` printed for the main trunk.
+  Moved onto `K3Trunk` itself.
+- `k3_trunk_open`'s `bad:` error path only freed the raw JSON text, leaking the parsed
+  manifest tree and any per-layer tensor arrays already allocated when a layer entry was
+  malformed or a `calloc` failed mid-parse. Now calls `k3_trunk_close`, which frees
+  exactly this and tolerates the sub-pointers nothing has reached yet.
+- `k3_cache_pin` range-checked only the combined `layer*n_experts + expert` key, so an
+  out-of-range `expert` paired with an in-range `layer` could alias into a different
+  layer's valid key. No current caller exercises `k3_cache_pin`, but it is now checked
+  the way `cache_get` already is.
 
 ## [1.0.0] - 2026-08-07
 
