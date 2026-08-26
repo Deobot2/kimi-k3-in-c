@@ -778,6 +778,45 @@ static double mem_available_bytes(void)
     return kb * 1024.0;
 }
 
+/* Fixed-cost memory estimate shared by --preset auto's budget sizing and the pre-flight
+ * admission check: embed/lm_head + norms, the recurrent state for NL layers, the
+ * per-token buffers, and (if incremental) the MLA KV cache. Both call sites need
+ * exactly this, from the config and the request actually being run rather than from
+ * memory of one checkpoint; keeping ONE copy means a fix to one estimate cannot drift
+ * from the other the way w_state once did here (auto sized it by c->n_layers while the
+ * admission check correctly used NL, the layers actually bound under --layers). */
+typedef struct { double model, state, buf, kv; } K3MemEstimate;
+
+static K3MemEstimate k3_mem_estimate(const K3Cfg *c, int T, int NL,
+                                     int incremental, int mla_latent, int kv_window)
+{
+    K3MemEstimate m;
+    const int64_t E64 = c->hidden;
+    const int mb = c->n_layers / c->attn_res_block + 2;
+    const int Pp = c->kda_heads * c->kda_head_dim;
+
+    m.model = 2.0 * (double)c->vocab * E64 * 2      /* embed + lm_head, bf16 */
+            + 3.0 * E64 * 4;                        /* norms, aggregator    */
+    m.state = (double)((size_t)Pp * c->kda_head_dim
+                      + (size_t)3 * Pp * (c->conv_k - 1)) * NL * 4;
+    m.buf = ((double)T * E64 + (double)T * mb * E64
+           + (double)k3_layer_scratch(c, T) + (double)c->vocab) * 4;
+
+    /* The KV cache MUST be in this total: it is the only term that grows with context,
+     * so an estimate that omits it is blind to the one thing it exists to catch.
+     * k3_mla_cached stores expanded per-head k and v plus the shared rope slot, in
+     * fp32, across every MLA layer -- 2.37 MB per position at the released dimensions,
+     * so a 4096-token prompt alone is 9.7 GB. */
+    int n_mla = 0;
+    for (int L = 0; L < c->n_layers; L++) if (k3_is_mla(c, L)) n_mla++;
+    const int kv_pos = (kv_window > 0 && kv_window < T) ? kv_window : T;
+    m.kv = !incremental ? 0.0
+        : mla_latent ? (double)kv_pos * n_mla * (c->kv_lora + c->qk_rope) * 4
+                     : (double)T * n_mla
+                       * ((double)c->n_heads * (c->qk_nope + c->v_head) + c->qk_rope) * 4;
+    return m;
+}
+
 /* One full forward over T tokens, writing logits for the LAST position only. Every
  * step rebuilds state from scratch, matching the path the oracle validates.
  *
@@ -1053,6 +1092,10 @@ int main(int argc, char **argv)
                "model; it is a partial stack for testing the machinery.\n\n",
                want_layers, c.n_layers);
     }
+    /* Computed once, up front, so every memory estimate below -- auto-budget sizing and
+     * the pre-flight admission check alike -- reasons about the layers actually being
+     * bound rather than the config's full count. */
+    const int NL = (want_layers > 0 && want_layers < c.n_layers) ? want_layers : c.n_layers;
 
     /* ---- prompt ----
      * Three entry points, one representation. --ids is the reproducible channel every
@@ -1288,28 +1331,15 @@ int main(int argc, char **argv)
                             "--trunk-gb/--cache-gb on this platform\n");
             return 2;
         }
-        const int64_t E64 = c.hidden;
         const int Tm = np + gen + 1;
-        const int Pp = c.kda_heads * c.kda_head_dim;
-        const int mb_ = c.n_layers / c.attn_res_block + 2;
 
-        /* Everything that lives outside both budgets, from the config rather than from
-         * memory of one checkpoint. */
-        const double w_model = 2.0 * (double)c.vocab * E64 * 2 + 3.0 * E64 * 4;
-        const double w_state = (double)((size_t)Pp * c.kda_head_dim
-                             + (size_t)3 * Pp * (c.conv_k - 1)) * c.n_layers * 4;
-        const double w_buf = ((double)Tm * E64 + (double)Tm * mb_ * E64
-                            + (double)k3_layer_scratch(&c, Tm) + (double)c.vocab) * 4;
-        int n_mla_ = 0, n_moe_ = 0;
-        for (int L = 0; L < c.n_layers; L++) {
-            if (k3_is_mla(&c, L)) n_mla_++;
-            if (!k3_is_dense(&c, L)) n_moe_++;
-        }
-        const int kv_pos = (kv_window > 0 && kv_window < Tm) ? kv_window : Tm;
-        const double w_kv = !incremental ? 0.0
-            : mla_latent ? (double)kv_pos * n_mla_ * (c.kv_lora + c.qk_rope) * 4
-                         : (double)Tm * n_mla_
-                           * ((double)c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope) * 4;
+        /* Everything that lives outside both budgets, from the config and NL (the
+         * layers actually being bound) rather than from memory of one checkpoint. */
+        const K3MemEstimate est = k3_mem_estimate(&c, Tm, NL, incremental, mla_latent, kv_window);
+        const double w_model = est.model, w_state = est.state;
+        const double w_buf = est.buf,     w_kv    = est.kv;
+        int n_moe_ = 0;
+        for (int L = 0; L < c.n_layers; L++) if (!k3_is_dense(&c, L)) n_moe_++;
 
         /* 2 GB + 2% margin on top, so auto never invites the OOM killer. */
         const double reserve = (w_model + w_state + w_buf + w_kv) / 1e9
@@ -1419,7 +1449,6 @@ int main(int argc, char **argv)
 
     /* ---- how much will this take? Report BEFORE allocating, so a box that cannot
      * hold it fails with a number rather than an OOM kill. ---- */
-    const int NL = (want_layers > 0 && want_layers < c.n_layers) ? want_layers : c.n_layers;
     int64_t total = 0; int missing = 0;
     for (int L = 0; L < NL; L++) {
         const int64_t n = k3_bind_layer_bytes(&st, &c, L);
@@ -1446,31 +1475,12 @@ int main(int argc, char **argv)
      * binding wastes the whole load and reports nothing useful; a refusal with the two
      * numbers side by side says exactly what box this needs. */
     {
-        const int64_t E64 = c.hidden;
         const double w_trunk = trunk_dir ? trunk_gb * 1e9 : (double)total;
-        const double w_model = 2.0 * (double)c.vocab * E64 * 2    /* embed + lm_head, bf16 */
-                             + 3.0 * E64 * 4;                     /* norms, aggregator */
         const double w_cache = cache_gb * 1e9;
         const int Tm = np + gen + 1;
-        const int mb = c.n_layers / c.attn_res_block + 2;
-        const int Pp = c.kda_heads * c.kda_head_dim;
-        const double w_state = (double)((size_t)Pp * c.kda_head_dim
-                              + (size_t)3 * Pp * (c.conv_k - 1)) * NL * 4;
-        const double w_buf = ((double)Tm * E64 + (double)Tm * mb * E64
-                              + (double)k3_layer_scratch(&c, Tm) + (double)c.vocab) * 4;
-        /* The KV cache MUST be in this total: it is the only term that grows with
-         * context, so a guard that omits it is blind to the one thing it exists to
-         * catch. k3_mla_cached stores expanded per-head k and v plus the shared rope
-         * slot, in fp32, across all 24 MLA layers -- 2.37 MB per position, so a
-         * 4096-token prompt alone is 9.7 GB. */
-        int n_mla = 0;
-        for (int L = 0; L < c.n_layers; L++) if (k3_is_mla(&c, L)) n_mla++;
-        const int kv_pos = (kv_window > 0 && kv_window < Tm) ? kv_window : Tm;
-        const double w_kv = !incremental ? 0.0
-            : mla_latent
-              ? (double)kv_pos * n_mla * (double)(c.kv_lora + c.qk_rope) * 4
-              : (double)Tm * n_mla
-                * ((double)c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope) * 4;
+        const K3MemEstimate est = k3_mem_estimate(&c, Tm, NL, incremental, mla_latent, kv_window);
+        const double w_model = est.model, w_state = est.state;
+        const double w_buf   = est.buf,   w_kv    = est.kv;
         const double need_b = w_trunk + w_model + w_cache + w_state + w_buf + w_kv;
         const double have = mem_available_bytes();
 
