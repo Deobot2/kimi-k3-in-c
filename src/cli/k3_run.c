@@ -858,13 +858,14 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     if (w->mb.out_res_norm && w->mb.out_res_proj) {
         float *fold = scratch;
         float *src  = fold + E;
+        float *asc  = src + (size_t)maxb * E;   /* attn_res score, same bound as src */
         for (int i = 0; i < E; i++) fold[i] = w->mb.out_res_norm[i] * w->mb.out_res_proj[i];
         for (int t = 0; t < T; t++) {
             for (int b = 0; b < nb; b++)
                 memcpy(src + (size_t)b * E, br + ((size_t)t * maxb + b) * E,
                        (size_t)E * sizeof(float));
             memcpy(src + (size_t)nb * E, h + (size_t)t * E, (size_t)E * sizeof(float));
-            k3_attn_res(h + (size_t)t * E, src, fold, nb + 1, E, c->rms_eps);
+            k3_attn_res(h + (size_t)t * E, src, fold, nb + 1, E, c->rms_eps, asc);
         }
     }
 

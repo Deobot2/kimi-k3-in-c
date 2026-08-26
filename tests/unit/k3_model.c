@@ -208,13 +208,14 @@ static void forward(Model *m, const K3Cfg *c, const int *ids, int T, float *logi
     if (m->out_res_norm && m->out_res_proj) {
         float *fold = scratch;
         float *src  = fold + E;
+        float *asc  = src + (size_t)maxb * E;
         for (int i = 0; i < E; i++) fold[i] = m->out_res_norm[i] * m->out_res_proj[i];
         for (int t = 0; t < T; t++) {
             for (int b = 0; b < nb; b++)
                 memcpy(src + (size_t)b * E, br + ((size_t)t * maxb + b) * E,
                        (size_t)E * sizeof(float));
             memcpy(src + (size_t)nb * E, h + (size_t)t * E, (size_t)E * sizeof(float));
-            k3_attn_res(h + (size_t)t * E, src, fold, nb + 1, E, c->rms_eps);
+            k3_attn_res(h + (size_t)t * E, src, fold, nb + 1, E, c->rms_eps, asc);
         }
     }
 
@@ -295,6 +296,7 @@ static int decode_inc(Model *m, const K3Cfg *c, const int *full, int np, int T,
             }
             /* model-level aggregator and head, on the LAST new position */
             float *fold = sc, *src = fold + E;
+            float *asc = src + (size_t)maxb * E;
             const int lastt = nT - 1;
             if (m->out_res_norm && m->out_res_proj) {
                 for (int i = 0; i < E; i++)
@@ -304,7 +306,7 @@ static int decode_inc(Model *m, const K3Cfg *c, const int *full, int np, int T,
                            (size_t)E * sizeof(float));
                 memcpy(src + (size_t)nb * E, h + (size_t)lastt * E,
                        (size_t)E * sizeof(float));
-                k3_attn_res(h + (size_t)lastt * E, src, fold, nb + 1, E, c->rms_eps);
+                k3_attn_res(h + (size_t)lastt * E, src, fold, nb + 1, E, c->rms_eps, asc);
             }
             float *nrm = sc;
             k3_rmsnorm(nrm, h + (size_t)lastt * E, m->final_norm, E, c->rms_eps);

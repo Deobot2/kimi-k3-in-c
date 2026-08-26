@@ -768,15 +768,8 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 /* ---------------------------------------------------------------- router ---- */
 void k3_router(int *idx, float *w, const float *x, const float *W,
                const float *bias, int hidden, int n_experts, int topk,
-               int renorm, float routed_scale)
+               int renorm, float routed_scale, float *score, float *choice)
 {
-    /* Returning early here would leave idx[] and w[] untouched, and k3_moe forms
-     * `w->w1 + idx[j]*I*L` from them one line later -- an arbitrary pointer built from
-     * uninitialised stack. */
-    float *score  = (float *)malloc((size_t)n_experts * sizeof(float));
-    float *choice = (float *)malloc((size_t)n_experts * sizeof(float));
-    if (!score || !choice) k3_fatal_oom("router scores", (size_t)n_experts * sizeof(float) * 2);
-
     /* logits in float32 with no bias, then an independent sigmoid per expert. The
      * reference upcasts both operands explicitly; a double accumulator here matches
      * it and costs nothing at this width. */
@@ -823,18 +816,13 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
         for (int j = 0; j < topk; j++) w[j] *= inv;
     }
     for (int j = 0; j < topk; j++) w[j] *= routed_scale;
-
-    free(score); free(choice);
 }
 
 /* --------------------------------------------------------------- AttnRes ---- */
 void k3_attn_res(float *out, const float *src, const float *fold,
-                 int nsrc, int n, float eps)
+                 int nsrc, int n, float eps, float *score_scratch)
 {
-    /* Returning early would leave `out` holding the previous layer's residual, which
-     * the caller cannot distinguish from a computed one. */
-    float *score = (float *)malloc((size_t)nsrc * sizeof(float));
-    if (!score) k3_fatal_oom("AttnRes scores", (size_t)nsrc * sizeof(float));
+    float *score = score_scratch;
 
     for (int s = 0; s < nsrc; s++) {
         const float *v = src + (size_t)s * n;
@@ -858,7 +846,6 @@ void k3_attn_res(float *out, const float *src, const float *fold,
         const float *v = src + (size_t)s * n;   /* the RAW source, not the key */
         for (int i = 0; i < n; i++) out[i] += p * v[i];
     }
-    free(score);
 }
 
 /* Exact scratch requirement for k3_mla. Callers should use this rather than
@@ -917,6 +904,8 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
     float *sgu  = edn  + L;             /* [2*SI] shared gate|up            */
     float *sact = sgu  + 2 * SI;        /* [SI]   shared after SiTU         */
     float *sdn  = sact + SI;            /* [E]    shared down-projection    */
+    float *rsc  = sdn  + E;             /* [n_experts] router score         */
+    float *rch  = rsc  + c->n_experts;  /* [n_experts] router choice        */
 
     /* Before the router has seen anything, tell the source we are here. It knows what
      * this layer wanted last time and can start those reads now, so they overlap the
@@ -932,7 +921,7 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
 
         /* 1. route on the FULL width, before the down-projection */
         k3_router(idx, wt, xt, w->gate, w->bias, E, c->n_experts, c->topk,
-                  c->moe_renorm, c->routed_scale);
+                  c->moe_renorm, c->routed_scale, rsc, rch);
 
         int nk = c->topk;
         /* Draft cache-only routing: keep only the top-k experts already resident, and
@@ -1021,7 +1010,8 @@ size_t k3_moe_scratch(const K3Cfg *c)
          + (size_t)3 * c->moe_inter       /* gu (2*I) + act (I) */
          + (size_t)c->latent              /* edn                */
          + (size_t)3 * SI                 /* sgu (2*SI) + sact  */
-         + (size_t)c->hidden;             /* sdn                */
+         + (size_t)c->hidden              /* sdn                */
+         + (size_t)2 * c->n_experts;      /* router score, choice */
 }
 
 /* Batched MoE for PREFILL over a chunk of T tokens, streamed experts only.
@@ -1078,6 +1068,12 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
 {
     const int E = c->hidden, Ll = c->latent, I = c->moe_inter;
     const int SI = I * c->n_shared, K = c->topk;
+    /* Router scratch, placed past where gu(2*I)/act(I)/edn(Ll) land below: those are
+     * untouched until step 2, well after every router() call in step 1 below has
+     * finished with these. k3_moe_scratch's total budget has ample room past this
+     * offset (its own layout is larger than this function's peak usage). */
+    float *rsc = scratch + 3 * I + Ll;
+    float *rch = rsc + c->n_experts;
 
     /* Per-token routing decisions and latent inputs, plus a contribution buffer holding
      * every routed expert's latent output for every token: [T][K][Ll]. At T=32, K=16,
@@ -1102,7 +1098,7 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         int   *it = ridx + (size_t)t * K;
         float *wtt = rwt + (size_t)t * K;
         k3_router(it, wtt, xt, w->gate, w->bias, E, c->n_experts, K,
-                  c->moe_renorm, c->routed_scale);
+                  c->moe_renorm, c->routed_scale, rsc, rch);
         k3_mmw(zz + (size_t)t * Ll, xt, w->down, w->wdt, E, Ll);
         for (int j = 0; j < K; j++) {
             const int e = it[j];
@@ -1311,10 +1307,13 @@ size_t k3_layer_scratch_kv(const K3Cfg *c, int T, int span, int mode)
     size_t m = k3_moe_scratch(c);
     size_t sub = a > b ? a : b;
     if (m > sub) sub = m;
-    /* prefix_sum, tmp, fold vectors, one attn_res source stack, plus the sub-block */
+    /* prefix_sum, tmp, fold vectors, one attn_res source stack, its score scratch,
+     * plus the sub-block */
+    const size_t maxb = (size_t)(c->n_layers / c->attn_res_block + 2);
     return (size_t)3 * T * c->hidden
          + (size_t)2 * c->hidden
-         + (size_t)(c->n_layers / c->attn_res_block + 2) * c->hidden
+         + maxb * c->hidden
+         + maxb
          + (size_t)2 * c->dense_inter
          + sub;
 }
@@ -1353,8 +1352,9 @@ void k3_decoder_layer_kv(float *h, float *block_residual, int *n_blocks,
     float *hin    = tmp  + (size_t)T * E;       /* [T][E] normalised layer input */
     float *foldA  = hin  + (size_t)T * E;       /* [E] attention aggregator      */
     float *foldM  = foldA + E;                  /* [E] mlp aggregator            */
-    float *src    = foldM + E;                  /* [maxb+1][E] source stack      */
-    float *dgu    = src + (size_t)(maxb) * E;   /* [2*dense_inter]               */
+    float *src    = foldM + E;                  /* [maxb][E] source stack        */
+    float *ares   = src + (size_t)maxb * E;     /* [maxb] attn_res score scratch */
+    float *dgu    = ares + (size_t)maxb;        /* [2*dense_inter]               */
     float *sub    = dgu + (size_t)2 * c->dense_inter;
 
     /* The norm gain and the scoring projection collapse to ONE vector. Folding them
@@ -1376,7 +1376,7 @@ void k3_decoder_layer_kv(float *h, float *block_residual, int *n_blocks,
                        (size_t)E * sizeof(float));
             memcpy(src + (size_t)(*n_blocks) * E, pref + (size_t)t * E,
                    (size_t)E * sizeof(float));
-            k3_attn_res(h + (size_t)t * E, src, foldA, *n_blocks + 1, E, c->rms_eps);
+            k3_attn_res(h + (size_t)t * E, src, foldA, *n_blocks + 1, E, c->rms_eps, ares);
         }
     }
 
@@ -1415,7 +1415,7 @@ void k3_decoder_layer_kv(float *h, float *block_residual, int *n_blocks,
                    (size_t)E * sizeof(float));
         memcpy(src + (size_t)(*n_blocks) * E, pref + (size_t)t * E,
                (size_t)E * sizeof(float));
-        k3_attn_res(h + (size_t)t * E, src, foldM, *n_blocks + 1, E, c->rms_eps);
+        k3_attn_res(h + (size_t)t * E, src, foldM, *n_blocks + 1, E, c->rms_eps, ares);
     }
 
     for (int t = 0; t < T; t++)
