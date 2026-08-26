@@ -205,9 +205,15 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
  *    2. read    u = S^T k
  *    3. write   S += k (beta*(v-u))^T
  *    4. output  o = S^T q          from the ALREADY UPDATED state
- * q must arrive pre-scaled by d_k^-0.5. */
+ * q must arrive pre-scaled by d_k^-0.5.
+ * u_scratch is a caller-owned, dv-wide temporary for step 2; this function overwrites
+ * it and does not read its incoming contents. Callers running heads in parallel (see
+ * k3_kda_layer) must give each concurrent call its own slice -- it is not safe to
+ * share one buffer across heads. Pulled out of the function so the hottest loop in the
+ * engine (H*T calls per KDA layer) does not malloc/free on every step. */
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
-                 const float *v, const float *alpha, float beta, int dk, int dv);
+                 const float *v, const float *alpha, float beta, int dk, int dv,
+                 float *u_scratch);
 
 /* y[out] = W[out][in] . x[in].  W is row-major, no bias anywhere in this model. */
 void k3_matmul(float *y, const float *x, const float *W, int in, int out);
