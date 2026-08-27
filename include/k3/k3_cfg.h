@@ -270,6 +270,10 @@ static inline int k3_cfg_load_file(K3Cfg *c, int *fa, int fa_max, const char *pa
     char *arena = NULL;
     jval *root = json_parse(txt, &arena);
     if (!root) { fprintf(stderr, "%s: not valid JSON\n", path); free(txt); return 0; }
+    /* json_parse copies every string it needs into `arena` (see third_party/json.h), so
+     * `txt` is done once parsing succeeds -- the same free k3_trunk.c already does after
+     * its own successful json_parse. Only the arena has to outlive this call. */
+    free(txt);
     return k3_cfg_load(c, fa, fa_max, root, path);
 }
 
