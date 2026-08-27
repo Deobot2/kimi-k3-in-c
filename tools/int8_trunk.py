@@ -77,6 +77,14 @@ def main():
         for name, t in items:
             o, nb, dt, shape = t["off"], t["nbytes"], t["dtype"], t.get("shape", [])
             raw = run[o:o + nb]
+            # Slicing past the end of `run` truncates silently rather than raising; the
+            # BF16 branch below catches it via reshape, but the pass-through branch
+            # would otherwise write a short tensor while still claiming its old `nbytes`
+            # in the manifest -- corrupting every tensor packed after it in this layer.
+            assert len(raw) == nb, (
+                f"{name}: layer {li} run is {len(run)} bytes, tensor at [{o}:{o+nb}] "
+                f"only got {len(raw)}"
+            )
             if dt == "BF16" and len(shape) == 2:
                 f = bf16_to_f32(np.frombuffer(raw, dtype=np.uint16)).reshape(shape[0], shape[1])
                 enc, enb = quant_row_int8(f)

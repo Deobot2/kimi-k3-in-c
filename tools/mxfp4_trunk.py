@@ -175,6 +175,14 @@ def main():
             shape = t.get("shape") or []
             dtype = t.get("dtype")
             raw = run[off:off + nb]
+            # Slicing past the end of `run` truncates silently rather than raising; the
+            # quantised branch below catches it via reshape, but the pass-through branch
+            # would otherwise write a short tensor while still claiming its old `nbytes`
+            # in the manifest -- corrupting every tensor packed after it in this layer.
+            assert len(raw) == nb, (
+                f"{name}: layer {li} run is {len(run)} bytes, tensor at [{off}:{off+nb}] "
+                f"only got {len(raw)}"
+            )
 
             do_q = (dtype in ("BF16", "bf16") and len(shape) == 2
                     and int(shape[0]) > 1 and int(shape[1]) % GROUP == 0
