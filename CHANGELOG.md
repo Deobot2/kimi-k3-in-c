@@ -129,6 +129,31 @@ not needing the bytes at all.
   went over what the walk owed. The aggregate byte total could say a run went over and
   never which layers; two explanations for the 13.7% were argued from the pinned set's
   shape before this existed, and both were wrong.
+- **A crafted `trunk.json` could point a matmul weight past its own layer's buffer.**
+  `k3_bind_layer_mem` has no capacity to bound-check `run + off` against — it is only
+  ever handed the offsets `trunk.json` claims — so nothing stopped a tensor's `[off,
+  off+nbytes)` span from reaching outside the allocation its own layer's `nbytes` sizes,
+  an out-of-bounds read on every use of that tensor. `trunk.json` is untrusted input per
+  `SECURITY.md`; `k3_trunk_open` now refuses one whose tensors do not tile inside their
+  declared layer, and refuses a negative `file_off`/`nbytes` outright rather than letting
+  it become a huge `size_t` at the allocation site.
+- `k3_cfg_load_file` leaked the raw config text on the success path — freed only when
+  parsing failed. `json_parse` copies every string it needs into its own arena, so the
+  raw buffer is safe to drop right after, the same as `k3_trunk_open` already does for
+  its own JSON read.
+- `k3_cache_pin` bound only the *combined* `layer * n_experts + expert` key, not the two
+  indices separately, so an out-of-range `expert` could be offset by an out-of-range
+  `layer` back into an in-range key — silently pinning the wrong expert's slot instead
+  of being rejected. `k3_cache_prefetch` had the same gap one level down, in `admit()`.
+  `cache_get`/`cache_resident` already validated both indices; both now match.
+- `k3_st_open`'s shard-directory scan left its `realloc` and its per-entry `malloc`
+  unchecked, unlike every other allocation in the function: on OOM the `realloc` would
+  silently drop the array it held (leaking it) and the next line dereferenced the NULL
+  result.
+- `ppl_load_suite` leaked the document in progress when a `--ppl-file` record was
+  rejected (allocation failure, an out-of-vocabulary id, or fewer than two ids): the
+  bottom-of-function cleanup only frees indices below `nd`, and every rejection broke
+  out before `nd` was incremented.
 
 ## [1.0.0] - 2026-08-07
 
