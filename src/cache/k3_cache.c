@@ -279,6 +279,14 @@ static void publish(K3Cache *c, int32_t key, int slot, int64_t got, int64_t pad,
  * mutex; this takes it, and drops it around the read so other threads can work. */
 static int admit(K3Cache *c, int layer, int expert, int count_stats)
 {
+    /* cache_get/cache_resident validate layer and expert individually before ever
+     * reaching here, so this is redundant on that path. k3_cache_prefetch has no such
+     * check of its own, and reaching the combined key straight from the arguments (as
+     * k3_cache_pin below does too) means an out-of-range expert can be offset by an
+     * out-of-range layer back into a VALID key, silently touching a different expert's
+     * slot instead of being rejected. */
+    if (layer < 0 || layer >= c->n_layers || expert < 0 || expert >= c->n_experts)
+        return -1;
     const int32_t key = layer * c->n_experts + expert;
     K3ExpertRef r;
 
@@ -804,8 +812,13 @@ int k3_cache_dump_trace(const K3Cache *c, const char *path)
 
 int k3_cache_pin(K3Cache *c, int layer, int expert, int pin)
 {
+    /* Bound layer and expert individually, not just their combined key: an
+     * out-of-range expert can be offset by an out-of-range layer back into a key that
+     * is in range, which would pin the WRONG expert's slot instead of being rejected.
+     * cache_get/cache_resident already validate this way. */
+    if (layer < 0 || layer >= c->n_layers || expert < 0 || expert >= c->n_experts)
+        return 0;
     const int32_t key = layer * c->n_experts + expert;
-    if (key < 0 || key >= c->n_layers * c->n_experts) return 0;
     pthread_mutex_lock(&c->mu);
     const int slot = c->slot_of[key];
     if (slot >= 0) c->pinned[slot] = pin ? 1 : 0;
