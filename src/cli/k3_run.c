@@ -210,9 +210,9 @@ static K3PplDoc *ppl_load_suite(const char *path, int *ndoc, int *maxlen, int vo
         const size_t room = (size_t)(ln - (tab - line)) + 1;
         d[nd].name = strdup(line);
         d[nd].ids  = (int *)malloc(room * sizeof(int));
-        if (!d[nd].name || !d[nd].ids) { bad = 1; break; }
+        if (!d[nd].name || !d[nd].ids) bad = 1;
         int n = 0;
-        for (const char *p = tab + 1; *p; ) {
+        for (const char *p = tab + 1; !bad && *p; ) {
             char *end = NULL;
             const long v = strtol(p, &end, 10);
             if (end == p) break;
@@ -225,15 +225,18 @@ static K3PplDoc *ppl_load_suite(const char *path, int *ndoc, int *maxlen, int vo
             p = end;
             while (*p == ',' || *p == ' ') p++;
         }
-        if (bad) break;
         /* One id predicts nothing: perplexity is scored on transitions, so a
          * single-token document contributes zero positions and would silently dilute
          * the document count it is averaged over. */
-        if (n < 2) {
+        if (!bad && n < 2) {
             fprintf(stderr, "k3: %s:%d (%s) has %d id(s); a document needs at least 2\n",
                     path, lineno, d[nd].name, n);
-            bad = 1; break;
+            bad = 1;
         }
+        /* d[nd] was just allocated above (name and, if it got that far, ids), so the
+         * bottom-of-function cleanup -- which only frees indices below the never-
+         * incremented nd -- would otherwise leak whichever of the two this record holds. */
+        if (bad) { free(d[nd].name); free(d[nd].ids); d[nd].name = NULL; d[nd].ids = NULL; break; }
         d[nd].n = n;
         if (n > longest) longest = n;
         nd++;
