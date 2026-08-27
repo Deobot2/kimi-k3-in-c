@@ -193,6 +193,13 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
         K3TrunkLayer *L = &tr->lay[i];
         if ((v = json_get(e, "file_off")) && v->t == J_NUM) L->file_off = (int64_t)v->num;
         if ((v = json_get(e, "nbytes"))   && v->t == J_NUM) L->nbytes   = (int64_t)v->num;
+        /* trunk.json is untrusted input (SECURITY.md): file_off feeds a pread offset and
+         * nbytes sizes the layer's own allocation below, so a negative value here is
+         * refused now rather than turning into a huge size_t at the allocation site. */
+        if (L->file_off < 0 || L->nbytes < 0) {
+            fprintf(stderr, "k3_trunk: layer %d has a negative file_off or nbytes\n", i);
+            goto bad;
+        }
         jval *ts = json_get(e, "tensors");
         if (!ts || ts->t != J_OBJ) { fprintf(stderr, "k3_trunk: layer %d has no tensors\n", i); goto bad; }
         L->nt = ts->len;
@@ -206,6 +213,19 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
             if ((v = json_get(o, "off"))    && v->t == J_NUM) t->off    = (int64_t)v->num;
             if ((v = json_get(o, "nbytes")) && v->t == J_NUM) t->nbytes = (int64_t)v->num;
             if ((v = json_get(o, "dtype"))  && v->t == J_STR) t->dtype  = dt_of(v->str);
+            /* k3_bind_layer_mem has no way to bound-check `run + off`: it is handed the
+             * layer buffer with no capacity, only the offsets trunk.json claims. Refusing
+             * a tensor whose span falls outside its own layer's declared bytes here is
+             * what keeps that later pointer arithmetic in bounds -- otherwise a crafted
+             * trunk.json points a matmul weight straight past the allocation that backs
+             * it, an out-of-bounds read on every use of that tensor. */
+            if (t->off < 0 || t->nbytes < 0 || t->off + t->nbytes > L->nbytes) {
+                fprintf(stderr, "k3_trunk: layer %d tensor \"%s\" spans [%lld, %lld), "
+                                "outside the layer's %lld declared bytes\n",
+                        i, t->name, (long long)t->off, (long long)(t->off + t->nbytes),
+                        (long long)L->nbytes);
+                goto bad;
+            }
         }
     }
     free(txt);                      /* arena holds the strings; txt itself is done */
