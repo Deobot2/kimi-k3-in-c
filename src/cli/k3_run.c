@@ -376,6 +376,17 @@ static int k3_state_peek(const char *path, K3StateHdr *hd)
                 path, hd->version, K3_STATE_VER);
         return -1;
     }
+    /* nseq sizes the caller's sequence buffer (main() reads it back as `prior` before
+     * k3_state_load ever runs its own checks) and is also the exact count k3_state_load
+     * hands to fread. A negative value here would go negative through both: `seq + prior`
+     * in main() lands before the allocation, and (size_t)hd->nseq in the fread wraps to
+     * a huge count bounded only by how much of the file is actually there to read --
+     * an attacker-sized, attacker-content heap write. Bounded the same way np/gen are. */
+    if (hd->nseq < 0 || hd->nseq > K3_MAX_PROMPT + K3_MAX_GEN) {
+        fprintf(stderr, "%s reports %d prior positions, outside 0..%d\n",
+                path, hd->nseq, K3_MAX_PROMPT + K3_MAX_GEN);
+        return -1;
+    }
     return 0;
 }
 
@@ -430,6 +441,30 @@ static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
                         "  Raise --gen or shorten the prompt.\n", path, hd->cached, w->kv_cap);
         return -1;
     }
+    /* k3_state_peek already applies this bound before main() sizes `seq` from the same
+     * hd->nseq (as `prior`), so on the one call path this file has, it never fires.
+     * Checked again here anyway, the same as every other field above: this function
+     * takes no buffer-capacity argument for `seq`, so a negative or oversized nseq
+     * reaching the fread below with no re-check is one caller-discipline slip away
+     * from the exact heap overflow the peek-side check exists to prevent. */
+    if (hd->nseq < 0 || hd->nseq > K3_MAX_PROMPT + K3_MAX_GEN) {
+        fprintf(stderr, "REFUSING: %s reports %d prior positions, outside 0..%d\n",
+                path, hd->nseq, K3_MAX_PROMPT + K3_MAX_GEN);
+        return -1;
+    }
+    /* kper sizes the caller's `ks` buffer (main() allocates kper * NL floats); it is
+     * derived from the config the same way here as there, and hd->kper is only ever
+     * used below to size a read INTO that buffer. A mismatched value -- from a state
+     * file this build did not write, or a corrupted one -- must be refused before the
+     * fread, not after: a header value larger than the true kper reads straight past
+     * ks's actual allocation. */
+    const int P = c->kda_heads * c->kda_head_dim;
+    const int64_t kper = (int64_t)P * c->kda_head_dim + (int64_t)3 * P * (c->conv_k - 1);
+    if (hd->kper != kper) {
+        fprintf(stderr, "REFUSING: %s holds %lld KDA floats per layer, this config "
+                        "computes %lld\n", path, (long long)hd->kper, (long long)kper);
+        return -1;
+    }
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return -1; }
     if (fseek(f, (long)sizeof *hd, SEEK_SET) != 0) { fclose(f); return -1; }
@@ -454,7 +489,19 @@ static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
         }
     } else {
         /* Position-major inside each layer slice, so a differently-sized destination
-         * cache is written slice by slice rather than as one block. */
+         * cache is written slice by slice rather than as one block. hd->kvpp/ropepp/
+         * kv_rows size both the destination offset and the read, exactly like kv_row_
+         * floats/kv_rows do on the latent branch above -- so they get the same
+         * REFUSING treatment rather than being trusted straight into the fread. */
+        const int64_t kvpp   = (int64_t)c->n_heads * (c->qk_nope + c->v_head);
+        const int64_t ropepp = c->qk_rope;
+        if (hd->kvpp != kvpp || hd->ropepp != ropepp || hd->kv_rows > w->kv_cap) {
+            fprintf(stderr, "REFUSING: %s holds %d expanded rows of %lld/%lld floats, "
+                            "this config computes %lld/%lld over a %d-row cache\n",
+                    path, hd->kv_rows, (long long)hd->kvpp, (long long)hd->ropepp,
+                    (long long)kvpp, (long long)ropepp, w->kv_cap);
+            fclose(f); return -1;
+        }
         for (int mi = 0; !rc && mi < w->n_mla; mi++) {
             float *dst = w->kvc + (size_t)mi * w->kv_cap * hd->kvpp;
             const size_t n = (size_t)hd->kv_rows * hd->kvpp;
