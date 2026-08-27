@@ -154,6 +154,20 @@ not needing the bytes at all.
   rejected (allocation failure, an out-of-vocabulary id, or fewer than two ids): the
   bottom-of-function cleanup only frees indices below `nd`, and every rejection broke
   out before `nd` was incremented.
+- **A crafted `--load-state` file could overflow the sequence, KDA and KV buffers it
+  restores into.** `k3_state_load` already refuses a mismatched architecture, layer
+  count, KV layout or window geometry, but five fields it went on to use as read sizes
+  were never checked against what the destination buffers were actually sized for:
+  `nseq` (negative wraps the `fread` count to near `SIZE_MAX`; positive-but-large reads
+  past `seq`'s real allocation, and `seq + prior` in `main()` lands before it entirely),
+  `kper` (read straight from the file into `ks` with no comparison against the value
+  the config implies), and `kvpp`/`ropepp`/`kv_rows` on the expanded-KV branch, which
+  had no equivalent of the latent branch's existing check just above it. All five are
+  now bounded or cross-checked the same way every other header field already is.
+  Verified with a standalone extraction of the load/peek/save functions run under
+  ASan+UBSan+LeakSanitizer: a legitimate round trip still matches byte for byte, and six
+  corrupted-header variants against deliberately undersized buffers are all cleanly
+  refused — confirming a real heap overflow existed before this fix.
 
 ## [1.0.0] - 2026-08-07
 
