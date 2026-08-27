@@ -45,13 +45,23 @@ static void fill_q(const K3Cache *c, int slot, K3ExpertQ *q)
  * fixtures. With a speculation thread there is now a second way to reach that state, so
  * the rule is enforced in one place for every policy.
  */
+/* Small and main are the only two queues, each a trio of (head, tail, len) fields on
+ * K3Cache itself rather than an array of queue structs, so every function that walks
+ * one queue by its K3_Q_SMALL/K3_Q_MAIN tag needs these three pointers resolved the
+ * same way. */
+static void queue_ptrs(K3Cache *c, int q, int32_t **head, int32_t **tail, int32_t **len)
+{
+    *head = (q == K3_Q_SMALL) ? &c->s_head : &c->m_head;
+    *tail = (q == K3_Q_SMALL) ? &c->s_tail : &c->m_tail;
+    *len  = (q == K3_Q_SMALL) ? &c->s_len  : &c->m_len;
+}
+
 static void q_push_tail(K3Cache *c, int slot, int q)
 {
     c->q_next[slot] = -1;
     c->q_of[slot] = (unsigned char)q;
-    int32_t *head = (q == K3_Q_SMALL) ? &c->s_head : &c->m_head;
-    int32_t *tail = (q == K3_Q_SMALL) ? &c->s_tail : &c->m_tail;
-    int32_t *len  = (q == K3_Q_SMALL) ? &c->s_len  : &c->m_len;
+    int32_t *head, *tail, *len;
+    queue_ptrs(c, q, &head, &tail, &len);
     if (*tail < 0) { *head = *tail = (int32_t)slot; }
     else { c->q_next[*tail] = (int32_t)slot; *tail = (int32_t)slot; }
     (*len)++;
@@ -59,9 +69,8 @@ static void q_push_tail(K3Cache *c, int slot, int q)
 
 static int q_pop_head(K3Cache *c, int q)
 {
-    int32_t *head = (q == K3_Q_SMALL) ? &c->s_head : &c->m_head;
-    int32_t *tail = (q == K3_Q_SMALL) ? &c->s_tail : &c->m_tail;
-    int32_t *len  = (q == K3_Q_SMALL) ? &c->s_len  : &c->m_len;
+    int32_t *head, *tail, *len;
+    queue_ptrs(c, q, &head, &tail, &len);
     const int32_t s = *head;
     if (s < 0) return -1;
     *head = c->q_next[s];
@@ -216,9 +225,8 @@ static void detach(K3Cache *c, int slot)
     if (c->q_of[slot] == K3_Q_FREE) return;
     /* Only reachable via pick_victim_lru, which does not maintain the queues. */
     const int q = c->q_of[slot];
-    int32_t *head = (q == K3_Q_SMALL) ? &c->s_head : &c->m_head;
-    int32_t *tail = (q == K3_Q_SMALL) ? &c->s_tail : &c->m_tail;
-    int32_t *len  = (q == K3_Q_SMALL) ? &c->s_len  : &c->m_len;
+    int32_t *head, *tail, *len;
+    queue_ptrs(c, q, &head, &tail, &len);
     int32_t prev = -1;
     for (int32_t s = *head; s >= 0; prev = s, s = c->q_next[s]) {
         if (s != slot) continue;
@@ -672,11 +680,6 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
 #if defined(MADV_HUGEPAGE)
         if (huge) madvise(c->arena, want, MADV_HUGEPAGE);
 #endif
-    }
-    if (0) {
-        fprintf(stderr, "k3_cache: cannot allocate %.2f GB arena\n",
-                (double)c->nslot * c->slot_bytes / 1e9);
-        return -1;
     }
 
     const size_t nkey = (size_t)c->n_layers * c->n_experts;
