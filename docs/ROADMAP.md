@@ -59,15 +59,26 @@ than assuming the pool has the machine to itself.
 
 ## 4. SIMD in the KDA recurrence
 
-The bf16 trunk matmul and the MXFP4 expert matmul already have hand-written AVX2 paths
-(`src/core/k3_ops.c`), each written to reproduce the scalar reduction order exactly. The
-KDA recurrence does not: it is still plain scalar C, and it is the largest remaining
-un-vectorised kernel on the non-I/O path.
+**Done for `k3_kda_step`.** It now has an AVX2 path (`kda_scale_row`/`kda_axpy`/`kda_delta`
+in `src/core/k3_ops.c`), reusing the same trick as the bf16 trunk matmul and the MXFP4
+expert matmul: mul-then-add rather than a fused multiply-add, so the scalar and vector
+paths cannot round differently under `-ffp-contract=off`. It vectorises more simply than
+those two, because every reduction in the recurrence is already an outer loop over the
+contraction index accumulating into an array indexed by the inner (vectorised) one, so
+there is only ever one accumulator per output element rather than a split reduction tree
+to reproduce. Verified bit-identical against a pure-scalar build (`ARCH="-mno-avx2
+-mno-fma"`) via `make test` and a standalone harness sweeping dk/dv across multiples and
+non-multiples of 8; a synthetic microbenchmark at the real kda_head_dim=128 measured
+~20% faster, best-of-7 to cut scheduler noise — not an end-to-end figure against the
+released checkpoint, so read it as "the vectorisation works," not as a decode-time claim
+(see item 2 on not overclaiming an unreplicated number).
 
-`k3_matmul_tr`, added for the latent KV cache's query absorption, is the second: it is a
-strided column sweep with a double accumulator per output and no vector path at all. It
-runs 96 times per MLA layer per token, so it is small next to the recurrence but it is
-new and it is scalar.
+`k3_matmul_tr`, added for the latent KV cache's query absorption, is still scalar: a
+strided column sweep with a double accumulator per output and no vector path. It runs 96
+times per MLA layer per token, so it is small next to the recurrence, and vectorising it
+means restructuring the loop nest (row-outer instead of column-outer, trading the strided
+gather for a sequential sweep and a per-call accumulator buffer) rather than adding a
+vector loop in place, which is why it was left for a separate pass.
 
 ## 5. Sampling
 
