@@ -969,9 +969,15 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
             if (w->src) {
                 /* Streamed: the expert stays MXFP4 and the matmul reads nibbles. In
                  * cache-only mode every idx[j] is known resident, so resident() serves it
-                 * with no disk read; otherwise get() may read it. */
+                 * with no disk read; otherwise get() may read it.
+                 *
+                 * resident is OPTIONAL (see k3.h: "May be NULL; callers must cope"), so a
+                 * cache_only source that does not implement it falls back to get() rather
+                 * than calling through a null pointer. The one existing source (K3Cache)
+                 * always provides it, so this is a contract fix for any future K3ExpertSrc
+                 * rather than a change in today's behaviour. */
                 K3ExpertQ q;
-                int miss = w->cache_only
+                int miss = (w->cache_only && w->src->resident)
                     ? !w->src->resident(w->src, w->layer, idx[j], &q)
                     : (w->src->get(w->src, w->layer, idx[j], &q) != 0);
                 if (miss) {
