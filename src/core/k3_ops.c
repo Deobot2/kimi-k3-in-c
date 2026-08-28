@@ -31,6 +31,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Needed here (not just further down, by the MXFP4 kernels) because k3_kda_step below
+ * also carries an AVX2 path. */
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
  * scratch without changing a published signature. They are hundreds of bytes to a few
@@ -279,16 +285,70 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 }
 
 /* -------------------------------------------------------- KDA recurrence ---- */
+/* docs/ROADMAP.md #4: "the largest remaining un-vectorised kernel on the non-I/O path".
+ * Every reduction below is already shaped as an OUTER loop over i (sequential, 0..dk-1,
+ * exactly as the scalar code always ran it) accumulating into an array indexed by the
+ * INNER loop variable j. Vectorising over j therefore changes nothing about summation
+ * ORDER: for any single output element u[j] (or o[j], or the in-place S[i][j]), the
+ * sequence of terms added to it, and the order they are added in, is identical to the
+ * scalar code -- SIMD just computes 8 independent such elements per instruction instead
+ * of 1. That is unlike k3_matmul's split, which partitions ONE reduction across several
+ * accumulators and therefore has to reproduce a specific reduction TREE; here there is
+ * only ever one accumulator per output element, vectorised or not.
+ *
+ * MUL THEN ADD, never FMA (same reasoning as k3_matmul_bf16): the scalar code computes
+ * each product and each sum as separate rounded float32 operations, and -ffp-contract=off
+ * keeps the compiler from fusing them. _mm256_fmadd_ps rounds once instead of twice and
+ * would silently diverge from the scalar reference in the last bit, so every vector loop
+ * below issues a separate mul (or sub) and add. */
+static inline void kda_scale_row(float *row, float a, int n)
+{
+    int j = 0;
+#if defined(__AVX2__)
+    const __m256 av = _mm256_set1_ps(a);
+    for (; j + 7 < n; j += 8)
+        _mm256_storeu_ps(row + j, _mm256_mul_ps(_mm256_loadu_ps(row + j), av));
+#endif
+    for (; j < n; j++) row[j] *= a;
+}
+
+/* dst[j] += s * src[j], for j in [0, n). Used for both u += k[i]*S[i] and o += q[i]*S[i]:
+ * same shape, different names at the call site. */
+static inline void kda_axpy(float *dst, float s, const float *src, int n)
+{
+    int j = 0;
+#if defined(__AVX2__)
+    const __m256 sv = _mm256_set1_ps(s);
+    for (; j + 7 < n; j += 8) {
+        const __m256 prod = _mm256_mul_ps(sv, _mm256_loadu_ps(src + j));
+        _mm256_storeu_ps(dst + j, _mm256_add_ps(_mm256_loadu_ps(dst + j), prod));
+    }
+#endif
+    for (; j < n; j++) dst[j] += s * src[j];
+}
+
+/* row[j] += kb * (v[j] - u[j]), for j in [0, n). The delta rule's write-back. */
+static inline void kda_delta(float *row, float kb, const float *v, const float *u, int n)
+{
+    int j = 0;
+#if defined(__AVX2__)
+    const __m256 kbv = _mm256_set1_ps(kb);
+    for (; j + 7 < n; j += 8) {
+        const __m256 diff = _mm256_sub_ps(_mm256_loadu_ps(v + j), _mm256_loadu_ps(u + j));
+        const __m256 prod = _mm256_mul_ps(kbv, diff);
+        _mm256_storeu_ps(row + j, _mm256_add_ps(_mm256_loadu_ps(row + j), prod));
+    }
+#endif
+    for (; j < n; j++) row[j] += kb * (v[j] - u[j]);
+}
+
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
     /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
      *    channel, not a scalar, which is what "channel-wise forget gate" means. */
-    for (int i = 0; i < dk; i++) {
-        float *row = S + (size_t)i * dv;
-        const float a = alpha[i];
-        for (int j = 0; j < dv; j++) row[j] *= a;
-    }
+    for (int i = 0; i < dk; i++)
+        kda_scale_row(S + (size_t)i * dv, alpha[i], dv);
 
     /* 2. read the state along k:  u = S^T k */
     /* Allocated AFTER the decay above has already modified S. Returning early here
@@ -299,8 +359,7 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) u[j] += ki * row[j];
+        kda_axpy(u, ki, S + (size_t)i * dv, dv);
     }
 
     /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
@@ -308,8 +367,7 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
-        float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
+        kda_delta(S + (size_t)i * dv, ki * beta, v, u, dv);
     }
 
     /* 4. output from the ALREADY UPDATED state: o = S^T q */
@@ -317,8 +375,7 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     for (int i = 0; i < dk; i++) {
         const float qi = q[i];
         if (qi == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) o[j] += qi * row[j];
+        kda_axpy(o, qi, S + (size_t)i * dv, dv);
     }
     free(u);
 }
@@ -1462,11 +1519,9 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
 
 /* ---------------------------------------------------------------- MXFP4 ---- */
 /* K3_E2M1 lives near the top of this file: k3_matmul_tr needs it too, for the
- * transposed sweep over a quantised trunk, and that is defined well before here. */
-
-#if defined(__AVX2__)
-#include <immintrin.h>
-#endif
+ * transposed sweep over a quantised trunk, and that is defined well before here.
+ * immintrin.h is included once, near the top of the file, because k3_kda_step also
+ * needs it. */
 
 /* y[out] = W[out][in] . x[in], with W stored as bf16 and widened on read.
  *
