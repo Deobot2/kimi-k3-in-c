@@ -977,12 +977,9 @@ int main(int argc, char **argv)
             cache_gb = p->cache_gb;
             preset_name = p->name;
         }
-        else if (!strcmp(argv[i], "--list-presets")) { k3_preset_list(stdout); return 0; }
-        else if (!strcmp(argv[i], "--version")) {
-            printf("k3 %s\n", K3_VERSION);
-            return 0;
-        }
-        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
+        /* --help/--version/--list-presets are NOT re-checked here: the scan at the top
+         * of main() already covers every element of argv, so if any of them were
+         * present this loop would never have been reached. */
         else { fprintf(stderr, "unknown option %s\n\n", argv[i]); usage(stderr); return 2; }
     }
     {
@@ -1242,6 +1239,13 @@ int main(int argc, char **argv)
      *   (tools/sim_cache.py). So a cache of 8 GB buys exactly what a cache of 0.5 GB buys,
      *   and the difference belongs in the trunk. Auto now gives the cache either the
      *   minimum or at least a whole working set, and never a useless amount in between. */
+    /* The layer count this run will actually bind, per --layers: computed once here so
+     * the auto-budget forecast below and the authoritative pre-allocation check further
+     * down size the recurrent-state reserve from the same number. They used to disagree
+     * -- the forecast always assumed all of c.n_layers, so `--layers 10 --preset auto`
+     * overstated a 93-layer state reserve for a 10-layer run, which could make auto pick
+     * a needlessly small trunk/cache split or refuse a run that would easily fit. */
+    const int NL = (want_layers > 0 && want_layers < c.n_layers) ? want_layers : c.n_layers;
     if (budget_auto) {
         const double avail = mem_available_bytes();
         if (avail <= 0.0) {
@@ -1258,7 +1262,7 @@ int main(int argc, char **argv)
          * memory of one checkpoint. */
         const double w_model = 2.0 * (double)c.vocab * E64 * 2 + 3.0 * E64 * 4;
         const double w_state = (double)((size_t)Pp * c.kda_head_dim
-                             + (size_t)3 * Pp * (c.conv_k - 1)) * c.n_layers * 4;
+                             + (size_t)3 * Pp * (c.conv_k - 1)) * NL * 4;
         const double w_buf = ((double)Tm * E64 + (double)Tm * mb_ * E64
                             + (double)k3_layer_scratch(&c, Tm) + (double)c.vocab) * 4;
         int n_mla_ = 0, n_moe_ = 0;
@@ -1379,8 +1383,8 @@ int main(int argc, char **argv)
     }
 
     /* ---- how much will this take? Report BEFORE allocating, so a box that cannot
-     * hold it fails with a number rather than an OOM kill. ---- */
-    const int NL = (want_layers > 0 && want_layers < c.n_layers) ? want_layers : c.n_layers;
+     * hold it fails with a number rather than an OOM kill. NL was computed above the
+     * auto-budget block, which needs the same count. ---- */
     int64_t total = 0; int missing = 0;
     for (int L = 0; L < NL; L++) {
         const int64_t n = k3_bind_layer_bytes(&st, &c, L);
@@ -1906,6 +1910,8 @@ int main(int argc, char **argv)
             fprintf(pf, "],\"teacher_forced\":true}\n");
             fclose(pf);
             printf("  wrote %s\n", outp);
+        } else {
+            fprintf(stderr, "cannot open %s for the --ppl summary\n", outp);
         }
         free(dnll); free(dpos); free(pp.rec);
         return 0;
@@ -1940,6 +1946,9 @@ int main(int argc, char **argv)
             fprintf(tf, "{\"tf_positions\":%d,\"tf_matches\":%d,\"tf_agreement\":%.4f}\n",
                     np - 1, match, (double)match / (np - 1));
             fclose(tf);
+            printf("  wrote %s\n", outp);
+        } else {
+            fprintf(stderr, "cannot open %s for the --tf-check summary\n", outp);
         }
         free(arg);
         return 0;
@@ -2137,7 +2146,8 @@ int main(int argc, char **argv)
     }
     free(spec_snap);
     printf("--------------------------------------------------------------------\n");
-    printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total, t_total / nout);
+    printf("%d tokens in %.1f s, %.2f s/token average\n",
+           nout, t_total, nout ? t_total / nout : 0.0);
 
     /* Decoded text, when a tokenizer is loaded. Printed as a distinct block rather than
      * streamed per token: a partially-decoded multi-byte sequence is not valid UTF-8, so
@@ -2166,16 +2176,22 @@ int main(int argc, char **argv)
         for (int i = 0; i < nout; i++) fprintf(f, "%s%d", i ? "," : "", outtok[i]);
         fprintf(f, "],\"full_ids\":[");
         for (int i = 0; i < T; i++) fprintf(f, "%s%d", i ? "," : "", seq[i]);
-        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f}\n", NL, t_total / nout);
+        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f}\n",
+                NL, nout ? t_total / nout : 0.0);
         fclose(f);
         printf("\nwrote %s\n", outp);
+    } else {
+        fprintf(stderr, "cannot open %s for the run summary\n", outp);
     }
     if (trace_dir) {
         char p[4096];
         snprintf(p, sizeof p, "%s/expert_hist.json", trace_dir);
-        k3_cache_dump_hist(&cache, p);
+        if (k3_cache_dump_hist(&cache, p) == 0) printf("wrote %s\n", p);
+        else fprintf(stderr, "cannot write %s\n", p);
         snprintf(p, sizeof p, "%s/expert_trace.bin", trace_dir);
-        k3_cache_dump_trace(&cache, p);
+        /* k3_cache_dump_trace prints its own success message; only failure is silent. */
+        if (k3_cache_dump_trace(&cache, p) != 0)
+            fprintf(stderr, "cannot write %s\n", p);
     }
 
     free(w.kvc); free(w.ropec); free(w.latc); free(w.mla_slot);
