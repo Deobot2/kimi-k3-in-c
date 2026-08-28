@@ -92,6 +92,16 @@ not needing the bytes at all.
 - Saved state records the KV layout and window geometry and refuses a mismatch: the two
   caches hold different tensors of the same float count, so restoring one as the other
   would be fluent and wrong. State version 1 → 2.
+- **AVX2 for the KDA recurrence** (`k3_kda_step`), the last hot kernel on the non-I/O path
+  without a vector path (docs/ROADMAP.md item 4). It vectorises more simply than the
+  matmul kernels: every reduction here is already an outer loop over the contraction
+  index accumulating into an array indexed by the vectorised inner one, so there is only
+  ever one accumulator per output element rather than a reduction tree to reproduce.
+  Every vector loop still does a separate mul (or sub) and add, never an FMA, matching
+  `-ffp-contract=off` exactly the way the bf16 matmul kernel already does. Verified
+  bit-identical against a pure-scalar build across dk/dv spanning multiples and
+  non-multiples of 8; a synthetic microbenchmark at the real kda_head_dim=128 measured
+  ~20% faster, best-of-7 to cut scheduler noise.
 
 ### Fixed
 
@@ -129,6 +139,30 @@ not needing the bytes at all.
   went over what the walk owed. The aggregate byte total could say a run went over and
   never which layers; two explanations for the 13.7% were argued from the pinned set's
   shape before this existed, and both were wrong.
+- `k3_moe`'s cache-only draft path called `K3ExpertSrc::resident` unconditionally, even
+  though `k3.h` documents it as optional ("may be NULL; callers must cope"), the same as
+  `getmany` and `speculate` right above it in the struct. The one existing source
+  (`K3Cache`) always provides it, so behaviour is unchanged; this makes the call site
+  honour the contract it already promises rather than relying on there only ever being
+  one implementation.
+- `k3_st_open`'s directory scan left two allocations (the shard-path array's `realloc`,
+  and the per-path `malloc`) unchecked, unlike every other allocation failure in the
+  file: a failed `realloc` both leaked every path already collected and handed the next
+  write a null pointer instead of the `fprintf`-and-refuse this file uses everywhere
+  else.
+- Removed an `if (0) { ... }` block in `k3_cache_init` left over from the arena
+  allocation being rewritten for hugepages — the real error path already returns above
+  it, so the block was unreachable.
+- **CLI**: `--layers N --preset auto` sized its recurrent-state memory forecast from the
+  model's full layer count rather than the truncated one actually being bound, which
+  could pick a needlessly small trunk/cache split or refuse a run that would fit.
+  `--gen 0` divided by zero generated tokens and printed/wrote `nan`, which is not a
+  legal JSON token, into `--out`; both now guard the division. Three output-file writes
+  (the `--ppl` and `--tf-check` summaries, `--dump-cache-trace`'s histogram) swallowed
+  `fopen`/write failures silently instead of reporting them like every other failure
+  path in this file. Removed three `--help`/`--version`/`--list-presets` branches in the
+  per-option loop that could never run, because the scan at the top of `main()` already
+  covers all of `argv` and returns before that loop is reached.
 
 ## [1.0.0] - 2026-08-07
 
