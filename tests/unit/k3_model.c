@@ -206,15 +206,16 @@ static void forward(Model *m, const K3Cfg *c, const int *ids, int T, float *logi
      * output_attn_res_{norm,proj}. The tensor census counts exactly 1 of these.
      * Skipping it is silent. */
     if (m->out_res_norm && m->out_res_proj) {
-        float *fold = scratch;
-        float *src  = fold + E;
+        float *fold  = scratch;
+        float *src   = fold + E;
+        float *score = src + (size_t)maxb * E;
         for (int i = 0; i < E; i++) fold[i] = m->out_res_norm[i] * m->out_res_proj[i];
         for (int t = 0; t < T; t++) {
             for (int b = 0; b < nb; b++)
                 memcpy(src + (size_t)b * E, br + ((size_t)t * maxb + b) * E,
                        (size_t)E * sizeof(float));
             memcpy(src + (size_t)nb * E, h + (size_t)t * E, (size_t)E * sizeof(float));
-            k3_attn_res(h + (size_t)t * E, src, fold, nb + 1, E, c->rms_eps);
+            k3_attn_res(h + (size_t)t * E, src, fold, nb + 1, E, c->rms_eps, score);
         }
     }
 
@@ -250,7 +251,7 @@ static int decode_inc(Model *m, const K3Cfg *c, const int *full, int np, int T,
     const size_t latper = (size_t)slots * (size_t)(c->kv_lora + c->qk_rope);
 
     size_t need = k3_layer_scratch_kv(c, T, T, mode);
-    const size_t alt = (size_t)(maxb + 2) * (size_t)E + (size_t)c->vocab;
+    const size_t alt = (size_t)(maxb + 2) * (size_t)E + (size_t)c->vocab + (size_t)maxb;
     if (alt > need) need = alt;
 
     float *kvc = (mode == K3_KV_LATENT) ? NULL
@@ -294,7 +295,7 @@ static int decode_inc(Model *m, const K3Cfg *c, const int *full, int np, int T,
                                     ks + kper * (size_t)L, sc, &kv);
             }
             /* model-level aggregator and head, on the LAST new position */
-            float *fold = sc, *src = fold + E;
+            float *fold = sc, *src = fold + E, *score = src + (size_t)maxb * E;
             const int lastt = nT - 1;
             if (m->out_res_norm && m->out_res_proj) {
                 for (int i = 0; i < E; i++)
@@ -304,7 +305,7 @@ static int decode_inc(Model *m, const K3Cfg *c, const int *full, int np, int T,
                            (size_t)E * sizeof(float));
                 memcpy(src + (size_t)nb * E, h + (size_t)lastt * E,
                        (size_t)E * sizeof(float));
-                k3_attn_res(h + (size_t)lastt * E, src, fold, nb + 1, E, c->rms_eps);
+                k3_attn_res(h + (size_t)lastt * E, src, fold, nb + 1, E, c->rms_eps, score);
             }
             float *nrm = sc;
             k3_rmsnorm(nrm, h + (size_t)lastt * E, m->final_norm, E, c->rms_eps);

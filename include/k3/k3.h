@@ -391,18 +391,27 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
  * Grouped routing is dead code for K3 (num_expert_group == 1) and is not implemented.
  *
  * idx and w are written in DESCENDING score order. Fills at most topk entries.
- */
+ *
+ * scratch is caller-owned working room for the per-expert score/choice arrays, at
+ * least 2*n_experts floats. This runs once per token per MoE layer, so a malloc/free
+ * pair here would be hot; threading the buffer through lets callers reuse their own
+ * scratch instead. */
 void k3_router(int *idx, float *w, const float *x, const float *W,
                const float *bias, int hidden, int n_experts, int topk,
-               int renorm, float routed_scale);
+               int renorm, float routed_scale, float *scratch);
 
 /* AttnRes aggregation over nsrc sources of width n.
  *   keys   = RMSNorm(sources)            normalised
  *   score  = dot(key, fold)              fold = norm.weight * proj.weight, ONE vector
  *   out    = softmax(score) @ sources    the RAW, UNNORMALISED sources
- * Fold the two weight vectors at load time. modeling_kimi_linear.py:1075-1088 */
+ * Fold the two weight vectors at load time. modeling_kimi_linear.py:1075-1088
+ *
+ * score is caller-owned working room, at least nsrc floats. nsrc is bounded by
+ * n_layers/attn_res_block + 2, which callers already size scratch for; this runs up
+ * to twice per layer per token across every layer, so a malloc/free pair here would
+ * be hot. */
 void k3_attn_res(float *out, const float *src, const float *fold,
-                 int nsrc, int n, float eps);
+                 int nsrc, int n, float eps, float *score);
 
 /* ---- weight storage format -------------------------------------------------------
  * The always-active weights ship as bf16 and total 113.49 GB; held as fp32 they are

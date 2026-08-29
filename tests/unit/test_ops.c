@@ -313,15 +313,16 @@ static void t_attnres(const char *dir)
         const int nsrc = nblk + 1;
         float *src = (float *)malloc((size_t)nsrc * n * sizeof(float));
         float *y = (float *)malloc((size_t)rows * n * sizeof(float));
+        float *score = (float *)malloc((size_t)nsrc * sizeof(float));
         for (int rw = 0; rw < rows; rw++) {
             for (int b = 0; b < nblk; b++)
                 memcpy(src + (size_t)b * n,
                        br + ((size_t)rw * nblk + b) * n, (size_t)n * sizeof(float));
             memcpy(src + (size_t)nblk * n, px + (size_t)rw * n, (size_t)n * sizeof(float));
-            k3_attn_res(y + (size_t)rw * n, src, fold, nsrc, n, eps);
+            k3_attn_res(y + (size_t)rw * n, src, fold, nsrc, n, eps, score);
         }
         report("attn_res", y, e, no);
-        free(src); free(y);
+        free(src); free(y); free(score);
     }
     free(px); free(br); free(fold); free(e); free(txt); free(ar);
 }
@@ -389,10 +390,11 @@ static void t_router(const char *dir)
         const int hidden = nw / E, rows = ni / hidden;
         int   *gi = (int   *)malloc((size_t)K * sizeof(int));
         float *gw = (float *)malloc((size_t)K * sizeof(float));
+        float *rt = (float *)malloc((size_t)2 * E * sizeof(float));
         int set_ok = 1; double worst_w = 0.0;
 
         for (int rw = 0; rw < rows; rw++) {
-            k3_router(gi, gw, x + (size_t)rw * hidden, W, bias, hidden, E, K, 1, 1.0f);
+            k3_router(gi, gw, x + (size_t)rw * hidden, W, bias, hidden, E, K, 1, 1.0f, rt);
 
             /* compare index SETS */
             for (int a = 0; a < K; a++) {
@@ -421,7 +423,7 @@ static void t_router(const char *dir)
                    set_ok ? "ok" : "MISMATCH", worst_w);
             g_fail++;
         }
-        free(gi); free(gw);
+        free(gi); free(gw); free(rt);
     }
     free(W); free(bias); free(x); free(eidx); free(ewt); free(txt); free(ar);
 }

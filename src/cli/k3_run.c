@@ -825,15 +825,19 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     /* The model-level aggregator, beyond the two per layer. Exactly one pair exists in
      * the checkpoint; skipping it is silent. */
     if (w->mb.out_res_norm && w->mb.out_res_proj) {
-        float *fold = scratch;
-        float *src  = fold + E;
+        float *fold  = scratch;
+        float *src   = fold + E;
+        /* Every layer above is done with this scratch buffer, which k3_layer_scratch_kv
+         * sizes with room to spare here: fold[E] + src[maxb*E] leaves far more than the
+         * maxb floats k3_attn_res needs for its own score scratch. */
+        float *score = src + (size_t)maxb * E;
         for (int i = 0; i < E; i++) fold[i] = w->mb.out_res_norm[i] * w->mb.out_res_proj[i];
         for (int t = 0; t < T; t++) {
             for (int b = 0; b < nb; b++)
                 memcpy(src + (size_t)b * E, br + ((size_t)t * maxb + b) * E,
                        (size_t)E * sizeof(float));
             memcpy(src + (size_t)nb * E, h + (size_t)t * E, (size_t)E * sizeof(float));
-            k3_attn_res(h + (size_t)t * E, src, fold, nb + 1, E, c->rms_eps);
+            k3_attn_res(h + (size_t)t * E, src, fold, nb + 1, E, c->rms_eps, score);
         }
     }
 
