@@ -206,9 +206,14 @@ typedef struct {
      * The routing decisions do not depend on the cache at all, so one run yields the
      * whole curve: record (layer, expert) in request order, then simulate any
      * replacement policy at any capacity offline. 1,472 requests per token, 8 bytes
-     * each, is 12 KB per token. */
+     * each, is 12 KB per token -- fine for the research runs this exists for, but
+     * unconditional growth for the life of the process on every run, plus an
+     * occasional realloc (which can memcpy hundreds of MB at long-run trace sizes)
+     * taken under the same lock every other cache access needs. trace_on gates it: off
+     * by default, k3_cache_enable_trace() turns it on for a run that asked to dump one. */
     int32_t     *trace;
     int64_t      ntrace, captrace;
+    int          trace_on;
 } K3Cache;
 
 /* budget_bytes is the arena size; it is rounded down to whole experts. Fails if that
@@ -233,5 +238,10 @@ int  k3_cache_dump_hist(const K3Cache *c, const char *path);
 /* Write the access trace as a flat binary file of int32 pairs (layer, expert) in
  * request order. tools/sim_cache.py replays it at any capacity. */
 int  k3_cache_dump_trace(const K3Cache *c, const char *path);
+
+/* Turn trace recording on. Call before the first request if this run intends to call
+ * k3_cache_dump_trace(); every request made while it is off is simply not recorded,
+ * which is what every run that never dumps a trace wants. */
+void k3_cache_enable_trace(K3Cache *c);
 
 #endif /* K3_CACHE_H */

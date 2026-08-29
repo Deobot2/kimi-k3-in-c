@@ -1524,6 +1524,10 @@ int main(int argc, char **argv)
 
     K3Cache cache;
     if (k3_cache_init(&cache, &st, &c, (int64_t)(cache_gb * 1e9)) != 0) return 1;
+    /* The trace is one this run wanted only if --dump-cache-trace was given; recording
+     * it unconditionally would grow without bound for the life of every run that never
+     * looks at it. */
+    if (trace_dir) k3_cache_enable_trace(&cache);
     {   /* The plan is a forecast. This is the outcome. */
         char rb[32];
         human(peak_rss_bytes(), rb, sizeof rb);

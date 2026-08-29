@@ -576,15 +576,19 @@ static int cache_get(K3ExpertSrc *self, int layer, int expert, K3ExpertQ *out)
 
     /* Record the request before serving it. The trace must reflect what the MODEL
      * asked for, independent of what the cache happened to hold, or replaying it at a
-     * different capacity would be meaningless. */
-    if (c->ntrace + 2 > c->captrace) {
-        int64_t nc = c->captrace ? c->captrace * 2 : (1 << 16);
-        int32_t *nt = (int32_t *)realloc(c->trace, (size_t)nc * sizeof(int32_t));
-        if (nt) { c->trace = nt; c->captrace = nc; }
-    }
-    if (c->ntrace + 2 <= c->captrace) {
-        c->trace[c->ntrace++] = layer;
-        c->trace[c->ntrace++] = expert;
+     * different capacity would be meaningless. Off unless a run asked to dump one: at
+     * 1,472 requests/token this grows without bound for the run's whole lifetime, and
+     * the occasional realloc runs under the same lock every other request needs too. */
+    if (c->trace_on) {
+        if (c->ntrace + 2 > c->captrace) {
+            int64_t nc = c->captrace ? c->captrace * 2 : (1 << 16);
+            int32_t *nt = (int32_t *)realloc(c->trace, (size_t)nc * sizeof(int32_t));
+            if (nt) { c->trace = nt; c->captrace = nc; }
+        }
+        if (c->ntrace + 2 <= c->captrace) {
+            c->trace[c->ntrace++] = layer;
+            c->trace[c->ntrace++] = expert;
+        }
     }
     pthread_mutex_unlock(&c->mu);
 
@@ -808,6 +812,13 @@ int k3_cache_dump_trace(const K3Cache *c, const char *path)
     printf("wrote %s: %lld requests (%.1f KB)\n",
            path, (long long)(c->ntrace / 2), (double)c->ntrace * 4 / 1024.0);
     return n == (size_t)c->ntrace ? 0 : -1;
+}
+
+void k3_cache_enable_trace(K3Cache *c)
+{
+    pthread_mutex_lock(&c->mu);
+    c->trace_on = 1;
+    pthread_mutex_unlock(&c->mu);
 }
 
 int k3_cache_pin(K3Cache *c, int layer, int expert, int pin)
