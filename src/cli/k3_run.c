@@ -373,6 +373,18 @@ static int k3_state_peek(const char *path, K3StateHdr *hd)
                 path, hd->version, K3_STATE_VER);
         return -1;
     }
+    /* Every other header field gets a REFUSING check before use; nseq did not, despite
+     * driving the size of every buffer the caller allocates next (Tmax, and from it h,
+     * br, ks, sc, seq) before k3_state_load ever reads a byte of the payload. A
+     * corrupted or hostile file claiming a huge or negative nseq would carry that
+     * straight into signed arithmetic (Tmax = prior + np + gen + 1) that can overflow,
+     * and then into allocation sizes derived from it. */
+    if (hd->nseq < 0 || hd->nseq > K3_MAX_PROMPT + K3_MAX_GEN) {
+        fprintf(stderr, "REFUSING: %s claims %d prior positions, outside 0..%d.\n"
+                        "  No run this build could have produced holds more.\n",
+                path, hd->nseq, K3_MAX_PROMPT + K3_MAX_GEN);
+        return -1;
+    }
     return 0;
 }
 
