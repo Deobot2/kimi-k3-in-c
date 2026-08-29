@@ -208,7 +208,13 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
     for (int i = 7; i >= 0; i--) hlen = (hlen << 8) | lenbuf[i];   /* little endian */
 
     off_t fsize = lseek(fd, 0, SEEK_END);
-    if (hlen == 0 || (uint64_t)fsize < 8 + hlen) {
+    /* fsize - 8 is safe: pread already proved the file holds at least 8 bytes, and the
+     * subtraction is done before hlen ever enters the comparison, so a huge hlen (up to
+     * and including UINT64_MAX) cannot wrap `8 + hlen` back into range and slip past
+     * this as "not impossible" -- which used to let scan_shard malloc(hlen+1) as
+     * malloc(0) and then write the actual (much smaller, but still nonzero) read past
+     * the end of that allocation. */
+    if (fsize < 8 || hlen == 0 || hlen > (uint64_t)fsize - 8) {
         fprintf(stderr, "k3_st: %s header length %llu is impossible (file %lld bytes)\n",
                 path, (unsigned long long)hlen, (long long)fsize);
         close(fd); return -1;
