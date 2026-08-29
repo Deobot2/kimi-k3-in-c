@@ -404,8 +404,13 @@ static int64_t blayout(int fmt, int bf16_at)
         BTensor *t = &g_bt[i];
         int64_t nb;
         if (!t->narrow) {
-            t->dtype = K3_DT_F32;
-            nb = (int64_t)t->rows * 4;             /* wide tensors are fp32 on disk */
+            /* Real checkpoints ship these BF16, same as everything else -- forcing F32
+             * here would point k3_bind_layer_mem straight at them and never exercise the
+             * widen path at all, which is exactly how an undersized widen buffer (a KDA
+             * layer's ShortConv kernels, dt_bias, o_norm and A_log, none counted by an
+             * earlier k3_bind_widen_bytes) went untested until it hit a real checkpoint. */
+            t->dtype = K3_DT_BF16;
+            nb = (int64_t)t->rows * 2;
         } else {
             const int use = (narrow_i++ == bf16_at) ? K3_DT_BF16 : fmt;
             t->dtype = use;

@@ -308,12 +308,35 @@ size_t k3_bind_widen_bytes(const K3Cfg *c)
 {
     /* Only the BF16 vectors that kernels read elementwise are copied. Everything else
      * is pointed at in place. The router gate dominates: it is BF16 on disk but stays
-     * fp32 in the engine because k3_router walks it with its own inline matmul. */
+     * fp32 in the engine because k3_router walks it with its own inline matmul.
+     *
+     * One widen region is reserved per layer SLOT and reused across whatever layer
+     * occupies it over time (see k3_trunk.c), so it must fit the worst case across
+     * BOTH attention kinds, not just MLA's -- this used to count only q_a_norm and
+     * kv_a_norm and omit every KDA-only widened vector entirely (the three ShortConv
+     * kernels, dt_bias, o_norm, A_log's kda_heads-wide prefix) as well as the router's
+     * bias vector. plan_layer()'s reqw() calls are the source of truth for what this
+     * must match. It went untested because the synthetic trunk in test_trunk stores
+     * every widened tensor as on-disk F32, which points at it in place rather than
+     * widening it (k3_bind_layer_mem's dt == K3_DT_F32 case) -- so the shortfall never
+     * came up against a widen buffer sized this way until a real BF16 checkpoint hit
+     * it, where every one of these vectors is BF16 on disk and must be widened. */
     const size_t H = (size_t)c->hidden;
-    size_t n = 6 * H                       /* in/post norm, attn-res and mlp-res pair  */
-             + (size_t)c->q_lora + c->kv_lora   /* MLA q_a/kv_a layernorms             */
-             + (size_t)c->latent                /* routed_expert_norm                  */
-             + (size_t)c->n_experts * H;        /* router gate                          */
+    const size_t P = (size_t)c->kda_heads * c->kda_head_dim;
+
+    const size_t common = 6 * H;                    /* in/post norm, attn-res + mlp-res pair */
+    const size_t mla_extra = (size_t)c->q_lora + c->kv_lora;         /* q_a/kv_a layernorms   */
+    const size_t kda_extra = 3 * P * (size_t)c->conv_k /* q/k/v ShortConv kernels            */
+                            + P                         /* dt_bias                            */
+                            + (size_t)c->kda_head_dim   /* o_norm                              */
+                            + (size_t)c->kda_heads;     /* A_log (only its kda_heads prefix)   */
+    const size_t attn_extra = mla_extra > kda_extra ? mla_extra : kda_extra;
+
+    const size_t moe_extra = (size_t)c->latent          /* routed_expert_norm                 */
+                            + (size_t)c->n_experts * H   /* router gate                        */
+                            + (size_t)c->n_experts;      /* router bias                        */
+
+    size_t n = common + attn_extra + moe_extra;
     return n * sizeof(float) + 4096;       /* slack for per-tensor 8-byte alignment    */
 }
 
