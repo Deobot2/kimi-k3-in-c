@@ -226,7 +226,8 @@ static void t_shortconv(const char *dir)
         const int T = ni / C;
         float *y = (float *)malloc((size_t)ni * sizeof(float));
         float *s = (float *)calloc((size_t)C * (K - 1), sizeof(float));
-        k3_shortconv(y, x, w, s, C, K, T);
+        float *hbuf = (float *)malloc((size_t)(K - 1 > 0 ? K - 1 : 0) * sizeof(float));
+        k3_shortconv(y, x, w, s, C, K, T, hbuf);
         report("shortconv", y, e, no);
         if (st) report("conv_state", s, st, ns);
 
@@ -240,14 +241,14 @@ static void t_shortconv(const char *dir)
         if (xn && en) {
             const int T2 = nxi / C;
             float *y2 = (float *)malloc((size_t)nxi * sizeof(float));
-            k3_shortconv(y2, xn, w, s, C, K, T2);   /* s carries forward, deliberately */
+            k3_shortconv(y2, xn, w, s, C, K, T2, hbuf);   /* s carries forward, deliberately */
             report("conv_continuation", y2, en, nxo);
             free(y2);
         } else {
             printf("  FAIL  conv_continuation  fixture lacks in_next/out_next\n");
             g_fail++;
         }
-        free(y); free(s);
+        free(y); free(s); free(hbuf);
     }
     free(w); free(x); free(e); free(st); free(xn); free(en); free(txt); free(ar);
 }
@@ -346,6 +347,7 @@ static void t_recur(const char *dir, const char *file)
         float *S = (float *)calloc((size_t)H * dk * dv, sizeof(float));
         float *out = (float *)malloc((size_t)T * H * dv * sizeof(float));
         float *qs_ = (float *)malloc((size_t)dk * sizeof(float));
+        float *ubuf = (float *)malloc((size_t)dv * sizeof(float));
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < H; h++) {
                 const size_t off = ((size_t)t * H + h) * dk;
@@ -354,14 +356,14 @@ static void t_recur(const char *dir, const char *file)
                             out + ((size_t)t * H + h) * dv,
                             qs_, k + off, v + off,
                             al + ((size_t)t * H + h) * dk,
-                            bt[(size_t)t * H + h], dk, dv);
+                            bt[(size_t)t * H + h], dk, dv, ubuf);
             }
         }
         char nm[32]; snprintf(nm, sizeof(nm), "%s_out", file);
         report(nm, out, eo, no);
         snprintf(nm, sizeof(nm), "%s_state", file);
         report(nm, S, es, nso);
-        free(S); free(out); free(qs_);
+        free(S); free(out); free(qs_); free(ubuf);
     }
     free(q); free(k); free(v); free(al); free(bt); free(eo); free(es);
     free(txt); free(ar);

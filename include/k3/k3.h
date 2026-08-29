@@ -185,9 +185,14 @@ void k3_situ_glu(float *y, const float *x, int n, float b1, float b2);
  * w is [channels][k]; state holds the (k-1) previous inputs per channel and is
  * UPDATED IN PLACE. Passing state = NULL treats history as zero (start of sequence).
  * This state is a second piece of per-sequence memory beyond the recurrent matrix
- * and is the piece a decode loop forgets. modeling_kimi_linear.py:504-518 */
+ * and is the piece a decode loop forgets. modeling_kimi_linear.py:504-518
+ *
+ * hist_scratch is caller-owned working room for the sliding history window, at least
+ * (k-1) floats (0 is fine when k == 1); the caller already owns scratch sized for the
+ * whole layer, so this avoids a malloc/free pair on a path called per channel-group
+ * per token. */
 void k3_shortconv(float *y, const float *x, const float *w, float *state,
-                  int channels, int k, int T);
+                  int channels, int k, int T, float *hist_scratch);
 
 /* Decay chain, per head h and channel d:
  *   z     = f_b(f_a(x))[h][d] + dt_bias[h*D + d]
@@ -205,9 +210,16 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
  *    2. read    u = S^T k
  *    3. write   S += k (beta*(v-u))^T
  *    4. output  o = S^T q          from the ALREADY UPDATED state
- * q must arrive pre-scaled by d_k^-0.5. */
+ * q must arrive pre-scaled by d_k^-0.5.
+ *
+ * u_scratch is caller-owned working room for step 2's read-out, at least dv floats.
+ * This runs once per head per token (H per token, across every KDA layer), so a
+ * malloc/free pair here would be among the hottest allocation sites in the engine;
+ * threading the buffer through lets callers reuse a per-head slice of their own
+ * scratch instead. */
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
-                 const float *v, const float *alpha, float beta, int dk, int dv);
+                 const float *v, const float *alpha, float beta, int dk, int dv,
+                 float *u_scratch);
 
 /* y[out] = W[out][in] . x[in].  W is row-major, no bias anywhere in this model. */
 void k3_matmul(float *y, const float *x, const float *W, int in, int out);
