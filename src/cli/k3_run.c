@@ -977,12 +977,10 @@ int main(int argc, char **argv)
             cache_gb = p->cache_gb;
             preset_name = p->name;
         }
-        else if (!strcmp(argv[i], "--list-presets")) { k3_preset_list(stdout); return 0; }
-        else if (!strcmp(argv[i], "--version")) {
-            printf("k3 %s\n", K3_VERSION);
-            return 0;
-        }
-        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
+        /* --help/--version/--list-presets are handled once, above, by the pre-scan over
+         * the whole of argv (including this loop's range) before argc < 2 is even
+         * checked -- a second copy of that handling here could never be reached, and a
+         * second copy is a second thing to keep in sync with the first. */
         else { fprintf(stderr, "unknown option %s\n\n", argv[i]); usage(stderr); return 2; }
     }
     {
