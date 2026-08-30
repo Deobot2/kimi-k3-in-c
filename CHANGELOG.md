@@ -71,6 +71,19 @@ not needing the bytes at all.
 
 ### Changed
 
+- **The KDA recurrence and the MLA latent query absorption are AVX2-vectorised.**
+  `k3_kda_step` (`src/core/k3_ops.c`) ran once per head per token — 96 heads × 69 KDA
+  layers on the real checkpoint — and was the largest un-vectorised kernel on the
+  non-I/O path (`docs/ROADMAP.md` #4); `k3_matmul_tr`'s bf16 and dense branches back
+  `--mla-latent`'s `W_UK` absorption and were the second. Both are loop-interchanged
+  rather than reassociated: every accumulation already summed over a fixed index in a
+  fixed order, so computing several independent output lanes per step, instead of one,
+  changes no single lane's arithmetic. Mul-then-add throughout, never `fmadd`, to match
+  `-ffp-contract=off`; verified bit-identical against a scalar (`-mtune=generic`) build
+  on the op fixtures and the full oracle's GATE 4/5. Measured at real dimensions: the
+  KDA layer forward (`scale_test`, H=96 D=128) drops from a 264 ms/token mean to 93
+  ms/token, ~2.8×; the `matmul_tr` bf16 branch alone (kv_lora=512, qk_nope=128) drops
+  from 20.5 to 14.0 us/call, ~1.45×.
 - **Expert cache replacement is S3-FIFO, not LRU.** The project's own simulator put 25.5
   points between LRU and Belady at 64 GB, and its own conclusion was that the lever is the
   policy rather than the size. Small FIFO, main FIFO, ghost queue; uniform object size

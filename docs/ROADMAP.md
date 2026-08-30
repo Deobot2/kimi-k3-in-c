@@ -57,36 +57,24 @@ Two background threads now exist as well — the trunk reader and the expert-cac
 speculator — so the sweep should cover their interaction with the OpenMP pool rather
 than assuming the pool has the machine to itself.
 
-## 4. SIMD in the KDA recurrence
-
-The bf16 trunk matmul and the MXFP4 expert matmul already have hand-written AVX2 paths
-(`src/core/k3_ops.c`), each written to reproduce the scalar reduction order exactly. The
-KDA recurrence does not: it is still plain scalar C, and it is the largest remaining
-un-vectorised kernel on the non-I/O path.
-
-`k3_matmul_tr`, added for the latent KV cache's query absorption, is the second: it is a
-strided column sweep with a double accumulator per output and no vector path at all. It
-runs 96 times per MLA layer per token, so it is small next to the recurrence but it is
-new and it is scalar.
-
-## 5. Sampling
+## 4. Sampling
 
 Greedy only today. Adding temperature and top-p is small, but note the trade-off: greedy
 decoding is what makes output identical across memory budgets, which is a property the
 test-suite depends on. Sampling must be opt-in and off by default.
 
-## 6. Chat template
+## 5. Chat template
 
 K3 ships an XTML chat format. Without it the engine produces base-model continuations,
 which is why asking a question gets the question completed rather than answered.
 
-## 7. Vision
+## 6. Vision
 
 K3 is natively multimodal. The vision tower is 27 layers and ~0.4B parameters, small,
 and its weights are ~0.9 GB, a fraction of a percent of the checkpoint. Self-contained
 enough to be tractable.
 
-## 8. Serving
+## 7. Serving
 
 No HTTP API. Deliberately last: it is product surface, and everything above changes what
 would be served.
