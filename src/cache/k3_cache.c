@@ -9,6 +9,7 @@
 #include <sys/mman.h>
 
 #include "k3_cache.h"
+#include "k3_hugealloc.h"
 
 static double now_s(void)
 {
@@ -647,23 +648,18 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
         return -1;
     }
 
-    /* Page aligned so the arena can later be read into with O_DIRECT unchanged. */
-    /* 2 MB aligned and hugepage-advised, for the same reason as the trunk arena: every
+    /* Page aligned so the arena can later be read into with O_DIRECT unchanged: 2 MB
+     * aligned and hugepage-advised, for the same reason as the trunk ring -- every
      * O_DIRECT expert read pins its destination pages, and a 17.55 MB slot on 4 KB pages
-     * is 4,284 pins per read, 1,472 reads per token. See k3_trunk.c:k3_alloc_direct.
-     * K3_NOHUGE=1 restores 4 KB so the two can be compared on one binary. */
+     * is 4,284 pins per read, 1,472 reads per token. See k3_hugealloc.h, shared with the
+     * trunk ring so the policy (K3_NOHUGE, the rounding rule, the madvise call) can only
+     * drift out of sync in one place instead of two. */
     {
-        const int huge = !getenv("K3_NOHUGE");
-        const size_t al = huge ? (2u << 20) : 4096u;
-        size_t want = (size_t)c->nslot * c->slot_bytes;
-        if (huge) want = (want + al - 1) & ~(al - 1);
-        if (posix_memalign((void **)&c->arena, al, want) != 0) {
+        const size_t want = (size_t)c->nslot * c->slot_bytes;
+        if (k3_alloc_hugepage((void **)&c->arena, want) != 0) {
             fprintf(stderr, "k3_cache: cannot allocate %.2f GB arena\n", (double)want / 1e9);
             return -1;
         }
-#if defined(MADV_HUGEPAGE)
-        if (huge) madvise(c->arena, want, MADV_HUGEPAGE);
-#endif
     }
 
     const size_t nkey = (size_t)c->n_layers * c->n_experts;

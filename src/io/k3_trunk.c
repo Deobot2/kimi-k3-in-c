@@ -15,11 +15,10 @@
 #include <pthread.h>
 
 #include "json.h"
+#include "k3_hugealloc.h"
 #include "k3_st.h"
 #include "k3_trunk.h"
 #include "k3_uring.h"
-
-static int k3_alloc_direct(void **out, size_t bytes);   /* defined below */
 
 /* THE READER, and the two invariants that keep a deeper ring from corrupting output.
  *
@@ -392,7 +391,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
             if (!chosen[L]) continue;
             const size_t need = (size_t)((tr->lay[L].nbytes + K3_TRUNK_ALIGN - 1)
                                          & ~(int64_t)(K3_TRUNK_ALIGN - 1)) + widen;
-            if (k3_alloc_direct((void **)&tr->pin[k], need) != 0) {
+            if (k3_alloc_hugepage((void **)&tr->pin[k], need) != 0) {
                 fprintf(stderr, "k3_trunk: cannot allocate %.2f GB for pinned layer %d\n",
                         (double)need / 1e9, L);
                 free(order); free(chosen);
@@ -402,7 +401,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
         }
     }
     free(order); free(chosen);
-    if (k3_alloc_direct((void **)&tr->arena, (size_t)RING * (size_t)ring_slot) != 0) {
+    if (k3_alloc_hugepage((void **)&tr->arena, (size_t)RING * (size_t)ring_slot) != 0) {
         fprintf(stderr, "k3_trunk: cannot allocate the %.2f GB streaming ring\n",
                 (double)RING * ring_slot / 1e9);
         return -1;
@@ -545,36 +544,13 @@ void k3_trunk_close(K3Trunk *tr)
 
 /* Read one layer's run into dst. */
 
-/* Allocate an O_DIRECT target on a 2 MB boundary and ask for transparent hugepages.
- *
- * WHY THIS IS NOT COSMETIC. Every O_DIRECT read must pin its destination pages in the
- * kernel (get_user_pages) for the duration of the transfer. A 2.37 GB ring slot backed by
- * 4 KB pages is 578,000 pages pinned and released PER READ, and the trunk is read 93
- * times per token: about 53.8 million pin operations, at a few hundred nanoseconds each.
- * That is on the order of ten seconds per token spent in the kernel doing page
- * bookkeeping, none of which appears in the engine's own I/O timer -- which brackets only
- * the pread loop and therefore reports a device rate that looks like the disk is
- * saturated while a third of the token is unaccounted for.
- *
- * Backing the same buffer with 2 MB pages cuts the count by 512x. The allocation is
- * otherwise identical, so this is lossless and cannot change a single output bit.
- *
- * K3_NOHUGE=1 restores 4 KB alignment so the two can be A/B compared on ONE binary,
- * which is the only way to attribute a timing difference to this decision rather than to
- * the compiler or the weather. */
-static int k3_alloc_direct(void **out, size_t bytes)
-{
-    const int huge = !getenv("K3_NOHUGE");
-    const size_t align = huge ? (2u << 20) : 4096u;
-    /* Round the LENGTH up too: madvise only covers whole pages, so a 2 MB-aligned start
-     * with a ragged tail leaves the last stretch on 4 KB pages. */
-    const size_t len = huge ? ((bytes + align - 1) & ~(align - 1)) : bytes;
-    if (posix_memalign(out, align, len) != 0) return -1;
-#if defined(MADV_HUGEPAGE)
-    if (huge) madvise(*out, len, MADV_HUGEPAGE);   /* advisory: failure is not an error */
-#endif
-    return 0;
-}
+/* The trunk ring's O_DIRECT targets are 2 MB aligned and hugepage-advised via
+ * k3_alloc_hugepage (k3_hugealloc.h); a 2.37 GB ring slot on 4 KB pages is 578,000 pages
+ * pinned and released PER READ, and the trunk is read 93 times per token: about 53.8
+ * million pin operations, on the order of ten seconds per token spent in the kernel
+ * doing page bookkeeping, none of which appears in the engine's own I/O timer. See that
+ * header for the full argument; it is shared with the expert cache arena, which pays
+ * the identical cost for the identical reason on a separate buffer. */
 
 /* Read one layer's run. `ur` may be NULL, in which case this is the pread loop it has
  * always been; when present the transfer is split across the ring so several requests
