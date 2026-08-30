@@ -31,6 +31,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Shared by every AVX2 path in this file, including k3_kda_step near the top, so the
+ * include lives here rather than beside the matmul kernels further down. */
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
  * scratch without changing a published signature. They are hundreds of bytes to a few
@@ -279,15 +285,43 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 }
 
 /* -------------------------------------------------------- KDA recurrence ---- */
+/* Called once per head per token -- 96 heads x 69 KDA layers on the real checkpoint --
+ * and, unlike the matmuls, was pure scalar C: this was the largest un-vectorised kernel
+ * on the non-I/O path (docs/ROADMAP.md #4).
+ *
+ * WHY THE AVX2 PATH IS BIT-IDENTICAL TO THE SCALAR ONE, not merely close. Every loop
+ * below is `for i (scalar): for j (vector): acc[j] OP= f(i) * row[i][j]`: the outer
+ * index i is the accumulation order, and it stays a sequential scalar loop unchanged
+ * from the code above. Vectorising the INNER index j does not reorder anything, it
+ * computes 8 of the dv independent lanes at once, each lane seeing exactly the sequence
+ * of operations the scalar loop would have given it. This is the same argument as
+ * k3_matmul's "output rows are independent", one level down: here it is output
+ * CHANNELS within one row that are independent, not whole rows.
+ *
+ * MUL THEN ADD, never _mm256_fmadd_ps, for the same reason as k3_matmul_bf16: the build
+ * sets -ffp-contract=off, so the scalar code above rounds the product and the sum
+ * separately, and an FMA would round once. Accumulators stay float, matching S, u and o
+ * above, not promoted to double the way k3_matmul's are -- this kernel already agrees
+ * with the scalar path bit for bit before either accumulator width is considered, so
+ * nothing here needs the wider type to converge.
+ */
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
     /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
-     *    channel, not a scalar, which is what "channel-wise forget gate" means. */
+     *    channel, not a scalar, which is what "channel-wise forget gate" means.
+     *    Purely elementwise -- no reduction at all -- so this one needs no argument
+     *    for why vectorising leaves the arithmetic unchanged. */
     for (int i = 0; i < dk; i++) {
         float *row = S + (size_t)i * dv;
         const float a = alpha[i];
-        for (int j = 0; j < dv; j++) row[j] *= a;
+        int j = 0;
+#if defined(__AVX2__)
+        const __m256 va = _mm256_set1_ps(a);
+        for (; j + 7 < dv; j += 8)
+            _mm256_storeu_ps(row + j, _mm256_mul_ps(_mm256_loadu_ps(row + j), va));
+#endif
+        for (; j < dv; j++) row[j] *= a;
     }
 
     /* 2. read the state along k:  u = S^T k */
@@ -300,7 +334,15 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float ki = k[i];
         if (ki == 0.0f) continue;
         const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) u[j] += ki * row[j];
+        int j = 0;
+#if defined(__AVX2__)
+        const __m256 vki = _mm256_set1_ps(ki);
+        for (; j + 7 < dv; j += 8) {
+            const __m256 prod = _mm256_mul_ps(vki, _mm256_loadu_ps(row + j));
+            _mm256_storeu_ps(u + j, _mm256_add_ps(_mm256_loadu_ps(u + j), prod));
+        }
+#endif
+        for (; j < dv; j++) u[j] += ki * row[j];
     }
 
     /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
@@ -309,7 +351,17 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float ki = k[i];
         if (ki == 0.0f) continue;
         float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
+        const float kib = ki * beta;   /* same left-to-right order as the scalar line */
+        int j = 0;
+#if defined(__AVX2__)
+        const __m256 vkib = _mm256_set1_ps(kib);
+        for (; j + 7 < dv; j += 8) {
+            const __m256 diff = _mm256_sub_ps(_mm256_loadu_ps(v + j), _mm256_loadu_ps(u + j));
+            const __m256 prod = _mm256_mul_ps(vkib, diff);
+            _mm256_storeu_ps(row + j, _mm256_add_ps(_mm256_loadu_ps(row + j), prod));
+        }
+#endif
+        for (; j < dv; j++) row[j] += kib * (v[j] - u[j]);
     }
 
     /* 4. output from the ALREADY UPDATED state: o = S^T q */
@@ -318,7 +370,15 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float qi = q[i];
         if (qi == 0.0f) continue;
         const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) o[j] += qi * row[j];
+        int j = 0;
+#if defined(__AVX2__)
+        const __m256 vqi = _mm256_set1_ps(qi);
+        for (; j + 7 < dv; j += 8) {
+            const __m256 prod = _mm256_mul_ps(vqi, _mm256_loadu_ps(row + j));
+            _mm256_storeu_ps(o + j, _mm256_add_ps(_mm256_loadu_ps(o + j), prod));
+        }
+#endif
+        for (; j < dv; j++) o[j] += qi * row[j];
     }
     free(u);
 }
@@ -1456,11 +1516,8 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
 
 /* ---------------------------------------------------------------- MXFP4 ---- */
 /* K3_E2M1 lives near the top of this file: k3_matmul_tr needs it too, for the
- * transposed sweep over a quantised trunk, and that is defined well before here. */
-
-#if defined(__AVX2__)
-#include <immintrin.h>
-#endif
+ * transposed sweep over a quantised trunk, and that is defined well before here.
+ * immintrin.h is included once, near the top, for every AVX2 path in this file. */
 
 /* y[out] = W[out][in] . x[in], with W stored as bf16 and widened on read.
  *
