@@ -753,6 +753,16 @@ size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span)
  *
  * The stride is unfriendly -- consecutive rows are `in` elements apart -- but the whole
  * of W_UK[h] is 128 KB at the released dimensions and stays in L2 across the sweep. */
+/* THE BF16 AND DENSE BRANCHES BELOW ARE VECTORISED FOUR COLUMNS AT A TIME, bit-
+ * identical to the scalar form above them by the same argument as k3_kda_step: for a
+ * fixed column j, `acc` sums over r = 0..rows-1 in that order regardless of how many
+ * OTHER columns are computed alongside it, so processing four independent columns
+ * per r-step (loop interchange, not reassociation) changes no single column's
+ * arithmetic. Four lanes because the accumulator is double, matching the scalar
+ * `double acc` above, and __m256d holds four; MUL THEN ADD as elsewhere in this file,
+ * never fmadd, to match -ffp-contract=off. The MXFP4 and int8 branches stay scalar:
+ * both need a per-r nibble or scale-byte lookup with no natural 4-wide read, and both
+ * are the trunk's own quantised weights, not the latent path this exists for. */
 void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int rows)
 {
     if (wdt == K3_WBF16) {
@@ -760,11 +770,42 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++)
-                acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
-            y[j] = (float)acc;
+        for (int jb = 0; jb < in; jb += 4) {
+            if (jb + 4 <= in) {
+                double a0, a1, a2, a3;
+#if defined(__AVX2__)
+                __m256d vacc = _mm256_setzero_pd();
+                for (int r = 0; r < rows; r++) {
+                    const __m128i h = _mm_loadl_epi64(
+                        (const __m128i *)(w16 + (size_t)r * in + jb));
+                    const __m128 wf = _mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h), 16));
+                    const __m256d wd = _mm256_cvtps_pd(wf);
+                    const __m256d xd = _mm256_set1_pd((double)x[r]);
+                    vacc = _mm256_add_pd(vacc, _mm256_mul_pd(wd, xd));
+                }
+                double tmp[4]; _mm256_storeu_pd(tmp, vacc);
+                a0 = tmp[0]; a1 = tmp[1]; a2 = tmp[2]; a3 = tmp[3];
+#else
+                a0 = a1 = a2 = a3 = 0.0;
+                for (int r = 0; r < rows; r++) {
+                    const uint16_t *row = w16 + (size_t)r * in + jb;
+                    const double xr = (double)x[r];
+                    a0 += xr * (double)k3_bf16f(row[0]);
+                    a1 += xr * (double)k3_bf16f(row[1]);
+                    a2 += xr * (double)k3_bf16f(row[2]);
+                    a3 += xr * (double)k3_bf16f(row[3]);
+                }
+#endif
+                y[jb + 0] = (float)a0; y[jb + 1] = (float)a1;
+                y[jb + 2] = (float)a2; y[jb + 3] = (float)a3;
+            } else {
+                for (int j = jb; j < in; j++) {
+                    double acc = 0.0;
+                    for (int r = 0; r < rows; r++)
+                        acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
+                    y[j] = (float)acc;
+                }
+            }
         }
     } else if (wdt == K3_WMX4) {
         /* A quantised trunk. Column j of row r is the nibble at byte j/2 of that row,
@@ -819,11 +860,38 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++)
-                acc += (double)x[r] * (double)wf[(size_t)r * in + j];
-            y[j] = (float)acc;
+        for (int jb = 0; jb < in; jb += 4) {
+            if (jb + 4 <= in) {
+                double a0, a1, a2, a3;
+#if defined(__AVX2__)
+                __m256d vacc = _mm256_setzero_pd();
+                for (int r = 0; r < rows; r++) {
+                    const __m128 wv = _mm_loadu_ps(wf + (size_t)r * in + jb);
+                    const __m256d wd = _mm256_cvtps_pd(wv);
+                    const __m256d xd = _mm256_set1_pd((double)x[r]);
+                    vacc = _mm256_add_pd(vacc, _mm256_mul_pd(wd, xd));
+                }
+                double tmp[4]; _mm256_storeu_pd(tmp, vacc);
+                a0 = tmp[0]; a1 = tmp[1]; a2 = tmp[2]; a3 = tmp[3];
+#else
+                a0 = a1 = a2 = a3 = 0.0;
+                for (int r = 0; r < rows; r++) {
+                    const float *row = wf + (size_t)r * in + jb;
+                    const double xr = (double)x[r];
+                    a0 += xr * (double)row[0]; a1 += xr * (double)row[1];
+                    a2 += xr * (double)row[2]; a3 += xr * (double)row[3];
+                }
+#endif
+                y[jb + 0] = (float)a0; y[jb + 1] = (float)a1;
+                y[jb + 2] = (float)a2; y[jb + 3] = (float)a3;
+            } else {
+                for (int j = jb; j < in; j++) {
+                    double acc = 0.0;
+                    for (int r = 0; r < rows; r++)
+                        acc += (double)x[r] * (double)wf[(size_t)r * in + j];
+                    y[j] = (float)acc;
+                }
+            }
         }
     }
 }
