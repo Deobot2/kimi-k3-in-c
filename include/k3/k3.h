@@ -235,14 +235,19 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out);
  * The output gate multiplies the attention output BEFORE o_proj, with no norm,
  * unlike KDA which norms first then gates. :470-473.
  *
- * scratch must hold at least
+ * scratch must hold at least, for the self-contained path k3_mla() uses:
  *     T*H*(qk_nope+qk_rope)      q
- *   + T*H*(qk_nope+v_head)       kv
- *   + T*(kv_lora+qk_rope)        compressed latent plus the shared rope slot
+ *   + T*H*(qk_nope+v_head)       kv, expanded on the fly (self-contained path only)
+ *   + (kv_lora+qk_rope)          compressed latent, ONE position's worth (a transient,
+ *                                not scaled by T)
+ *   + T*qk_rope                  the shared rope row, one per position
  *   + q_lora                     transient
  *   + 2*H*v_head                 attention accumulator and gate buffer
  *   + T                          scores
- * floats. Use k3_mla_scratch() rather than recomputing this.
+ * floats. This is NOT T*(kv_lora+qk_rope) as a single term -- the transient and the rope
+ * row scale differently, and folding them together under-counts by qk_rope at T=1.
+ * k3_mla_scratch_cached() and k3_mla_scratch_latent() size the cached and latent variants,
+ * which differ further still. Use these functions rather than recomputing any of it.
  */
 typedef struct {
     /* Tagged by wdt: fp32 when zero (every fixture), bf16 for the real checkpoint. */
