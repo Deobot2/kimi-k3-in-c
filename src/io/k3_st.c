@@ -125,7 +125,15 @@ static int i64_(Scan *s, int64_t *v)
     if (s->p < s->end && (*s->p == '-' || *s->p == '+')) neg = (*s->p++ == '-');
     if (s->p >= s->end || *s->p < '0' || *s->p > '9') return 0;
     int64_t a = 0;
-    while (s->p < s->end && *s->p >= '0' && *s->p <= '9') a = a * 10 + (*s->p++ - '0');
+    /* A hostile or corrupt header can carry an arbitrarily long digit run; a * 10 + d
+     * without a bound is signed overflow, undefined behaviour in C, on the 19th digit.
+     * Real offsets and shapes top out in the trillions (13 digits), so refusing rather
+     * than wrapping costs nothing legitimate. */
+    while (s->p < s->end && *s->p >= '0' && *s->p <= '9') {
+        const int d = *s->p++ - '0';
+        if (a > (INT64_MAX - d) / 10) return 0;
+        a = a * 10 + d;
+    }
     *v = neg ? -a : a;
     return 1;
 }
@@ -310,6 +318,17 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
 
         if (!have_dt || !have_off) {
             fprintf(stderr, "k3_st: %s: %s is missing dtype or data_offsets\n", path, name);
+            goto bad;
+        }
+
+        /* data_offsets came straight off i64_() on file-supplied JSON: a negative o0 paired
+         * with a matching o1 can still pass the nbytes/EOF checks below (they only
+         * constrain the difference and the upper end), leaving t.off pointing before the
+         * shard's data region. Refuse rather than load it, same policy as everything
+         * else in this file. */
+        if (o0 < 0 || o1 < o0) {
+            fprintf(stderr, "k3_st: %s: %s has invalid data_offsets [%lld, %lld]\n",
+                    path, name, (long long)o0, (long long)o1);
             goto bad;
         }
 
