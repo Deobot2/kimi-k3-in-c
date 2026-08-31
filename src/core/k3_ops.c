@@ -1088,7 +1088,12 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
     int   *ridx = (int *)  malloc((size_t)T * K * sizeof(int));
     float *rwt  = (float *)malloc((size_t)T * K * sizeof(float));
     float *zz   = (float *)malloc((size_t)T * Ll * sizeof(float));
-    float *contrib = (float *)malloc((size_t)T * K * Ll * sizeof(float));
+    /* Zeroed, not merely allocated: a dropped expert's (t, j) slot is skipped below rather
+     * than written, and step 3 sums every slot unconditionally. Without the zero-fill that
+     * sum would fold uninitialised heap bytes into the output instead of treating the
+     * missing expert as a zero contribution -- silent corruption of exactly the kind
+     * k3_expert_drops exists to make loud. */
+    float *contrib = (float *)calloc((size_t)T * K * Ll, sizeof(float));
     if (!ridx || !rwt || !zz || !contrib)
         k3_fatal_oom("MoE prefill batch", (size_t)T * K * Ll * sizeof(float));
 
