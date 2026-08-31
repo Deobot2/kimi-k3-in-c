@@ -1316,6 +1316,12 @@ size_t k3_layer_scratch_kv(const K3Cfg *c, int T, int span, int mode)
     size_t m = k3_moe_scratch(c);
     size_t sub = a > b ? a : b;
     if (m > sub) sub = m;
+    /* The dense branch (no MoE, first_k_dense_replace layers) writes dense_inter floats
+     * of SiTU-GLU output starting at this same `sub` region -- see the k3_situ_glu(sub,
+     * dgu, c->dense_inter, ...) call in k3_decoder_layer_inc. On the released dimensions
+     * dense_inter (33,792) is smaller than the MoE scratch (45,568) so this held by
+     * coincidence; nothing forced it. */
+    if ((size_t)c->dense_inter > sub) sub = (size_t)c->dense_inter;
     /* prefix_sum, tmp, fold vectors, one attn_res source stack, plus the sub-block */
     return (size_t)3 * T * c->hidden
          + (size_t)2 * c->hidden
