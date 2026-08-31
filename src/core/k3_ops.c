@@ -307,11 +307,24 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     }
 
     /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
-     * would leave the recurrent state permanently scaled but never updated -- silent,
-     * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    /* This runs H*T times per KDA layer -- once per (head, token) inside the
+     * parallel-over-heads loop below -- so a heap round trip per call is real
+     * contention on the allocator across threads for a 128-float scratch. dv is the
+     * head dimension, D, which is 128 on the released model; 256 is headroom the same
+     * way mxfp4_rowdot's wf[64] is headroom for a group of 32. Allocated AFTER the
+     * decay above has already modified S either way: returning early here would leave
+     * the recurrent state permanently scaled but never updated -- silent, unrecoverable
+     * corruption of every subsequent token. */
+    float ubuf[256];
+    float *uheap = NULL;
+    float *u = ubuf;
+    if (dv > 256) {
+        uheap = (float *)calloc((size_t)dv, sizeof(float));
+        if (!uheap) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+        u = uheap;
+    } else {
+        memset(u, 0, (size_t)dv * sizeof(float));
+    }
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -336,7 +349,7 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
+    free(uheap);
 }
 
 /* ---------------------------------------------------------------- matmul ---- */
