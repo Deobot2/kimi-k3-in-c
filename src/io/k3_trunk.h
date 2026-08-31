@@ -161,6 +161,14 @@ typedef struct {
      * both wrong. k3_trunk_report prints the offenders. */
     uint32_t    *reads_of;
     double       load_seconds;
+    /* Wall clock around the whole of k3_trunk_bind, and the widen step within it. Per
+     * struct rather than process-global: the hybrid draft path (--draft-trunk) and
+     * tests/unit/test_trunk.c can both have a K3Trunk open at once, and a shared global
+     * would fold one trunk's bind time into the other's k3_trunk_report output. See the
+     * note above k3_trunk_bind in the .c for what these measure and why. */
+    double       bind_wall;
+    double       widen_wall;
+    long         binds;
 } K3Trunk;
 
 /* Read ONLY the manifest: total packed bytes, layer count, and whether the weights were

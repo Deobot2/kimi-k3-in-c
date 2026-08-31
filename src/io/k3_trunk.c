@@ -74,12 +74,10 @@ static void *trunk_io_main(void *arg);
  * to it while still being paid on every layer of every token. That residual is large
  * enough to change conclusions drawn from the device rate alone.
  *
- * These three counters close the gap by measurement rather than estimate: wall clock
- * around the whole of k3_trunk_bind, of which the widen loop is tracked separately, so
- * bind_wall - load_seconds - widen_wall is the remaining unattributed time. */
-double k3_trunk_bind_wall = 0.0;    /* total wall inside k3_trunk_bind   */
-double k3_trunk_widen_wall = 0.0;   /* of which, inside k3_bind_layer_mem */
-long   k3_trunk_binds = 0;
+ * tr->bind_wall/widen_wall/binds close the gap by measurement rather than estimate: wall
+ * clock around the whole of k3_trunk_bind, of which the widen loop is tracked separately,
+ * so bind_wall - load_seconds - widen_wall is the remaining unattributed time. Kept on the
+ * struct rather than as process globals: see the note beside them in k3_trunk.h. */
 
 static double now_s(void)
 {
@@ -824,7 +822,7 @@ int k3_trunk_fetch(K3Trunk *tr, int L, unsigned char **out)
 int k3_trunk_bind(K3Trunk *tr, const K3Cfg *c, int L, K3LayerBind *b)
 {
     const double t_bind0 = now_s();
-    k3_trunk_binds++;
+    tr->binds++;
     unsigned char *base = NULL;
     if (k3_trunk_fetch(tr, L, &base) != 0) return -1;
 
@@ -837,8 +835,8 @@ int k3_trunk_bind(K3Trunk *tr, const K3Cfg *c, int L, K3LayerBind *b)
     const double tw = now_s();
     const int rc = k3_bind_layer_mem(c, L, b, base, &src, widen, cap, NULL);
     const double tnow = now_s();
-    k3_trunk_widen_wall += tnow - tw;
-    k3_trunk_bind_wall  += tnow - t_bind0;
+    tr->widen_wall += tnow - tw;
+    tr->bind_wall  += tnow - t_bind0;
     return rc;
 }
 
@@ -937,26 +935,26 @@ void k3_trunk_report(const K3Trunk *tr, const char *label)
          * achieved, which is how the previous form of this line reported the feature
          * working as "other -157.06" and a read share of 207%. Overlapped time is a
          * result, not unattributed overhead, so it is named rather than subtracted. */
-        const double serial = tr->load_seconds + k3_trunk_widen_wall;
-        const double overlapped = serial - k3_trunk_bind_wall;
+        const double serial = tr->load_seconds + tr->widen_wall;
+        const double overlapped = serial - tr->bind_wall;
         if (overlapped > 0.0) {
             printf("  bind wall %.2f s over %ld binds; read %.2f + widen %.2f = %.2f s of "
                    "device work,\n"
                    "                    of which %.2f s (%.0f%%) overlapped compute on the "
                    "reader thread\n",
-                   k3_trunk_bind_wall, k3_trunk_binds, tr->load_seconds,
-                   k3_trunk_widen_wall, serial, overlapped,
+                   tr->bind_wall, tr->binds, tr->load_seconds,
+                   tr->widen_wall, serial, overlapped,
                    serial > 0.0 ? 100.0 * overlapped / serial : 0.0);
         } else {
-            const double other = k3_trunk_bind_wall - serial;
+            const double other = tr->bind_wall - serial;
             printf("  bind wall %.2f s over %ld binds  =  read %.2f + widen %.2f + other %.2f\n",
-                   k3_trunk_bind_wall, k3_trunk_binds, tr->load_seconds,
-                   k3_trunk_widen_wall, other);
-            if (k3_trunk_bind_wall > 0.0)
+                   tr->bind_wall, tr->binds, tr->load_seconds,
+                   tr->widen_wall, other);
+            if (tr->bind_wall > 0.0)
                 printf("                    shares:      read %.0f%%  widen %.0f%%  other %.0f%%\n",
-                       100.0 * tr->load_seconds / k3_trunk_bind_wall,
-                       100.0 * k3_trunk_widen_wall / k3_trunk_bind_wall,
-                       100.0 * other / k3_trunk_bind_wall);
+                       100.0 * tr->load_seconds / tr->bind_wall,
+                       100.0 * tr->widen_wall / tr->bind_wall,
+                       100.0 * other / tr->bind_wall);
         }
     }
 }
