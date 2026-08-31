@@ -243,7 +243,11 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
         fprintf(stderr, "k3_st: %s header is not a JSON object\n", path); goto bad;
     }
 
-    static char name[512];
+    /* Scratch only: push() below copies every name it reads into s->strpool before the
+     * next iteration overwrites this, so nothing is retained across calls and there is
+     * no reason for this to be `static` -- doing so just makes the scanner gratuitously
+     * non-reentrant for no benefit. */
+    char name[512];
     int first = 1, ntensor = 0;
     int64_t maxend = 0;
     for (;;) {
@@ -364,7 +368,10 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
      * falls back to fd[]. */
     if (s->dfd) {
         s->dfd[shard] = open(path, O_RDONLY | O_DIRECT);
-        k3_set_direct(s->dfd[shard]);   /* no-op off Darwin; advisory, failure is fine */
+        /* no-op off Darwin; advisory, failure is fine. Guarded the same way k3_trunk.c's
+         * call is: a failed open() already left dfd[shard] negative, and there is
+         * nothing to set on a descriptor that does not exist. */
+        if (s->dfd[shard] >= 0) k3_set_direct(s->dfd[shard]);
     }
     return ntensor;
 bad:
