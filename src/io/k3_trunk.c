@@ -103,6 +103,11 @@ static char *slurp(const char *p, size_t *n)
     FILE *f = fopen(p, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    /* ftell fails (-1) on a directory fopen("rb") happened to accept, or an unseekable
+     * stream. Unchecked, (size_t)sz + 1 wraps to 0: malloc(0) succeeds, and the fread
+     * below -- which uses (size_t)sz, SIZE_MAX, not the wrapped length -- would then
+     * write an unbounded read straight through that zero-size allocation. */
+    if (sz < 0) { fclose(f); return NULL; }
     char *b = (char *)malloc((size_t)sz + 1);
     if (!b) { fclose(f); return NULL; }
     if (fread(b, 1, (size_t)sz, f) != (size_t)sz) { free(b); fclose(f); return NULL; }
