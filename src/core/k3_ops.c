@@ -776,9 +776,12 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
     /* Returning early here would leave idx[] and w[] untouched, and k3_moe forms
      * `w->w1 + idx[j]*I*L` from them one line later -- an arbitrary pointer built from
      * uninitialised stack. */
-    float *score  = (float *)malloc((size_t)n_experts * sizeof(float));
-    float *choice = (float *)malloc((size_t)n_experts * sizeof(float));
-    if (!score || !choice) k3_fatal_oom("router scores", (size_t)n_experts * sizeof(float) * 2);
+    /* One allocation for both: they are independent n_experts-float buffers with no
+     * shared layout requirement, so there is no reason to pay two malloc/free pairs
+     * (184 of them per decoded token, one per MoE layer) for what one covers. */
+    float *score  = (float *)malloc((size_t)2 * n_experts * sizeof(float));
+    float *choice = score + n_experts;
+    if (!score) k3_fatal_oom("router scores", (size_t)n_experts * sizeof(float) * 2);
 
     /* logits in float32 with no bias, then an independent sigmoid per expert. The
      * reference upcasts both operands explicitly; a double accumulator here matches
@@ -827,7 +830,7 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
     }
     for (int j = 0; j < topk; j++) w[j] *= routed_scale;
 
-    free(score); free(choice);
+    free(score);
 }
 
 /* --------------------------------------------------------------- AttnRes ---- */
