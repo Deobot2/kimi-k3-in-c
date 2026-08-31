@@ -183,6 +183,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
 
     jval *jl = json_get(root, "layers");
     if (!jl || jl->t != J_ARR) { fprintf(stderr, "k3_trunk: no layers array\n"); goto bad; }
+    if (jl->len <= 0) { fprintf(stderr, "k3_trunk: %s has an empty layers array\n", p); goto bad; }
     tr->n_layers = jl->len;
     tr->lay = (K3TrunkLayer *)calloc((size_t)tr->n_layers, sizeof(K3TrunkLayer));
     if (!tr->lay) goto bad;
