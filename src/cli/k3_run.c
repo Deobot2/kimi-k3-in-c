@@ -199,11 +199,15 @@ static K3PplDoc *ppl_load_suite(const char *path, int *ndoc, int *maxlen, int vo
         }
         *tab = 0;
         if (nd == cap) {
-            cap *= 2;
-            K3PplDoc *nx = (K3PplDoc *)realloc(d, cap * sizeof *d);
+            /* Grow into a local so a failed realloc leaves `cap` matching d's actual
+             * allocated size, not the size the grow attempt wanted -- the cleanup below
+             * uses `nd < cap` to tell whether d[nd] is memory it can touch. */
+            const size_t ncap = cap * 2;
+            K3PplDoc *nx = (K3PplDoc *)realloc(d, ncap * sizeof *d);
             if (!nx) { bad = 1; break; }
             d = nx;
-            memset(d + nd, 0, (cap - nd) * sizeof *d);
+            memset(d + nd, 0, (ncap - nd) * sizeof *d);
+            cap = ncap;
         }
         /* An upper bound on the id count: every id needs at least one separator byte
          * after the first, so the remaining text length always covers it. */
@@ -247,6 +251,11 @@ static K3PplDoc *ppl_load_suite(const char *path, int *ndoc, int *maxlen, int vo
     }
     if (bad) {
         for (size_t i = 0; i < nd; i++) { free(d[i].name); free(d[i].ids); }
+        /* The document being built when `bad` was set is not counted in nd yet, but
+         * d[nd].name/.ids may already hold allocations (strdup/malloc above, or a parse
+         * failure partway through). Free it too, guarded by nd < cap: on the realloc
+         * failure path nd == cap and d has no slot nd to touch at all. */
+        if (nd < cap) { free(d[nd].name); free(d[nd].ids); }
         free(d);
         return NULL;
     }
