@@ -1081,7 +1081,18 @@ int main(int argc, char **argv)
         printf("  tokenized: %ld bytes -> %d ids\n", plen, np);
     } else {
         for (const char *p = ids_s; *p && np < K3_MAX_PROMPT; ) {
-            prompt[np++] = (int)strtol(p, (char **)&p, 10);
+            char *end = NULL;
+            const long v = strtol(p, &end, 10);
+            /* strtol leaves end == p on a failed conversion rather than advancing, so an
+             * unchecked loop here never moves past the bad text either -- it re-parses
+             * the same spot every iteration and pads prompt[] with id 0 until np hits
+             * K3_MAX_PROMPT, which then looks like a legitimate (if huge) prompt. */
+            if (end == p) {
+                fprintf(stderr, "--ids: cannot parse '%s' as a token id\n", p);
+                return 2;
+            }
+            prompt[np++] = (int)v;
+            p = end;
             while (*p == ',' || *p == ' ') p++;
         }
     }
