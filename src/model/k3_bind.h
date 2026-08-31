@@ -83,7 +83,13 @@ typedef struct {
 int  k3_bind_model(const K3St *s, const K3Cfg *c, int want_lm_head, K3ModelBind *m);
 void k3_bind_model_free(K3ModelBind *m);
 
-/* BYTES one layer needs, without loading it. For sizing and for reporting. */
+/* BYTES one layer needs, without loading it. For sizing and for reporting.
+ *
+ * Always sizes as if every large tensor binds narrow (BF16): it does not replicate
+ * k3_bind_layer's fp32 demotion, which fires when a real layer's large tensors are not
+ * all BF16 and roughly doubles that layer's footprint. A caller using this figure for
+ * memory budgeting (k3_run.c's pre-allocation report is one) will under-count any layer
+ * that demotes at actual bind time. */
 int64_t k3_bind_layer_bytes(const K3St *s, const K3Cfg *c, int layer);
 
 /* ---- binding from a memory buffer, for the streaming trunk ------------------------
