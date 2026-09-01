@@ -1080,9 +1080,26 @@ int main(int argc, char **argv)
         free(ptext);
         printf("  tokenized: %ld bytes -> %d ids\n", plen, np);
     } else {
-        for (const char *p = ids_s; *p && np < K3_MAX_PROMPT; ) {
-            prompt[np++] = (int)strtol(p, (char **)&p, 10);
+        const char *p = ids_s;
+        while (*p && np < K3_MAX_PROMPT) {
+            char *end;
+            const long v = strtol(p, &end, 10);
+            /* strtol leaves end == p and returns 0 on anything it cannot parse as an
+             * integer, which used to read as "token 0" and silently keep going --
+             * `--ids abc` filled the whole K3_MAX_PROMPT buffer with zeros rather than
+             * being refused. */
+            if (end == p) {
+                fprintf(stderr, "--ids: cannot parse '%s' as an integer\n", p);
+                return 2;
+            }
+            prompt[np++] = (int)v;
+            p = end;
             while (*p == ',' || *p == ' ') p++;
+        }
+        if (*p) {
+            fprintf(stderr, "--ids: more than %d ids given, exceeding the %d-id ceiling\n",
+                    K3_MAX_PROMPT, K3_MAX_PROMPT);
+            return 2;
         }
     }
     if (np == 0) { fprintf(stderr, "no prompt ids parsed\n"); return 2; }
@@ -1117,6 +1134,20 @@ int main(int argc, char **argv)
      * than letting a long prompt get 40 minutes into a run and then be OOM-killed. Only
      * incremental decode allocates the KV cache; full recompute carries no cache. */
     /* ---- KV layout, and the flags that only make sense together ---- */
+    if (incremental && (want_ppl || tf_check)) {
+        /* --ppl scores each document from a clean slate on purpose: forward() only
+         * clears the carried KDA/ShortConv state and KV cache when w.kv_on is false,
+         * and --incremental is what turns w.kv_on on, permanently, for the rest of the
+         * process. With both flags set, document i's score would silently depend on
+         * document i-1 having run first -- and --tf-check inherits the same hazard the
+         * moment state was ever primed beforehand (--load-state). Neither flag needs
+         * a carried cache: --ppl and --tf-check each run their own single teacher-
+         * forced pass over ids already in hand. */
+        fprintf(stderr, "--incremental cannot be combined with --ppl/--ppl-file/--tf-check: "
+                        "both score from a clean slate, and --incremental leaves state "
+                        "carried across calls instead of clearing it\n");
+        return 2;
+    }
     if (mla_latent && !incremental) {
         fprintf(stderr, "--mla-latent needs --incremental: without a carried cache "
                         "there is no KV layout to choose\n");
@@ -2139,15 +2170,31 @@ int main(int argc, char **argv)
     }
     free(spec_snap);
     printf("--------------------------------------------------------------------\n");
-    printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total, t_total / nout);
+    /* nout can be 0 (--gen 0 is accepted), and t_total / 0 is a NaN that later lands
+     * straight in the JSON below, which is not valid JSON. */
+    const double s_per_tok = nout > 0 ? t_total / nout : 0.0;
+    printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total, s_per_tok);
 
     /* Decoded text, when a tokenizer is loaded. Printed as a distinct block rather than
      * streamed per token: a partially-decoded multi-byte sequence is not valid UTF-8, so
      * streaming would emit mojibake at every token boundary that splits a codepoint. */
     if (have_tok && nout > 0) {
-        char *txt = (char *)malloc((size_t)nout * 8 + 1);
+        /* tok_decode emits at most strlen(id2str[id]) bytes per token: an added token
+         * is copied verbatim at that length, and an ordinary one emits at most one
+         * output byte per source codepoint, which is at most one per source byte. A
+         * fixed bytes-per-token guess (this used to be 8) truncates silently the
+         * moment any token is longer -- routine for a 100k+-entry vocabulary, where
+         * long merged words and most non-Latin-script tokens exceed it. Summing the
+         * real per-token bound costs one pass over ids already in hand and can never
+         * truncate. */
+        size_t need = 1;
+        for (int i = 0; i < nout; i++) {
+            const int id = outtok[i];
+            if (id >= 0 && id < tok.n_ids && tok.id2str[id]) need += strlen(tok.id2str[id]);
+        }
+        char *txt = (char *)malloc(need);
         if (txt) {
-            int m = tok_decode(&tok, outtok, nout, txt, nout * 8);
+            int m = tok_decode(&tok, outtok, nout, txt, (int)need - 1);
             txt[m] = 0;
             printf("\n--- generated text ---\n%s\n----------------------\n\n", txt);
             free(txt);
@@ -2168,7 +2215,13 @@ int main(int argc, char **argv)
         for (int i = 0; i < nout; i++) fprintf(f, "%s%d", i ? "," : "", outtok[i]);
         fprintf(f, "],\"full_ids\":[");
         for (int i = 0; i < T; i++) fprintf(f, "%s%d", i ? "," : "", seq[i]);
-        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f}\n", NL, t_total / nout);
+        /* k3_expert_drops is checked and reported below, AFTER this file is written and
+         * closed -- a caller that reads generated_ids straight out of this JSON without
+         * also checking the process exit code would see a normal-looking result from a
+         * run this process itself is about to call CORRUPT. Stamp the verdict into the
+         * file that outlives the process, not just the exit code and a stderr line. */
+        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f,\"valid\":%s}\n",
+                NL, s_per_tok, k3_expert_drops ? "false" : "true");
         fclose(f);
         printf("\nwrote %s\n", outp);
     }
