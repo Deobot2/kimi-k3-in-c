@@ -1526,6 +1526,8 @@ int main(int argc, char **argv)
 
     K3Cache cache;
     if (k3_cache_init(&cache, &st, &c, (int64_t)(cache_gb * 1e9)) != 0) return 1;
+    /* Only pay for the access trace when something will read it back. */
+    cache.want_trace = trace_dir != NULL;
     {   /* The plan is a forecast. This is the outcome. */
         char rb[32];
         human(peak_rss_bytes(), rb, sizeof rb);

@@ -209,6 +209,11 @@ typedef struct {
      * each, is 12 KB per token. */
     int32_t     *trace;
     int64_t      ntrace, captrace;
+    /* Off by default: recording is unconditional inside get() otherwise, and at 1,472
+     * requests per token it grows without bound (and without a way to turn it off) on a
+     * long run that never passed --dump-cache-trace. Set directly, or through no
+     * accessor at all -- there being none is the point, one bool does not need one. */
+    int          want_trace;
 } K3Cache;
 
 /* budget_bytes is the arena size; it is rounded down to whole experts. Fails if that

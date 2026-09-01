@@ -568,15 +568,21 @@ static int cache_get(K3ExpertSrc *self, int layer, int expert, K3ExpertQ *out)
 
     /* Record the request before serving it. The trace must reflect what the MODEL
      * asked for, independent of what the cache happened to hold, or replaying it at a
-     * different capacity would be meaningless. */
-    if (c->ntrace + 2 > c->captrace) {
-        int64_t nc = c->captrace ? c->captrace * 2 : (1 << 16);
-        int32_t *nt = (int32_t *)realloc(c->trace, (size_t)nc * sizeof(int32_t));
-        if (nt) { c->trace = nt; c->captrace = nc; }
-    }
-    if (c->ntrace + 2 <= c->captrace) {
-        c->trace[c->ntrace++] = layer;
-        c->trace[c->ntrace++] = expert;
+     * different capacity would be meaningless.
+     *
+     * Gated on want_trace: at 1,472 requests per token (12 KB/token) this array grows
+     * without bound for the whole run, whether or not anything will ever read it back.
+     * Only --dump-cache-trace sets want_trace, so a plain run pays nothing here. */
+    if (c->want_trace) {
+        if (c->ntrace + 2 > c->captrace) {
+            int64_t nc = c->captrace ? c->captrace * 2 : (1 << 16);
+            int32_t *nt = (int32_t *)realloc(c->trace, (size_t)nc * sizeof(int32_t));
+            if (nt) { c->trace = nt; c->captrace = nc; }
+        }
+        if (c->ntrace + 2 <= c->captrace) {
+            c->trace[c->ntrace++] = layer;
+            c->trace[c->ntrace++] = expert;
+        }
     }
     pthread_mutex_unlock(&c->mu);
 
