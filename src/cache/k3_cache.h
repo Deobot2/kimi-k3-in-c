@@ -152,6 +152,14 @@ typedef struct {
                                    * the threshold s_target is chosen against       */
     int32_t     *ghost;           /* [nghost] ring of recently evicted keys    */
     unsigned char *ghost_mark;    /* [n_layers*n_experts] membership, exact    */
+    /* [n_layers*n_experts] ring INDEX of a marked key's current live entry, valid
+     * exactly when ghost_mark[key] is set. Lets admission remove the physical ring
+     * entry instead of just clearing the mark and hoping the entry "ages out" -- if a
+     * key is re-added to the ghost queue after being promoted out of it, the stale
+     * ring slot from its first visit would otherwise still be sitting there, and when
+     * IT ages out it would clear ghost_mark for the key even though the second,
+     * genuinely live entry has not aged out yet. See admit_queue(). */
+    int32_t     *ghost_pos;
     int32_t      nghost, ghost_at, ghost_len;
 
     /* The slots most recently handed out, which eviction must not touch: k3_moe holds

@@ -78,12 +78,19 @@ static void ghost_add(K3Cache *c, int32_t key)
     if (c->ghost_mark[key]) return;
     if (c->ghost_len == c->nghost) {          /* FIFO: drop the oldest key */
         const int32_t old = c->ghost[c->ghost_at];
-        if (old >= 0) c->ghost_mark[old] = 0;
+        /* Only clear the outgoing key's mark if THIS is still its live entry: a key
+         * cleared by admit_queue and re-added later gets a fresh ring slot recorded in
+         * ghost_pos, so an old, already-invalidated ring cell (set to -1 there) never
+         * reaches this branch, and a stale mark from some OTHER key that happens to
+         * still occupy `old`'s value cannot be cleared out from under a newer entry
+         * for that same key. */
+        if (old >= 0 && c->ghost_pos[old] == c->ghost_at) c->ghost_mark[old] = 0;
     } else {
         c->ghost_len++;
     }
     c->ghost[c->ghost_at] = key;
     c->ghost_mark[key] = 1;
+    c->ghost_pos[key] = c->ghost_at;
     c->ghost_at = (c->ghost_at + 1) % c->nghost;
 }
 
@@ -704,6 +711,7 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
     if (c->recent_cap < 1) c->recent_cap = 1;
     c->recent  = (int32_t *)malloc((size_t)c->recent_cap * sizeof(int32_t));
     c->ghost_mark = (unsigned char *)calloc(nkey, 1);
+    c->ghost_pos  = (int32_t *)malloc(nkey * sizeof(int32_t));
     c->last_topk  = (int32_t *)calloc((size_t)c->n_layers * K3_MAX_TOPK, sizeof(int32_t));
     c->last_n     = (int32_t *)calloc((size_t)c->n_layers, sizeof(int32_t));
     /* The ghost queue remembers as many keys as there are slots. Bigger than that and it
@@ -712,10 +720,11 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
     c->ghost  = (int32_t *)malloc((size_t)c->nghost * sizeof(int32_t));
     if (!c->slot_of || !c->inflight_of || !c->key_of || !c->used_at || !c->pinned ||
         !c->ref || !c->pad || !c->hist || !c->q_next || !c->q_of || !c->freq ||
-        !c->recent || !c->ghost_mark || !c->ghost || !c->last_topk || !c->last_n) {
+        !c->recent || !c->ghost_mark || !c->ghost_pos || !c->ghost ||
+        !c->last_topk || !c->last_n) {
         k3_cache_free(c); return -1;
     }
-    for (size_t i = 0; i < nkey; i++) { c->slot_of[i] = -1; c->inflight_of[i] = -1; }
+    for (size_t i = 0; i < nkey; i++) { c->slot_of[i] = -1; c->inflight_of[i] = -1; c->ghost_pos[i] = -1; }
     for (int i = 0; i < c->nslot; i++) c->key_of[i] = -1;
     for (int i = 0; i < c->recent_cap; i++) c->recent[i] = -1;
     for (int i = 0; i < c->nghost; i++) c->ghost[i] = -1;
@@ -801,7 +810,7 @@ void k3_cache_free(K3Cache *c)
     free(c->arena); free(c->slot_of); free(c->inflight_of); free(c->key_of);
     free(c->used_at); free(c->pinned); free(c->ref); free(c->pad); free(c->hist);
     free(c->q_next); free(c->q_of); free(c->freq); free(c->recent);
-    free(c->ghost); free(c->ghost_mark); free(c->last_topk); free(c->last_n);
+    free(c->ghost); free(c->ghost_mark); free(c->ghost_pos); free(c->last_topk); free(c->last_n);
     free(c->trace);
     memset(c, 0, sizeof *c);
 }
