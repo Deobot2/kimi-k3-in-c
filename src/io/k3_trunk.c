@@ -21,6 +21,25 @@
 
 static int k3_alloc_direct(void **out, size_t bytes);   /* defined below */
 
+/* The size a pinned layer of `nbytes` actually needs once allocated, matching the
+ * rounding the allocation site below applies before calling k3_alloc_direct: up to
+ * K3_TRUNK_ALIGN for the layer itself, plus the widen area.
+ *
+ * The pin-selection budget used to charge nbytes + widen, unrounded, while the
+ * allocation always rounds the layer up first; at ~80 pinned layers on the released
+ * checkpoint that under-charged the printed memory plan by up to one alignment step
+ * each. (k3_alloc_direct rounds once more, to a 2 MB huge page unless K3_NOHUGE is set,
+ * but that step is advisory -- whether the kernel actually backs the padding with a
+ * huge page depends on THP settings and physical contiguity outside this process's
+ * control -- and negligible relative to any layer in the released checkpoint, so it is
+ * not charged here; it dominates only for a layer already far smaller than one page,
+ * which the released model has none of.) One function used at both the selection loop
+ * and the allocation site keeps them from drifting apart again. */
+static int64_t k3_trunk_pin_bytes(int64_t nbytes, size_t widen)
+{
+    return ((nbytes + K3_TRUNK_ALIGN - 1) & ~(int64_t)(K3_TRUNK_ALIGN - 1)) + (int64_t)widen;
+}
+
 /* THE READER, and the two invariants that keep a deeper ring from corrupting output.
  *
  * With one slot in flight the old design could stay informal: the worker held one
@@ -371,7 +390,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
         memset(chosen, 0, (size_t)tr->n_layers);
         for (int i = 0; i < tr->n_layers; i++) {
             const int L = order[i];
-            const int64_t need = tr->lay[L].nbytes + (int64_t)widen;
+            const int64_t need = k3_trunk_pin_bytes(tr->lay[L].nbytes, widen);
             if (sp + need > budget_bytes) {
                 /* A prefix pin stops at the first layer that does not fit, because the
                  * order is the walk order and skipping one would leave a hole in it.
@@ -400,8 +419,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
         int k = 0;
         for (int L = 0; L < tr->n_layers && k < npin; L++) {
             if (!chosen[L]) continue;
-            const size_t need = (size_t)((tr->lay[L].nbytes + K3_TRUNK_ALIGN - 1)
-                                         & ~(int64_t)(K3_TRUNK_ALIGN - 1)) + widen;
+            const size_t need = (size_t)k3_trunk_pin_bytes(tr->lay[L].nbytes, widen);
             if (k3_alloc_direct((void **)&tr->pin[k], need) != 0) {
                 fprintf(stderr, "k3_trunk: cannot allocate %.2f GB for pinned layer %d\n",
                         (double)need / 1e9, L);
