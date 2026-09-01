@@ -1126,6 +1126,20 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
             k3_expert_drops++;
             fprintf(stderr, "EXPERT DROP: layer %d expert %d failed to load; "
                             "this chunk is CORRUPT\n", w->layer, e);
+            /* `contrib` is malloc'd, not zeroed: every (t,j) slot below is written by
+             * the matmul above on the ordinary path, and step 3 sums every slot
+             * unconditionally in top-k order. Skipping the write here without also
+             * zeroing it, as k3_moe does by simply never adding a dropped expert's
+             * contribution, would fold uninitialized memory into the MoE sum with the
+             * same one-in-a-million plausible-but-wrong finish this file's header
+             * exists to prevent -- just reached from an allocator's leftovers instead
+             * of a bad checkpoint. */
+            for (int t = 0; t < T; t++) {
+                const int *it = ridx + (size_t)t * K;
+                for (int j = 0; j < K; j++)
+                    if (it[j] == e)
+                        memset(contrib + ((size_t)t * K + j) * Ll, 0, (size_t)Ll * sizeof(float));
+            }
             continue;
         }
         for (int t = 0; t < T; t++) {
