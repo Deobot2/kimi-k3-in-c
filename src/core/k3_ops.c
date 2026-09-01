@@ -426,6 +426,19 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     const int kvd = qn + vh;                      /* 256: cached width per head    */
     const float scale = 1.0f / sqrtf((float)qh);  /* :359, over qh not qn           */
     if (!kvc) cached = 0;
+    /* kvc and ropec are read through K3_KV_AT/K3_ROPE_AT below, each of which picks
+     * kvc/ropec or the scratch fallback independently -- so a caller passing one
+     * non-NULL and the other NULL gets kvc read from the cache while ropec is read
+     * from `rps`, a scratch region that k3_mla_scratch_cached only allocates when
+     * BOTH are absent (kvc == NULL). rps then aliases past the end of the scratch
+     * buffer: a silent heap overrun rather than a wrong answer. Every call site in
+     * this file passes both or neither; catch the day a new one does not. */
+    if ((kvc == NULL) != (ropec == NULL)) {
+        fprintf(stderr, "k3: FATAL, k3_mla_cached called with kvc %s but ropec %s -- "
+                        "both must be NULL or both non-NULL.\n",
+                kvc ? "non-NULL" : "NULL", ropec ? "non-NULL" : "NULL");
+        abort();
+    }
     const int last = cached + T - 1;              /* highest absolute position      */
     if (kvc && last >= cap)
         k3_fatal_bound("MLA KV cache position", (long)last, (long)cap - 1);
