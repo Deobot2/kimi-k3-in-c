@@ -604,6 +604,16 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
     c->src.getmany = getenv("K3_NOPREFETCH") ? NULL : cache_getmany;
     if (!c->src.getmany)
         fprintf(stderr, "k3_cache: batch prefetch DISABLED by K3_NOPREFETCH\n");
+#ifndef _OPENMP
+    /* cache_getmany's read phase is a #pragma omp parallel for; without OpenMP (the
+     * sanitizer builds drop it, see Makefile) that loop runs serially -- one blocking
+     * pread at a time, queue depth one, for however many experts the batch reserved.
+     * That is exactly the depth-one pattern the batch path exists to avoid, so say so
+     * rather than let it look like the same prefetch running slow. */
+    if (c->src.getmany)
+        fprintf(stderr, "k3_cache: built without OpenMP; batch prefetch reads run "
+                        "serially (queue depth 1), not concurrently\n");
+#endif
     c->src.ctx = c;
     /* Policy is a runtime choice so the two can be compared on ONE binary. Comparing
      * two builds compares two binaries; comparing one decision is the only way to
