@@ -465,14 +465,18 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
      * safe only while H*vh < H*qh holds, but that is an accident of the released
      * dimensions, not an invariant, and it breaks silently the moment v_head grows.
      * Size the buffer with k3_mla_scratch_cached(); do not compute it by hand. */
+    /* sc is PER HEAD, [H][stride], so the attention loop below can run every head on
+     * its own thread -- see the comment there. `stride` mirrors k3_mla_scratch_cached's
+     * max(cap, T) sizing for this same region, so it is exactly what was allocated. */
+    const int stride = cap > T ? cap : T;
     float *q    = scratch;                          /* [T][H][qh]     */
     float *ct   = q    + (size_t)T * H * qh;        /* [kvw] transient, one token */
     float *ql   = ct   + (size_t)kvw;               /* [q_lora]       */
     float *acc  = ql   + (size_t)c->q_lora;         /* [H][vh]        */
     float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate   */
-    float *sc   = gbuf + (size_t)H * vh;            /* [last+1] scores */
+    float *sc   = gbuf + (size_t)H * vh;            /* [H][stride] scores */
     /* Without a cache the keys/values live in scratch and cover only this call. */
-    float *kvs  = sc   + (size_t)(last + 1);        /* [T][H][kvd]    */
+    float *kvs  = sc   + (size_t)H * stride;        /* [T][H][kvd]    */
     float *rps  = kvs  + (kvc ? 0 : (size_t)T * H * kvd);   /* [T][qr] */
 
     #define K3_KV_AT(p)   (kvc   ? kvc   + (size_t)(p) * H * kvd : kvs + (size_t)(p) * H * kvd)
@@ -496,11 +500,22 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         k3_mmw(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, H * kvd);
     }
 
-    /* ---- attention, per head, causal ---- */
+    /* ---- attention, per head, causal ----
+     * Heads are independent: each iteration reads only its own slice of q and writes
+     * only its own [h*vh, (h+1)*vh) slice of acc and [h*stride, ...) slice of sc, with
+     * K3_KV_AT/K3_ROPE_AT read-only from every head's perspective. The reduction order
+     * within one head -- over s, ascending -- is untouched, so results are bit-identical
+     * at any thread count, the same argument the absorbed-latent attention loop and
+     * k3_router already rely on. This loop, serial, was the dominant non-matmul cost at
+     * any real context length: 96 heads x up to `p+1` cached positions, one thread. */
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static)
+#endif
         for (int h = 0; h < H; h++) {
             const float *qt = q + ((size_t)t * H + h) * qh;
+            float *sch = sc + (size_t)h * stride;
             float m = -INFINITY;
             for (int s = 0; s <= p; s++) {                 /* causal: s <= p */
                 const float *ks = K3_KV_AT(s) + (size_t)h * kvd;
@@ -510,16 +525,16 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                 /* the rope slot is UNROTATED but still scored, and the SAME 64
                  * values serve every head. Dropping this term is the silent bug. */
                 for (int i = 0; i < qr; i++) d += (double)qt[qn + i] * (double)kr[i];
-                sc[s] = (float)d * scale;
-                if (sc[s] > m) m = sc[s];
+                sch[s] = (float)d * scale;
+                if (sch[s] > m) m = sch[s];
             }
             double z = 0.0;
-            for (int s = 0; s <= p; s++) { sc[s] = expf(sc[s] - m); z += sc[s]; }
+            for (int s = 0; s <= p; s++) { sch[s] = expf(sch[s] - m); z += sch[s]; }
 
             float *o = acc + (size_t)h * vh;
             for (int j = 0; j < vh; j++) o[j] = 0.0f;
             for (int s = 0; s <= p; s++) {
-                const float pr = (float)(sc[s] / z);
+                const float pr = (float)(sch[s] / z);
                 const float *vs = K3_KV_AT(s) + (size_t)h * kvd + qn;
                 for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
             }
@@ -951,11 +966,13 @@ size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode)
 {
     const int H = c->n_heads, qh = c->qk_nope + c->qk_rope, vh = c->v_head;
     const size_t kvd = (size_t)(c->qk_nope + vh);
+    /* Scores are PER HEAD, [H][max(cap,T)], so k3_mla_cached's attention loop can run
+     * every head on its own thread -- see the comment there. */
     size_t n = (size_t)T * H * qh                      /* q            */
              + (size_t)(c->kv_lora + c->qk_rope)       /* ct transient */
              + (size_t)c->q_lora
              + (size_t)2 * H * vh                      /* acc, gbuf    */
-             + (size_t)(cap > T ? cap : T);            /* scores       */
+             + (size_t)H * (cap > T ? cap : T);        /* scores, per head */
     if (!cached_mode) n += (size_t)T * H * kvd + (size_t)T * c->qk_rope;
     return n;
 }
