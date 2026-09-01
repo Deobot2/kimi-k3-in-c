@@ -1381,7 +1381,16 @@ size_t k3_layer_scratch_kv(const K3Cfg *c, int T, int span, int mode)
     size_t m = k3_moe_scratch(c);
     size_t sub = a > b ? a : b;
     if (m > sub) sub = m;
-    /* prefix_sum, tmp, fold vectors, one attn_res source stack, plus the sub-block */
+    /* prefix_sum, tmp, fold vectors, plus the sub-block.
+     *
+     * k3_decoder_layer_kv no longer gathers block_residual snapshots into a copy of its
+     * own here -- it reads the attn_res source stack straight out of block_residual
+     * (`br` in the caller) instead -- but the (n_layers/attn_res_block + 2) * hidden
+     * term below stays regardless: k3_run.c's model-level aggregator (the one pair
+     * beyond the per-layer ones) reuses THIS SAME scratch buffer, after the layer loop,
+     * for its own fold[E] + source-stack[(nb+1)*E] layout, and checks its need against
+     * exactly this return value. Dropping the term here would silently undersize that
+     * reuse instead of the one thing it looks like it is sizing. */
     return (size_t)3 * T * c->hidden
          + (size_t)2 * c->hidden
          + (size_t)(c->n_layers / c->attn_res_block + 2) * c->hidden
@@ -1423,8 +1432,7 @@ void k3_decoder_layer_kv(float *h, float *block_residual, int *n_blocks,
     float *hin    = tmp  + (size_t)T * E;       /* [T][E] normalised layer input */
     float *foldA  = hin  + (size_t)T * E;       /* [E] attention aggregator      */
     float *foldM  = foldA + E;                  /* [E] mlp aggregator            */
-    float *src    = foldM + E;                  /* [maxb+1][E] source stack      */
-    float *dgu    = src + (size_t)(maxb) * E;   /* [2*dense_inter]               */
+    float *dgu    = foldM + E;                  /* [2*dense_inter]               */
     float *sub    = dgu + (size_t)2 * c->dense_inter;
 
     /* The norm gain and the scoring projection collapse to ONE vector. Folding them
@@ -1437,16 +1445,21 @@ void k3_decoder_layer_kv(float *h, float *block_residual, int *n_blocks,
     memcpy(pref, h, (size_t)T * E * sizeof(float));
     int have_prefix = 1;                        /* mirrors "prefix_sum is not None" */
 
-    /* aggregation before attention, only when snapshots already exist */
+    /* aggregation before attention, only when snapshots already exist.
+     *
+     * block_residual is already [T][maxb][E], and its slot at *n_blocks -- one past the
+     * last real snapshot -- is otherwise unused until the boundary below (if any) claims
+     * it: forward() memsets the whole buffer to zero at the start of the token, and
+     * nothing else ever writes past *n_blocks. So k3_attn_res can read the source stack
+     * straight out of block_residual, PREF MIRRORED INTO THAT SLOT, instead of gathering
+     * every real snapshot into a separate `src` buffer first -- one E-float memcpy
+     * instead of (*n_blocks + 1). */
     if (*n_blocks > 0) {
         for (int t = 0; t < T; t++) {
-            for (int b = 0; b < *n_blocks; b++)
-                memcpy(src + (size_t)b * E,
-                       block_residual + ((size_t)t * maxb + b) * E,
-                       (size_t)E * sizeof(float));
-            memcpy(src + (size_t)(*n_blocks) * E, pref + (size_t)t * E,
+            float *blk_t = block_residual + (size_t)t * maxb * E;
+            memcpy(blk_t + (size_t)(*n_blocks) * E, pref + (size_t)t * E,
                    (size_t)E * sizeof(float));
-            k3_attn_res(h + (size_t)t * E, src, foldA, *n_blocks + 1, E, c->rms_eps);
+            k3_attn_res(h + (size_t)t * E, blk_t, foldA, *n_blocks + 1, E, c->rms_eps);
         }
     }
 
@@ -1477,15 +1490,16 @@ void k3_decoder_layer_kv(float *h, float *block_residual, int *n_blocks,
     if (have_prefix) for (size_t i = 0; i < (size_t)T * E; i++) pref[i] += tmp[i];
     else             { memcpy(pref, tmp, (size_t)T * E * sizeof(float)); have_prefix = 1; }
 
-    /* aggregation before the MLP. NO emptiness guard in the reference. */
+    /* aggregation before the MLP. NO emptiness guard in the reference.
+     * Same block_residual-as-source-stack trick as before attention, above -- and the
+     * mirror slot at *n_blocks has to be rewritten here even when nothing changed it in
+     * between, because `pref` itself just changed (the attention output was folded into
+     * it a few lines up): the two calls need two different snapshots of the same slot. */
     for (int t = 0; t < T; t++) {
-        for (int b = 0; b < *n_blocks; b++)
-            memcpy(src + (size_t)b * E,
-                   block_residual + ((size_t)t * maxb + b) * E,
-                   (size_t)E * sizeof(float));
-        memcpy(src + (size_t)(*n_blocks) * E, pref + (size_t)t * E,
+        float *blk_t = block_residual + (size_t)t * maxb * E;
+        memcpy(blk_t + (size_t)(*n_blocks) * E, pref + (size_t)t * E,
                (size_t)E * sizeof(float));
-        k3_attn_res(h + (size_t)t * E, src, foldM, *n_blocks + 1, E, c->rms_eps);
+        k3_attn_res(h + (size_t)t * E, blk_t, foldM, *n_blocks + 1, E, c->rms_eps);
     }
 
     for (int t = 0; t < T; t++)
