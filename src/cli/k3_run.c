@@ -1129,6 +1129,26 @@ int main(int argc, char **argv)
                 np, gen, K3_MAX_PROMPT + K3_MAX_GEN);
         return 2;
     }
+    /* A resumed session holds the saved history as well as the new tokens, so every
+     * guard and sizing computation below that counts positions has to count `prior`
+     * too. This has to run BEFORE those guards, not just before the allocation that
+     * follows them: computing it after let --load-state's own REFUSING TO START guard,
+     * the --preset auto sizing and the printed memory plan all size themselves from
+     * np + gen + 1 alone, undercounting a resumed run by exactly `prior` positions --
+     * the guard that exists to catch an OOM before 40 minutes of compute simply never
+     * saw the positions that made it one. Only the header is read here; the payload is
+     * restored later, once buffers sized against this number actually exist. */
+    K3StateHdr shd;
+    int prior = 0;
+    if (load_state) {
+        if (!incremental) {
+            fprintf(stderr, "--load-state needs --incremental\n");
+            return 2;
+        }
+        if (k3_state_peek(load_state, &shd) != 0) return 1;
+        prior = shd.nseq;
+        printf("resuming from %s: %d prior positions, %d new\n\n", load_state, prior, np);
+    }
     /* THE REAL CONTEXT LIMIT is the MLA KV cache, not any array size. Check it against
      * what the kernel says is actually available and refuse with both numbers, rather
      * than letting a long prompt get 40 minutes into a run and then be OOM-killed. Only
@@ -1183,7 +1203,7 @@ int main(int argc, char **argv)
         return 2;
     }
     if (incremental) {
-        const int npos = np + gen + 1;
+        const int npos = prior + np + gen + 1;
         const double per_pos = mla_latent ? K3_KV_LATENT_BYTES_PER_POS
                                           : K3_KV_BYTES_PER_POS;
         const int held = (kv_window > 0 && kv_window < npos) ? kv_window : npos;
@@ -1281,7 +1301,7 @@ int main(int argc, char **argv)
             return 2;
         }
         const int64_t E64 = c.hidden;
-        const int Tm = np + gen + 1;
+        const int Tm = prior + np + gen + 1;
         const int Pp = c.kda_heads * c.kda_head_dim;
         const int mb_ = c.n_layers / c.attn_res_block + 2;
 
@@ -1443,7 +1463,7 @@ int main(int argc, char **argv)
         const double w_model = 2.0 * (double)c.vocab * E64 * 2    /* embed + lm_head, bf16 */
                              + 3.0 * E64 * 4;                     /* norms, aggregator */
         const double w_cache = cache_gb * 1e9;
-        const int Tm = np + gen + 1;
+        const int Tm = prior + np + gen + 1;
         const int mb = c.n_layers / c.attn_res_block + 2;
         const int Pp = c.kda_heads * c.kda_head_dim;
         const double w_state = (double)((size_t)Pp * c.kda_head_dim
@@ -1572,19 +1592,9 @@ int main(int argc, char **argv)
 
     /* ---- buffers ----
      * A resumed session must hold the saved history as well as the new tokens, so the
-     * KV cache and every per-position buffer are sized for both. The header is read
-     * here, before anything is allocated; the payload is restored after. */
-    K3StateHdr shd;
-    int prior = 0;
-    if (load_state) {
-        if (!incremental) {
-            fprintf(stderr, "--load-state needs --incremental\n");
-            return 2;
-        }
-        if (k3_state_peek(load_state, &shd) != 0) return 1;
-        prior = shd.nseq;
-        printf("resuming from %s: %d prior positions, %d new\n\n", load_state, prior, np);
-    }
+     * KV cache and every per-position buffer are sized for both. `prior`/`shd` were
+     * already read above, before the memory guards, so every sizing decision this run
+     * makes -- guards included -- counts the same resumed context. */
     const int Tmax = prior + np + gen + 1;
     const int E = c.hidden;
     const int maxb = c.n_layers / c.attn_res_block + 2;
