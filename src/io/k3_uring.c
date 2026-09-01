@@ -176,73 +176,99 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
     int      nagain = 0;
     if (!again) { free(ck); return -1; }
 
-    while (!failed && (next < nchunk || nagain > 0 || posted > 0)) {
-        /* ---- fill the submission queue ---- */
-        unsigned tail = __atomic_load_n(u->sq_tail, __ATOMIC_RELAXED);
-        unsigned head = __atomic_load_n(u->sq_head, __ATOMIC_ACQUIRE);
-        unsigned queued = 0;
-        while ((tail - head) < u->entries && (next < nchunk || nagain > 0)) {
-            const int64_t idx = nagain > 0 ? again[--nagain] : next++;
-            struct io_uring_sqe *sqe = &u->sqes[tail & *u->sq_mask];
-            memset(sqe, 0, sizeof *sqe);
-            sqe->opcode    = IORING_OP_READ;
-            sqe->fd        = fd;
-            sqe->off       = (unsigned long long)(ck[idx].off + ck[idx].done);
-            sqe->addr      = (unsigned long long)(uintptr_t)(ck[idx].buf + ck[idx].done);
-            sqe->len       = (unsigned)(ck[idx].len - ck[idx].done);
-            sqe->user_data = (unsigned long long)idx;
-            u->sq_array[tail & *u->sq_mask] = tail & *u->sq_mask;
-            tail++;
-            queued++;
-            posted++;
-        }
-        if (queued) {
-            /* RELEASE: the SQEs above must be visible to the kernel before the tail
-             * that publishes them. */
-            __atomic_store_n(u->sq_tail, tail, __ATOMIC_RELEASE);
-        }
+    /* `failed` stops new submissions but must never stop this loop while `posted` is
+     * still nonzero: those chunks were handed to the kernel by an EARLIER, successful
+     * enter() call in this same run and are genuinely in flight. Returning while they
+     * are still outstanding used to let the caller treat -1 as "nothing happened" and
+     * retry with a plain pread into the very same buffer, racing the kernel's own DMA
+     * into it -- the "read succeeds, no pointer changes, fluent wrong tokens" failure
+     * this engine exists to refuse, just reached from the I/O layer instead of a
+     * checkpoint. So once failed, this loop does only one thing: drain, never submit. */
+    while (posted > 0 || (!failed && (next < nchunk || nagain > 0))) {
+        if (!failed) {
+            /* ---- fill the submission queue ---- */
+            unsigned tail = __atomic_load_n(u->sq_tail, __ATOMIC_RELAXED);
+            unsigned head = __atomic_load_n(u->sq_head, __ATOMIC_ACQUIRE);
+            unsigned queued = 0;
+            while ((tail - head) < u->entries && (next < nchunk || nagain > 0)) {
+                const int64_t idx = nagain > 0 ? again[--nagain] : next++;
+                struct io_uring_sqe *sqe = &u->sqes[tail & *u->sq_mask];
+                memset(sqe, 0, sizeof *sqe);
+                sqe->opcode    = IORING_OP_READ;
+                sqe->fd        = fd;
+                sqe->off       = (unsigned long long)(ck[idx].off + ck[idx].done);
+                sqe->addr      = (unsigned long long)(uintptr_t)(ck[idx].buf + ck[idx].done);
+                sqe->len       = (unsigned)(ck[idx].len - ck[idx].done);
+                sqe->user_data = (unsigned long long)idx;
+                u->sq_array[tail & *u->sq_mask] = tail & *u->sq_mask;
+                tail++;
+                queued++;
+                posted++;
+            }
+            if (queued) {
+                /* RELEASE: the SQEs above must be visible to the kernel before the tail
+                 * that publishes them. */
+                __atomic_store_n(u->sq_tail, tail, __ATOMIC_RELEASE);
+            }
 
-        /* ---- hand them to the kernel ----
-         * to_submit is recomputed from the RING, not from what this iteration happened
-         * to queue. io_uring_enter returns how many SQEs it actually consumed and is
-         * entitled to consume fewer than asked; passing `queued` and moving on leaves
-         * the remainder sitting in the submission queue forever, and the next call --
-         * with nothing new to submit -- then waits for a completion that was never going
-         * to arrive. That is a hang, not a slowdown, and it reproduced as an intermittent
-         * stall in tests/unit/test_trunk.c before this was written this way.
-         *
-         * min_complete likewise counts only what the KERNEL already holds. Waiting on a
-         * request that is still sitting unsubmitted in the ring is the same deadlock in
-         * a different disguise. */
-        if (!u->sqpoll) {
-            head = __atomic_load_n(u->sq_head, __ATOMIC_ACQUIRE);
-            const unsigned to_submit = tail - head;
-            const int in_kernel = posted - (int)to_submit;
-            if (to_submit || in_kernel > 0) {
-                int r;
-                do {
-                    r = sys_io_uring_enter(u->fd, to_submit,
-                                           in_kernel > 0 ? 1u : 0u,
-                                           IORING_ENTER_GETEVENTS);
-                } while (r < 0 && errno == EINTR);
-                if (r < 0) { failed = 1; break; }
+            /* ---- hand them to the kernel ----
+             * to_submit is recomputed from the RING, not from what this iteration happened
+             * to queue. io_uring_enter returns how many SQEs it actually consumed and is
+             * entitled to consume fewer than asked; passing `queued` and moving on leaves
+             * the remainder sitting in the submission queue forever, and the next call --
+             * with nothing new to submit -- then waits for a completion that was never going
+             * to arrive. That is a hang, not a slowdown, and it reproduced as an intermittent
+             * stall in tests/unit/test_trunk.c before this was written this way.
+             *
+             * min_complete likewise counts only what the KERNEL already holds. Waiting on a
+             * request that is still sitting unsubmitted in the ring is the same deadlock in
+             * a different disguise. */
+            if (!u->sqpoll) {
+                head = __atomic_load_n(u->sq_head, __ATOMIC_ACQUIRE);
+                const unsigned to_submit = tail - head;
+                const int in_kernel = posted - (int)to_submit;
+                if (to_submit || in_kernel > 0) {
+                    int r;
+                    do {
+                        r = sys_io_uring_enter(u->fd, to_submit,
+                                               in_kernel > 0 ? 1u : 0u,
+                                               IORING_ENTER_GETEVENTS);
+                    } while (r < 0 && errno == EINTR);
+                    /* Do NOT break here: `posted` chunks from a prior successful call are
+                     * still in flight and must be drained (see the loop comment above), not
+                     * abandoned. Only stop handing the kernel anything new. */
+                    if (r < 0) failed = 1;
+                }
+            } else {
+                /* The polling thread parks itself after sq_thread_idle and sets NEED_WAKEUP;
+                 * skipping the syscall then would leave the submissions unnoticed. */
+                const unsigned f = __atomic_load_n(u->sq_flags, __ATOMIC_ACQUIRE);
+                if (f & IORING_SQ_NEED_WAKEUP) {
+                    int r;
+                    do { r = sys_io_uring_enter(u->fd, 0, 0, IORING_ENTER_SQ_WAKEUP); }
+                    while (r < 0 && errno == EINTR);
+                    if (r < 0) failed = 1;
+                }
             }
-        } else {
-            /* The polling thread parks itself after sq_thread_idle and sets NEED_WAKEUP;
-             * skipping the syscall then would leave the submissions unnoticed. */
-            const unsigned f = __atomic_load_n(u->sq_flags, __ATOMIC_ACQUIRE);
-            if (f & IORING_SQ_NEED_WAKEUP) {
-                int r;
-                do { r = sys_io_uring_enter(u->fd, 0, 0, IORING_ENTER_SQ_WAKEUP); }
-                while (r < 0 && errno == EINTR);
-                if (r < 0) { failed = 1; break; }
-            }
+        } else if (posted > 0 && !u->sqpoll) {
+            /* Draining only, nothing left to submit: block for the kernel to finish the
+             * reads it already owns, so this stays a wait instead of a CPU-spinning poll
+             * of the shared ring while the drive services the last few chunks. A second
+             * failure here changes nothing -- the kernel completes these on its own
+             * schedule regardless of whether this call succeeds -- so fall through to the
+             * reap below and let the ring itself be the source of truth. */
+            int r;
+            do { r = sys_io_uring_enter(u->fd, 0, 1, IORING_ENTER_GETEVENTS); }
+            while (r < 0 && errno == EINTR);
         }
 
         /* ---- reap ---- */
         unsigned chead = __atomic_load_n(u->cq_head, __ATOMIC_RELAXED);
         const unsigned ctail = __atomic_load_n(u->cq_tail, __ATOMIC_ACQUIRE);
-        if (chead == ctail && posted > 0 && u->sqpoll) continue;  /* spin for SQPOLL */
+        /* Spin rather than looping back through the submit/wait dance above: SQPOLL never
+         * blocks there, and a failed run no longer submits, so for both this shared-memory
+         * ring is the only thing left to observe. */
+        if (chead == ctail && posted > 0 && (u->sqpoll || failed)) continue;
         while (chead != ctail) {
             const struct io_uring_cqe *cqe = &u->cqes[chead & *u->cq_mask];
             const int64_t idx = (int64_t)cqe->user_data;
@@ -250,14 +276,14 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
             chead++;
             posted--;
             if (res < 0) {
-                if (res == -EINTR || res == -EAGAIN) { again[nagain++] = idx; continue; }
+                if (!failed && (res == -EINTR || res == -EAGAIN)) { again[nagain++] = idx; continue; }
                 failed = 1;
                 continue;
             }
             if (res == 0) { failed = 1; continue; }   /* EOF short of the run */
             ck[idx].done += res;
             got += res;
-            if (ck[idx].done < ck[idx].len) again[nagain++] = idx;
+            if (!failed && ck[idx].done < ck[idx].len) again[nagain++] = idx;
         }
         __atomic_store_n(u->cq_head, chead, __ATOMIC_RELEASE);
     }
