@@ -790,10 +790,10 @@ int k3_cache_dump_trace(const K3Cache *c, const char *path)
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
     const size_t n = fwrite(c->trace, sizeof(int32_t), (size_t)c->ntrace, f);
-    fclose(f);
+    const int closed_ok = fclose(f) == 0;
     printf("wrote %s: %lld requests (%.1f KB)\n",
            path, (long long)(c->ntrace / 2), (double)c->ntrace * 4 / 1024.0);
-    return n == (size_t)c->ntrace ? 0 : -1;
+    return (n == (size_t)c->ntrace && closed_ok) ? 0 : -1;
 }
 
 int k3_cache_pin(K3Cache *c, int layer, int expert, int pin)
@@ -891,6 +891,5 @@ int k3_cache_dump_hist(const K3Cache *c, const char *path)
         }
     }
     fprintf(f, "}}\n");
-    fclose(f);
-    return 0;
+    return fclose(f) == 0 ? 0 : -1;
 }
