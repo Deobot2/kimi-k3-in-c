@@ -40,13 +40,22 @@ static void fill_q(const K3Cache *c, int slot, K3ExpertQ *q)
  * fixtures. With a speculation thread there is now a second way to reach that state, so
  * the rule is enforced in one place for every policy.
  */
+/* The small and main queues are each a singly-linked list threaded through q_next[],
+ * with their own head/tail/len fields. Every operation on "queue q" needs all three,
+ * selected the same way, so that selection lives here once. */
+static void queue_ptrs(K3Cache *c, int q, int32_t **head, int32_t **tail, int32_t **len)
+{
+    *head = (q == K3_Q_SMALL) ? &c->s_head : &c->m_head;
+    *tail = (q == K3_Q_SMALL) ? &c->s_tail : &c->m_tail;
+    *len  = (q == K3_Q_SMALL) ? &c->s_len  : &c->m_len;
+}
+
 static void q_push_tail(K3Cache *c, int slot, int q)
 {
     c->q_next[slot] = -1;
     c->q_of[slot] = (unsigned char)q;
-    int32_t *head = (q == K3_Q_SMALL) ? &c->s_head : &c->m_head;
-    int32_t *tail = (q == K3_Q_SMALL) ? &c->s_tail : &c->m_tail;
-    int32_t *len  = (q == K3_Q_SMALL) ? &c->s_len  : &c->m_len;
+    int32_t *head, *tail, *len;
+    queue_ptrs(c, q, &head, &tail, &len);
     if (*tail < 0) { *head = *tail = (int32_t)slot; }
     else { c->q_next[*tail] = (int32_t)slot; *tail = (int32_t)slot; }
     (*len)++;
@@ -54,9 +63,8 @@ static void q_push_tail(K3Cache *c, int slot, int q)
 
 static int q_pop_head(K3Cache *c, int q)
 {
-    int32_t *head = (q == K3_Q_SMALL) ? &c->s_head : &c->m_head;
-    int32_t *tail = (q == K3_Q_SMALL) ? &c->s_tail : &c->m_tail;
-    int32_t *len  = (q == K3_Q_SMALL) ? &c->s_len  : &c->m_len;
+    int32_t *head, *tail, *len;
+    queue_ptrs(c, q, &head, &tail, &len);
     const int32_t s = *head;
     if (s < 0) return -1;
     *head = c->q_next[s];
@@ -211,9 +219,8 @@ static void detach(K3Cache *c, int slot)
     if (c->q_of[slot] == K3_Q_FREE) return;
     /* Only reachable via pick_victim_lru, which does not maintain the queues. */
     const int q = c->q_of[slot];
-    int32_t *head = (q == K3_Q_SMALL) ? &c->s_head : &c->m_head;
-    int32_t *tail = (q == K3_Q_SMALL) ? &c->s_tail : &c->m_tail;
-    int32_t *len  = (q == K3_Q_SMALL) ? &c->s_len  : &c->m_len;
+    int32_t *head, *tail, *len;
+    queue_ptrs(c, q, &head, &tail, &len);
     int32_t prev = -1;
     for (int32_t s = *head; s >= 0; prev = s, s = c->q_next[s]) {
         if (s != slot) continue;
