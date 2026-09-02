@@ -129,6 +129,14 @@ not needing the bytes at all.
   went over what the walk owed. The aggregate byte total could say a run went over and
   never which layers; two explanations for the 13.7% were argued from the pinned set's
   shape before this existed, and both were wrong.
+- Small maintenance pass, no behavior change on any success path: `k3_cache_init` had an
+  unreachable `if (0)` error block left over from a refactor; `k3_st_open`'s directory
+  scan left an unchecked `realloc`/`malloc` pair while collecting shard filenames (a
+  failed `realloc` dropped the old pointer, and a failed `malloc` could feed `NULL` to
+  `snprintf`); `k3_trunk.c`'s `slurp()` relied on a downstream short-read check to
+  incidentally catch an unguarded `ftell()` failure; `k3_cache_dump_trace` and
+  `k3_cache_dump_hist` discarded `fclose()`'s return value, so a write error flushed on
+  close could report success on a truncated file.
 
 ## [1.0.0] - 2026-08-07
 
