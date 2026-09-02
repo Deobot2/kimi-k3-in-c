@@ -15,6 +15,7 @@
 #include <pthread.h>
 
 #include "json.h"
+#include "k3_clock.h"
 #include "k3_st.h"
 #include "k3_trunk.h"
 #include "k3_uring.h"
@@ -80,12 +81,6 @@ static void *trunk_io_main(void *arg);
 double k3_trunk_bind_wall = 0.0;    /* total wall inside k3_trunk_bind   */
 double k3_trunk_widen_wall = 0.0;   /* of which, inside k3_bind_layer_mem */
 long   k3_trunk_binds = 0;
-
-static double now_s(void)
-{
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec * 1e-9;
-}
 
 static int dt_of(const char *s)
 {

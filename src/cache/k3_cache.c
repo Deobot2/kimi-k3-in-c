@@ -9,12 +9,7 @@
 #include <sys/mman.h>
 
 #include "k3_cache.h"
-
-static double now_s(void)
-{
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec * 1e-9;
-}
+#include "k3_clock.h"
 
 /* Resolve a slot to the three (packed, scale) pairs the kernels want. */
 static void fill_q(const K3Cache *c, int slot, K3ExpertQ *q)

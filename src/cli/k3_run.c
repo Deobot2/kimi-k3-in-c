@@ -54,15 +54,10 @@
 #include "k3.h"
 #include "k3_bind.h"
 #include "k3_cache.h"
+#include "k3_clock.h"
 #include "k3_trunk.h"
 #include "k3_tok.h"   /* text in/out; the --ids path never touches it */
 #include "k3_cfg.h"   /* read the checkpoint's own config rather than assuming it */
-
-static double now_s(void)
-{
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec * 1e-9;
-}
 
 static void human(double b, char *o, size_t n)
 {
