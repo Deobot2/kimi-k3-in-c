@@ -450,6 +450,12 @@ static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
             if (fread(dst, sizeof(float), n, f) != n) rc = -1;
         }
     } else {
+        if (hd->kv_rows > w->kv_cap) {
+            fprintf(stderr, "REFUSING: %s holds %d KV rows, this run's KV cache is %d.\n"
+                            "  Raise --gen or shorten the prompt.\n",
+                    path, hd->kv_rows, w->kv_cap);
+            fclose(f); return -1;
+        }
         /* Position-major inside each layer slice, so a differently-sized destination
          * cache is written slice by slice rather than as one block. */
         for (int mi = 0; !rc && mi < w->n_mla; mi++) {
