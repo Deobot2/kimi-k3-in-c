@@ -262,6 +262,32 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
         __atomic_store_n(u->cq_head, chead, __ATOMIC_RELEASE);
     }
 
+    /* On failure the loop above can exit with `posted` chunks still outstanding in the
+     * kernel: their SQEs carry sqe->addr pointing straight into the caller's buffer and
+     * sqe->user_data set to an index into THIS call's ck[]/again[], which are about to be
+     * freed. The caller falls back to re-reading the whole buffer with pread, and this
+     * ring (`u`) is a long-lived object reused for the next k3_uring_read call -- so if
+     * one of these abandoned reads completes after that next call has started, its stale
+     * user_data is read back as an index into a DIFFERENT-SIZED ck[]/again[], which is an
+     * out-of-bounds write when the old index exceeds the new call's chunk count and silent
+     * bookkeeping corruption otherwise. Reap and discard every outstanding completion
+     * before returning, so no stale CQE can surface during a later call. Best-effort: if
+     * io_uring_enter itself starts failing there is nothing more this function can do, so
+     * it stops waiting rather than spinning forever. */
+    while (posted > 0) {
+        unsigned chead = __atomic_load_n(u->cq_head, __ATOMIC_RELAXED);
+        unsigned ctail = __atomic_load_n(u->cq_tail, __ATOMIC_ACQUIRE);
+        if (chead == ctail) {
+            int r;
+            do { r = sys_io_uring_enter(u->fd, 0, 1, IORING_ENTER_GETEVENTS); }
+            while (r < 0 && errno == EINTR);
+            if (r < 0) break;
+            continue;
+        }
+        while (chead != ctail && posted > 0) { chead++; posted--; }
+        __atomic_store_n(u->cq_head, chead, __ATOMIC_RELEASE);
+    }
+
     free(ck); free(again);
     if (failed) return -1;
     return got;
