@@ -179,7 +179,10 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
     jval *root = json_parse(txt, &arena);
     tr->json_arena = arena;
     tr->json_root = root;
-    if (!root) { fprintf(stderr, "k3_trunk: %s is not valid JSON\n", p); free(txt); return -1; }
+    if (!root) {
+        fprintf(stderr, "k3_trunk: %s is not valid JSON\n", p);
+        free(txt); k3_trunk_close(tr); return -1;
+    }
 
     jval *jl = json_get(root, "layers");
     if (!jl || jl->t != J_ARR) { fprintf(stderr, "k3_trunk: no layers array\n"); goto bad; }
@@ -228,7 +231,10 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
         tr->direct = 0;
         tr->fd = open(p, O_RDONLY);
     }
-    if (tr->fd < 0) { fprintf(stderr, "k3_trunk: cannot open %s\n", p); return -1; }
+    if (tr->fd < 0) {
+        fprintf(stderr, "k3_trunk: cannot open %s\n", p);
+        k3_trunk_close(tr); return -1;
+    }
     {
         jval *a = json_get(root, "align");
         const int64_t want = (a && a->t == J_NUM) ? (int64_t)a->num : 0;
@@ -241,7 +247,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
             close(tr->fd);
             tr->direct = 0;
             tr->fd = open(p, O_RDONLY);
-            if (tr->fd < 0) return -1;
+            if (tr->fd < 0) { k3_trunk_close(tr); return -1; }
         }
     }
 
@@ -265,7 +271,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
      * of uniform slots for everything else. Uniform slots everywhere would size every
      * slot for layer 0 (2.34 GB, the dense MLP) and waste roughly half the budget. */
     tr->slot_of = (int32_t *)malloc((size_t)tr->n_layers * sizeof(int32_t));
-    if (!tr->slot_of) return -1;
+    if (!tr->slot_of) { k3_trunk_close(tr); return -1; }
     for (int i = 0; i < tr->n_layers; i++) tr->slot_of[i] = -1;
 
     /* One counter per layer, so a re-read has a NAME. The aggregate byte count says the
@@ -273,7 +279,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
      * every attempt to infer that from the pinned set has been a guess. See the note above
      * k3_trunk_report. */
     tr->reads_of = (uint32_t *)calloc((size_t)tr->n_layers, sizeof(uint32_t));
-    if (!tr->reads_of) return -1;
+    if (!tr->reads_of) { k3_trunk_close(tr); return -1; }
 
     /* Ring slots: the layer being computed on, plus the reads in flight behind it.
      *
@@ -324,7 +330,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
     const int pin_prefix = getenv("K3_PIN_PREFIX") != NULL;
     int *order = (int *)malloc((size_t)tr->n_layers * sizeof(int));
     unsigned char *chosen = (unsigned char *)calloc((size_t)tr->n_layers, 1);
-    if (!order || !chosen) { free(order); free(chosen); return -1; }
+    if (!order || !chosen) { free(order); free(chosen); k3_trunk_close(tr); return -1; }
     for (int i = 0; i < tr->n_layers; i++) order[i] = i;
     if (!pin_prefix) {
         /* Insertion sort by nbytes DESCENDING, ties broken by layer index ascending so
@@ -384,7 +390,9 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
 
     tr->pin_of = (int32_t *)malloc((size_t)tr->n_layers * sizeof(int32_t));
     tr->pin = (unsigned char **)calloc((size_t)(npin ? npin : 1), sizeof(unsigned char *));
-    if (!tr->pin || !tr->pin_of) { free(order); free(chosen); return -1; }
+    if (!tr->pin || !tr->pin_of) {
+        free(order); free(chosen); k3_trunk_close(tr); return -1;
+    }
     for (int i = 0; i < tr->n_layers; i++) tr->pin_of[i] = -1;
     {
         int k = 0;
@@ -396,6 +404,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
                 fprintf(stderr, "k3_trunk: cannot allocate %.2f GB for pinned layer %d\n",
                         (double)need / 1e9, L);
                 free(order); free(chosen);
+                k3_trunk_close(tr);
                 return -1;
             }
             tr->pin_of[L] = k++;
@@ -405,6 +414,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
     if (k3_alloc_direct((void **)&tr->arena, (size_t)RING * (size_t)ring_slot) != 0) {
         fprintf(stderr, "k3_trunk: cannot allocate the %.2f GB streaming ring\n",
                 (double)RING * ring_slot / 1e9);
+        k3_trunk_close(tr);
         return -1;
     }
     tr->layer_of = (int *)malloc((size_t)RING * sizeof(int));
@@ -433,7 +443,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
      * which is exactly the synchronous path this file had before the reader existed. */
     {
         K3TrunkIO *io = (K3TrunkIO *)calloc(1, sizeof *io);
-        if (!io) return -1;
+        if (!io) { k3_trunk_close(tr); return -1; }
         io->tr = tr;
         io->held = -1;
         for (int i = 0; i < K3_TRUNK_MAXRING; i++) io->pending[i] = -1;
@@ -454,6 +464,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
                 pthread_mutex_destroy(&io->mu);
                 free(io);
                 tr->io_state = NULL;
+                k3_trunk_close(tr);
                 return -1;
             }
             io->running = 1;
@@ -506,6 +517,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
     return 0;
 bad:
     free(txt);
+    k3_trunk_close(tr);
     return -1;
 }
 
