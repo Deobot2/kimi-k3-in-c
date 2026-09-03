@@ -169,6 +169,11 @@ static inline void k3_tok_load(Tok *T, const char *files_dir)
         int rn = k3_b64(buf + ls, blen, raw);
         if (rn < 0) { fprintf(stderr, "k3_tok: bad base64 at rank %d\n", rank); exit(1); }
 
+        if (T->id2str[rank]) {
+            fprintf(stderr, "k3_tok: duplicate rank %d in tiktoken.model\n", rank);
+            exit(1);
+        }
+
         char *key = (char *)malloc((size_t)2 * rn + 1);
         if (!key) { fprintf(stderr, "k3_tok: OOM on token %d\n", rank); exit(1); }
         int kl = k3_bytelevel(T, raw, rn, key);
