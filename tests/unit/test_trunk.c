@@ -395,8 +395,11 @@ static int bfind(void *ctx, const char *name, int64_t *off, int64_t *nb, int *dt
 }
 
 /* Lay the run out. `fmt` is the dtype every NARROW tensor gets; `bf16_at` names one
- * narrow tensor forced back to bf16, for the mixed case, or -1. */
-static int64_t blayout(int fmt, int bf16_at)
+ * narrow tensor forced back to bf16, for the mixed case, or -1. `other_at`/`other_dt`
+ * force one narrow tensor to an arbitrary third dtype (e.g. plain F32 among MXFP4
+ * others), for the "quantised except one weight, left in an unsupported format" case;
+ * other_at is -1 when unused. */
+static int64_t blayout(int fmt, int bf16_at, int other_at, int other_dt)
 {
     int64_t at = 0;
     int narrow_i = 0;
@@ -407,10 +410,13 @@ static int64_t blayout(int fmt, int bf16_at)
             t->dtype = K3_DT_F32;
             nb = (int64_t)t->rows * 4;             /* wide tensors are fp32 on disk */
         } else {
-            const int use = (narrow_i++ == bf16_at) ? K3_DT_BF16 : fmt;
+            const int ni = narrow_i++;
+            const int use = (ni == other_at) ? other_dt : (ni == bf16_at) ? K3_DT_BF16 : fmt;
             t->dtype = use;
             nb = (use == K3_DT_MX4)
                ? (int64_t)t->rows * (t->cols / 2 + t->cols / 32)
+               : (use == K3_DT_F32)
+               ? (int64_t)t->rows * t->cols * 4
                : (int64_t)t->rows * t->cols * 2;
         }
         at = (at + 7) & ~(int64_t)7;
@@ -440,14 +446,20 @@ static void t_formats(void)
     K3Cfg c; int fa[4]; bcfg(&c, fa);
     const size_t widen_cap = k3_bind_widen_bytes(&c);
 
-    struct { int fmt; int bf16_at; int want_ok; int want_wdt; const char *label; } cases[] = {
-        { K3_DT_BF16, -1, 1, K3_WBF16, "bind: all bf16"          },
-        { K3_DT_MX4,  -1, 1, K3_WMX4,  "bind: all MXFP4"         },
-        { K3_DT_MX4,   0, 0, 0,        "bind: refuses mixed"     },
+    struct { int fmt; int bf16_at; int other_at; int other_dt;
+              int want_ok; int want_wdt; const char *label; } cases[] = {
+        { K3_DT_BF16, -1, -1, 0,          1, K3_WBF16, "bind: all bf16"          },
+        { K3_DT_MX4,  -1, -1, 0,          1, K3_WMX4,  "bind: all MXFP4"         },
+        { K3_DT_MX4,   0, -1, 0,          0, 0,        "bind: refuses mixed"     },
+        /* Everything MXFP4 except one narrow tensor left as plain F32 -- neither BF16
+         * nor a recognised quantised format. Must refuse rather than silently read that
+         * tensor's fp32 bytes as MXFP4-packed ones under the layer's MX4 tag. */
+        { K3_DT_MX4,  -1,  0, K3_DT_F32,  0, 0,        "bind: refuses stray f32"  },
     };
 
-    for (int k = 0; k < 3; k++) {
-        const int64_t n = blayout(cases[k].fmt, cases[k].bf16_at);
+    for (int k = 0; k < 4; k++) {
+        const int64_t n = blayout(cases[k].fmt, cases[k].bf16_at,
+                                   cases[k].other_at, cases[k].other_dt);
         unsigned char *run = (unsigned char *)calloc((size_t)n, 1);
         unsigned char *wid = (unsigned char *)calloc(widen_cap, 1);
         K3LayerBind b;

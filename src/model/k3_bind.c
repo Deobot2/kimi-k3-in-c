@@ -340,6 +340,8 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
      * BF16 with MX4 when it contained no bf16 matmul weight at all. */
     int bf16_seen = 0, i8_seen = 0, mx4_seen = 0;
     const char *bf16_name = NULL;
+    const char *narrow_other_name = NULL;
+    int narrow_other_dt = 0;
     for (int i = 0; i < p.n; i++) {
         Req *q = &p.r[i];
         int64_t off = 0, nb = 0; int dt = 0;
@@ -429,7 +431,10 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
         }
 
         if (q->narrow) {
-            if (dt != K3_DT_BF16) { narrowed_all = 0; }   /* handled below */
+            if (dt != K3_DT_BF16) {   /* handled below */
+                narrowed_all = 0;
+                if (!narrow_other_name) { narrow_other_name = q->name; narrow_other_dt = dt; }
+            }
             else {
                 *q->dest = run + off;
                 if (!bf16_seen) { bf16_seen = 1; bf16_name = q->name; }
@@ -458,10 +463,24 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
         w += (size_t)q->take * 4;
     }
 
-    if (!narrowed_all && !i8_seen && !mx4_seen) {
-        /* A large matrix was not BF16 in the packed run. The tag is per struct, so this
-         * cannot be described; refuse rather than read fp32 bytes as bf16. */
-        fprintf(stderr, "k3_bind_mem: layer %d has a non-BF16 large tensor\n", L);
+    if (!narrowed_all) {
+        /* A large matrix was neither BF16 nor one of the two quantised matmul formats
+         * (I8R, MX4). The tag is per struct, so this cannot be described -- refuse
+         * unconditionally rather than read its raw bytes under whatever format the REST
+         * of the layer happens to use.
+         *
+         * This has to fire even when i8_seen/mx4_seen is already true: a layer that is
+         * mostly MXFP4 but has one narrow tensor left as plain fp32 (a packer bug that
+         * quantised everything except one weight, rather than skipping a whole tensor
+         * class) used to fall through both this check and the mixed-format one below,
+         * because neither counted "narrow tensor in some OTHER format" as a seen format
+         * of its own -- it was read as MXFP4 bytes and produced a silently wrong layer. */
+        fprintf(stderr, "k3_bind_mem: layer %d has a non-BF16/I8R/MX4 large tensor "
+                        "(dtype %d)\n", L, narrow_other_dt);
+        if (narrow_other_name)
+            fprintf(stderr, "             the first such matmul weight here is %s; the "
+                            "packer left it unquantised in an unsupported format\n",
+                    narrow_other_name);
         return -1;
     }
     if (bf16_seen + i8_seen + mx4_seen > 1) {
