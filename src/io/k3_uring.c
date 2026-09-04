@@ -156,7 +156,13 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
 {
     if (!u || nbytes <= 0) return 0;
 
-    const int64_t nchunk = (nbytes + K3_URING_CHUNK - 1) / K3_URING_CHUNK;
+    /* Chunk count as (a/b) rounded up, computed without `nbytes + K3_URING_CHUNK - 1`:
+     * that addition is signed and, for nbytes within K3_URING_CHUNK of INT64_MAX,
+     * overflows -- undefined behaviour that UBSan (rightly) refuses to optimise away,
+     * which is why this form is also what silences its false "size range" warning on
+     * the malloc below. No real trunk layer is anywhere near that size, but the
+     * division/remainder form is exact for every nbytes > 0 and costs nothing. */
+    const int64_t nchunk = nbytes / K3_URING_CHUNK + (nbytes % K3_URING_CHUNK != 0);
     Chunk *ck = (Chunk *)malloc((size_t)nchunk * sizeof(Chunk));
     if (!ck) return -1;
     for (int64_t i = 0; i < nchunk; i++) {
