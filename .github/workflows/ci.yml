@@ -117,15 +117,23 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libomp-dev
-      # test_cache and test_st are the two that matter most here. SECURITY.md puts the
-      # safetensors parser and the streaming cache in scope precisely because they read
-      # attacker-influenceable bytes: a hand-written binary parser and an O_DIRECT slot
-      # allocator are where an out-of-bounds read actually lives.
+      # test_cache and test_st are two of the ones that matter most here. SECURITY.md
+      # puts the safetensors parser and the streaming cache in scope precisely because
+      # they read attacker-influenceable bytes: a hand-written binary parser and an
+      # O_DIRECT slot allocator are where an out-of-bounds read actually lives.
+      #
+      # test_trunk matters just as much and used to be absent from this job: it is the
+      # only test that drives k3_uring.c, and CHANGELOG records two intermittent hangs
+      # in the ring's submit/reap path that manual sanitizer runs found and CI did not.
+      # scale_test is included too -- it is the one weightless gate that runs a real,
+      # full-width (7168-hidden) kernel rather than the small fixture dimensions the
+      # rest of this job uses.
       - name: Build instrumented tests
         run: |
           make CFLAGS="-O1 -g -std=gnu99 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" \
                LDFLAGS="-lm -fsanitize=address,undefined" ARCH= \
                bin/test_ops bin/test_cfg bin/test_cache bin/test_st bin/k3_model \
+               bin/test_trunk bin/scale_test \
                -j"$(nproc)"
       - name: Run under sanitizers
         env:
@@ -141,6 +149,8 @@ jobs:
           ./bin/test_st tests/fixtures/st "$RUNNER_TEMP/idx.json" \
             plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
           ./bin/k3_model tests/fixtures
+          mkdir -p "$RUNNER_TEMP/trunkfix" && ./bin/test_trunk "$RUNNER_TEMP/trunkfix"
+          ./bin/scale_test
 
   # The tokenizer is portable C99 and must agree with the reference implementation
   # token-for-token. A tokenizer that is merely "close" corrupts every prompt silently.
