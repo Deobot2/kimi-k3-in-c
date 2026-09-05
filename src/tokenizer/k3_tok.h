@@ -78,15 +78,27 @@ static inline int k3_b64(const char *in, int n, unsigned char *out)
         for (int i = 0; i < 64; i++) t[(unsigned char)A[i]] = (signed char)i;
         init = 1;
     }
-    int o = 0, acc = 0, bits = 0;
+    /* acc is unsigned and masked down to the still-unconsumed bits after every byte it
+     * emits, so it never holds more than 7 bits between iterations. Left un-masked, a
+     * SIGNED accumulator that only ever grows (every real token's base64 is well past
+     * the ~5 characters needed to fill 32 bits) shifts a 1 into the sign bit and the next
+     * `<<6` is signed-overflow undefined behaviour -- harmless in practice on a two's
+     * complement machine, since only the low 8 bits of each extraction are ever read, but
+     * still UB, and this is the plainly-correct streaming decoder rather than a
+     * bit-pattern argument for why an unbounded one happens to work. */
+    int o = 0, bits = 0; unsigned acc = 0;
     for (int i = 0; i < n; i++) {
         unsigned char c = (unsigned char)in[i];
         if (c == '=') break;
         signed char v = t[c];
         if (v < 0) return -1;
-        acc = (acc << 6) | v;
+        acc = (acc << 6) | (unsigned)v;
         bits += 6;
-        if (bits >= 8) { bits -= 8; out[o++] = (unsigned char)((acc >> bits) & 0xFF); }
+        if (bits >= 8) {
+            bits -= 8;
+            out[o++] = (unsigned char)((acc >> bits) & 0xFF);
+            acc &= (1u << bits) - 1;
+        }
     }
     return o;
 }
@@ -187,6 +199,10 @@ static inline void k3_tok_load(Tok *T, const char *files_dir)
     char *cfg = tk_read_file(path, &ncfg);
     char *arena = NULL;
     jval *root = json_parse(cfg, &arena);
+    /* Unlike `root`, whose leaf strings T->sp[]/T->id2str below alias directly (see the
+     * "independent" note a few lines down), `cfg` is not referenced by anything json_parse
+     * produced -- j_dup copies every string out of it -- so it can be freed once parsed. */
+    free(cfg);
     jval *adt  = json_get(root, "added_tokens_decoder");
     if (!adt) {
         fprintf(stderr, "k3_tok: tokenizer_config.json has no added_tokens_decoder\n");
