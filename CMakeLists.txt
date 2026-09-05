@@ -101,6 +101,7 @@ k3_add_test(test_cfg    tests/unit/test_cfg.c)
 k3_add_test(test_tok    tests/unit/test_tok.c)
 k3_add_test(scale_test  tests/unit/scale_test.c)
 k3_add_test(k3_model    tests/unit/k3_model.c)
+k3_add_test(test_trunk  tests/unit/test_trunk.c)
 
 set(FIX ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures)
 
@@ -112,6 +113,11 @@ add_test(NAME cache      COMMAND test_cache ${FIX}/cache)
 add_test(NAME config     COMMAND test_cfg   fixture ${FIX}/ref_k3.json)
 add_test(NAME scale      COMMAND scale_test)
 add_test(NAME oracle     COMMAND k3_model   ${FIX})
+
+# test_trunk writes a synthetic trunk.bin/trunk.json into this directory and reads it
+# back; it must exist before ctest runs the test, same as the Makefile's `mkdir -p`.
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/trunkfix)
+add_test(NAME trunk      COMMAND test_trunk ${CMAKE_CURRENT_BINARY_DIR}/trunkfix)
 
 # The negative half of the config contract. Each fixture is the working flat config with
 # exactly one field mutated, so a rejection can only come from that field. Without these
