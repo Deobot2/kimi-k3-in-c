@@ -44,6 +44,7 @@
 #define _DARWIN_C_SOURCE
 #endif
 
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +63,35 @@ static double now_s(void)
 {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec * 1e-9;
+}
+
+/* Every numeric flag reads its value with these rather than atoi/atof directly.
+ * atoi/atof silently return 0 on garbage, and argv[++i] takes whatever token follows a
+ * flag whether or not it looks like a number -- so a value accidentally omitted (e.g.
+ * `--gen --incremental`) reads the NEXT flag as "--gen"'s argument, silently swallows it,
+ * and never processes it as a flag at all. That is exactly the class of silent-wrong-
+ * answer this engine refuses everywhere else (see k3_cfg.h), so a malformed or missing
+ * numeric argument is refused here too rather than defaulting to zero. */
+static long parse_int_opt(const char *flag, const char *s)
+{
+    char *end; errno = 0;
+    long v = strtol(s, &end, 10);
+    if (s[0] == '\0' || *end != '\0' || errno == ERANGE) {
+        fprintf(stderr, "%s expects an integer argument, got '%s'\n", flag, s);
+        exit(2);
+    }
+    return v;
+}
+
+static double parse_double_opt(const char *flag, const char *s)
+{
+    char *end; errno = 0;
+    double v = strtod(s, &end);
+    if (s[0] == '\0' || *end != '\0' || errno == ERANGE) {
+        fprintf(stderr, "%s expects a numeric argument, got '%s'\n", flag, s);
+        exit(2);
+    }
+    return v;
 }
 
 static void human(double b, char *o, size_t n)
@@ -930,12 +960,17 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--prompt-file") && i + 1 < argc) prompt_file = argv[++i];
         else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
-        else if (!strcmp(argv[i], "--gen") && i + 1 < argc) { gen = atoi(argv[++i]); gen_set = 1; }
-        else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--layers") && i + 1 < argc) want_layers = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--gen") && i + 1 < argc) {
+            gen = (int)parse_int_opt("--gen", argv[++i]); gen_set = 1;
+        }
+        else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc)
+            cache_gb = parse_double_opt("--cache-gb", argv[++i]);
+        else if (!strcmp(argv[i], "--layers") && i + 1 < argc)
+            want_layers = (int)parse_int_opt("--layers", argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
         else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
-        else if (!strcmp(argv[i], "--spec") && i + 1 < argc) spec_n = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--spec") && i + 1 < argc)
+            spec_n = (int)parse_int_opt("--spec", argv[++i]);
         else if (!strcmp(argv[i], "--tf-check")) tf_check = 1;
         else if (!strcmp(argv[i], "--ppl")) want_ppl = 1;
         else if (!strcmp(argv[i], "--ppl-file") && i + 1 < argc) { ppl_file = argv[++i]; want_ppl = 1; }
@@ -944,17 +979,21 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--load-state") && i + 1 < argc) load_state = argv[++i];
         else if (!strcmp(argv[i], "--save-state") && i + 1 < argc) save_state = argv[++i];
         else if (!strcmp(argv[i], "--draft-trunk") && i + 1 < argc) draft_dir = argv[++i];
-        else if (!strcmp(argv[i], "--draft-trunk-gb") && i + 1 < argc) draft_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--draft-trunk-gb") && i + 1 < argc)
+            draft_gb = parse_double_opt("--draft-trunk-gb", argv[++i]);
         else if (!strcmp(argv[i], "--trunk-gb") && i + 1 < argc) {
             const char *v = argv[++i];
             if (!strcmp(v, "auto")) budget_auto = 1;
-            else { trunk_gb = atof(v); budget_auto = 0; }
+            else { trunk_gb = parse_double_opt("--trunk-gb", v); budget_auto = 0; }
         }
-        else if (!strcmp(argv[i], "--trunk-ring") && i + 1 < argc) trunk_ring = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--trunk-ring") && i + 1 < argc)
+            trunk_ring = (int)parse_int_opt("--trunk-ring", argv[++i]);
         else if (!strcmp(argv[i], "--incremental")) incremental = 1;
         else if (!strcmp(argv[i], "--mla-latent")) mla_latent = 1;
-        else if (!strcmp(argv[i], "--kv-window") && i + 1 < argc) kv_window = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--kv-sinks") && i + 1 < argc) kv_sinks = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--kv-window") && i + 1 < argc)
+            kv_window = (int)parse_int_opt("--kv-window", argv[++i]);
+        else if (!strcmp(argv[i], "--kv-sinks") && i + 1 < argc)
+            kv_sinks = (int)parse_int_opt("--kv-sinks", argv[++i]);
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) logits_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-cache-trace") && i + 1 < argc) trace_dir = argv[++i];
         else if (!strcmp(argv[i], "--preset") && i + 1 < argc && !strcmp(argv[i + 1], "auto")) {
