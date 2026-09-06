@@ -102,7 +102,9 @@ static char *slurp(const char *p, size_t *n)
 {
     FILE *f = fopen(p, "rb");
     if (!f) return NULL;
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long sz = ftell(f);
+    if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
     char *b = (char *)malloc((size_t)sz + 1);
     if (!b) { fclose(f); return NULL; }
     if (fread(b, 1, (size_t)sz, f) != (size_t)sz) { free(b); fclose(f); return NULL; }
