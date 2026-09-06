@@ -110,8 +110,6 @@ static K3CalSlot *g_cal;          /* [n_layers][K3_CAL_SLOTS], NULL when off */
 static int        g_cal_layers;
 static int        g_cal_L;        /* layer that observations belong to       */
 
-int k3_calib_active(void) { return g_cal != NULL; }
-
 int k3_calib_begin(int n_layers)
 {
     k3_calib_end();

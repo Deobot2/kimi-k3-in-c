@@ -171,8 +171,6 @@ void k3_calib_layer(int L);
 void k3_calib_observe(int slot, const float *x, int rows, int n);
 int  k3_calib_write(const char *path);
 void k3_calib_end(void);
-/* Non-zero when collection is on, so callers can skip preparing an observation. */
-int  k3_calib_active(void);
 
 /* SiTU-GLU over a 2*n input laid out as [gate | up].
  *   a  = b1 * tanh(gate / b1) * sigmoid(gate)     sigmoid sees the UNCAPPED gate
