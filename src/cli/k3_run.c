@@ -280,6 +280,14 @@ static size_t kv_latent_width(const K3Cfg *c)
     return (size_t)c->kv_lora + (size_t)c->qk_rope;
 }
 
+/* Floats of KV per position per MLA layer in the expanded (non-latent) layout: per-head
+ * key and value plus the shared rope slot. Kept as one helper, mirroring
+ * kv_latent_width, so the five sites that size or report this cache cannot drift apart. */
+static size_t kv_expanded_width(const K3Cfg *c)
+{
+    return (size_t)c->n_heads * (size_t)(c->qk_nope + c->v_head) + (size_t)c->qk_rope;
+}
+
 /* Describe this layer's slice of whichever cache is in use. One place builds the
  * descriptor so the two layouts cannot drift apart in the offsets they imply. */
 static void kv_for_layer(const Weights *w, const K3Cfg *c, int mi, K3KvCache *kv)
@@ -523,7 +531,7 @@ static double k3_state_bytes(const K3Cfg *c, const Weights *w, int nseq, int64_t
     const double rows = (double)k3_state_rows(w);
     const double per  = (w->kv_mode == K3_KV_LATENT)
         ? (double)kv_latent_width(c)
-        : (double)c->n_heads * (c->qk_nope + c->v_head) + (double)c->qk_rope;
+        : (double)kv_expanded_width(c);
     return (double)sizeof(K3StateHdr) + (double)nseq * sizeof(int)
          + (double)kper * w->n_bound * sizeof(float)
          + rows * per * w->n_mla * sizeof(float);
@@ -1262,9 +1270,8 @@ int main(int argc, char **argv)
         }
         const int kv_pos = (kv_window > 0 && kv_window < Tm) ? kv_window : Tm;
         const double w_kv = !incremental ? 0.0
-            : mla_latent ? (double)kv_pos * n_mla_ * (c.kv_lora + c.qk_rope) * 4
-                         : (double)Tm * n_mla_
-                           * ((double)c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope) * 4;
+            : mla_latent ? (double)kv_pos * n_mla_ * (double)kv_latent_width(&c) * 4
+                         : (double)Tm * n_mla_ * (double)kv_expanded_width(&c) * 4;
 
         /* 2 GB + 2% margin on top, so auto never invites the OOM killer. */
         const double reserve = (w_model + w_state + w_buf + w_kv) / 1e9
@@ -1423,9 +1430,8 @@ int main(int argc, char **argv)
         const int kv_pos = (kv_window > 0 && kv_window < Tm) ? kv_window : Tm;
         const double w_kv = !incremental ? 0.0
             : mla_latent
-              ? (double)kv_pos * n_mla * (double)(c.kv_lora + c.qk_rope) * 4
-              : (double)Tm * n_mla
-                * ((double)c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope) * 4;
+              ? (double)kv_pos * n_mla * (double)kv_latent_width(&c) * 4
+              : (double)Tm * n_mla * (double)kv_expanded_width(&c) * 4;
         const double need_b = w_trunk + w_model + w_cache + w_state + w_buf + w_kv;
         const double have = mem_available_bytes();
 
@@ -1629,8 +1635,7 @@ int main(int argc, char **argv)
                    "positions\n", b1, w.n_mla, w.kv_slots);
             {   /* the same run in the expanded layout, so the saving is on the record */
                 const double exp_b = (double)w.kv_cap * w.n_mla
-                    * ((double)c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope)
-                    * sizeof(float);
+                    * (double)kv_expanded_width(&c) * sizeof(float);
                 char b8[32]; human(exp_b, b8, sizeof b8);
                 printf("                    the expanded layout would be %s for the same "
                        "run (%.1fx)\n\n", b8,
