@@ -129,6 +129,24 @@ not needing the bytes at all.
   went over what the walk owed. The aggregate byte total could say a run went over and
   never which layers; two explanations for the 13.7% were argued from the pinned set's
   shape before this existed, and both were wrong.
+- **`--gen 0` printed `nan` instead of a rate**, both on stdout and in `k3_run.json`'s
+  `seconds_per_token` field — invalid JSON, so any reader of that file broke. `nout` stays
+  0 when there is nothing to generate; both sites now guard the division.
+- `k3_cfg_load_file` leaked its raw file buffer on every successful load (only the
+  parse-failure branch freed it) — the common case, not the exceptional one.
+- `slurp()` (`src/io/k3_trunk.c`, backing `trunk.json` reads) ignored `fseek`/`ftell`
+  failures; a failed `ftell` returns -1, which would size the read buffer as `malloc(0)`
+  while still asking `fread` for `SIZE_MAX` bytes. Brought in line with the equivalent
+  check already in `k3_cfg_load_file`.
+- `k3_st_open`'s directory scan touched memory through an unchecked `realloc`/`malloc` in
+  its shard-list growth, the one allocation path in the codebase that didn't fail loudly.
+- `k3_moe_prefill` malloc'd and freed six buffers (up to 14.7 MB) per 64-token sub-chunk
+  per MoE layer instead of once per call — tens of thousands of allocations on a long
+  prompt. Hoisted to one allocation per `k3_moe_prefill` call, reused across sub-chunks;
+  bit-identity confirmed against the pre-existing `K3_NO_BATCH_PREFILL` reference path.
+- Five sites re-derived the expanded-KV-cache-per-position width by hand and two more
+  re-derived the latent equivalent despite `kv_latent_width` already existing; both now
+  go through one helper each (`kv_expanded_width` is new).
 
 ## [1.0.0] - 2026-08-07
 
