@@ -792,15 +792,14 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     if (!w->kv_on) memset(kstate, 0, kper * (size_t)w->n_bound * sizeof(float));
     int nb = 0;
     for (int L = 0; L < w->n_bound; L++) {
-        /* Streaming: bring this layer in, and hint the next one so its read overlaps
-         * this layer's arithmetic. The order is fixed 0..92 every token, so the hint is
-         * never wrong. */
+        /* Streaming: bring this layer in. k3_trunk_bind itself hints the next layer
+         * (order is fixed 0..92 every token, so the hint is never wrong) right after the
+         * read completes and before it spends any time widening this one. */
         if (w->trunk) {
             if (k3_trunk_bind(w->trunk, c, L, &w->lay[L]) != 0) {
                 fprintf(stderr, "trunk bind failed at layer %d\n", L);
                 return -1;
             }
-            k3_trunk_prefetch(w->trunk, L + 1);
         }
         /* Point this layer's MoE at the cache before use. Doing it here rather than at
          * bind time keeps K3LayerBind independent of any particular cache. */

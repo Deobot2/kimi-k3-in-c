@@ -821,6 +821,12 @@ int k3_trunk_bind(K3Trunk *tr, const K3Cfg *c, int L, K3LayerBind *b)
     unsigned char *base = NULL;
     if (k3_trunk_fetch(tr, L, &base) != 0) return -1;
 
+    /* Hint the NEXT layer here, before widening this one, not after. The widen loop
+     * below is CPU-bound (the router gate alone is ~25.7 MB of bf16->fp32 conversion)
+     * and every microsecond of it spent before the reader is told what to fetch next is
+     * overlap the ring buffer exists to capture and does not get back. */
+    k3_trunk_prefetch(tr, L + 1);
+
     Finder f; f.L = &tr->lay[L];
     K3MemSrc src; src.find = find_in_layer; src.ctx = &f;
     unsigned char *widen = base + (((tr->lay[L].nbytes + K3_TRUNK_ALIGN - 1)
