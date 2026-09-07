@@ -382,6 +382,12 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
             float *dst = (float *)(widen + w);
             const unsigned char *rp = run + off;
             const size_t rowb = 4u + (size_t)cols;
+            /* Rows are independent: each reads its own scale and writes its own slice
+             * of dst, so splitting the loop across threads changes neither which scale
+             * a row uses nor the value it produces. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (rows > 64)
+#endif
             for (int64_t r = 0; r < rows; r++) {
                 float scale;
                 memcpy(&scale, rp + (size_t)r * rowb, 4);
@@ -453,6 +459,14 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
         }
         float *dst = (float *)(widen + w);
         const uint16_t *sp = (const uint16_t *)(run + off);
+        /* Exact bit-widening, one element in, one element out, no accumulation -- so
+         * thread count and scheduling cannot change a single output bit. This is the
+         * loop docs/ARCHITECTURE.md and k3_bind_widen_bytes both call out as the
+         * dominant cost of a bind (the router gate alone is ~25.7 MB of it), and unlike
+         * every kernel in k3_ops.c it ran on one core. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (q->take > 4096)
+#endif
         for (int64_t k = 0; k < q->take; k++) dst[k] = k3_bf16f(sp[k]);
         *q->dest = dst;
         w += (size_t)q->take * 4;
