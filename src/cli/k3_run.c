@@ -1525,6 +1525,7 @@ int main(int argc, char **argv)
 
     K3Cache cache;
     if (k3_cache_init(&cache, &st, &c, (int64_t)(cache_gb * 1e9)) != 0) return 1;
+    if (trace_dir) k3_cache_set_trace(&cache, 1);
     {   /* The plan is a forecast. This is the outcome. */
         char rb[32];
         human(peak_rss_bytes(), rb, sizeof rb);

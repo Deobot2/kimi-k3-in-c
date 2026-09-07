@@ -209,6 +209,7 @@ typedef struct {
      * each, is 12 KB per token. */
     int32_t     *trace;
     int64_t      ntrace, captrace;
+    int          want_trace;      /* off unless --dump-cache-trace asked for it */
 } K3Cache;
 
 /* budget_bytes is the arena size; it is rounded down to whole experts. Fails if that
@@ -226,6 +227,11 @@ int  k3_cache_prefetch(K3Cache *c, int layer, int expert);
 
 void k3_cache_reset_stats(K3Cache *c);
 void k3_cache_report(const K3Cache *c, const char *label);
+
+/* Turn the (layer, expert) access trace on or off. Off by default: recording it takes
+ * the cache mutex and grows an unbounded buffer on every single request, which is
+ * wasted work and wasted memory on every run that never calls k3_cache_dump_trace. */
+void k3_cache_set_trace(K3Cache *c, int on);
 
 /* Write the request histogram as JSON, for offline analysis of the hot set. */
 int  k3_cache_dump_hist(const K3Cache *c, const char *path);
