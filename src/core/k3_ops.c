@@ -280,7 +280,8 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 
 /* -------------------------------------------------------- KDA recurrence ---- */
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
-                 const float *v, const float *alpha, float beta, int dk, int dv)
+                 const float *v, const float *alpha, float beta, int dk, int dv,
+                 float *u_scratch)
 {
     /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
      *    channel, not a scalar, which is what "channel-wise forget gate" means. */
@@ -291,11 +292,8 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     }
 
     /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
-     * would leave the recurrent state permanently scaled but never updated -- silent,
-     * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    float *u = u_scratch;
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -320,7 +318,6 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
 }
 
 /* ---------------------------------------------------------------- matmul ---- */
@@ -1258,17 +1255,21 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
      * serial form (gated by test_ops' kda fixtures under 1 vs N threads). The recurrence
      * is 0.4% of FLOPs but, serial, it is a majority of non-matmul wall time at high
      * core counts. wr is a full P-wide work row, so wr + h*D gives each head a private
-     * slice with no new allocation. */
+     * slice with no new allocation; gb (also P-wide) is dead until step 7 below, so it
+     * doubles as k3_kda_step's per-head u scratch for the same reason -- concurrent
+     * malloc/free across up to H threads, once per (head, token), was real allocator
+     * contention this recurrence cannot afford. */
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
     for (int h = 0; h < H; h++) {
         float *wh = wr + (size_t)h * D;
+        float *uh = gb + (size_t)h * D;
         for (int t = 0; t < T; t++) {
             const size_t off = (size_t)t * P + (size_t)h * D;
             for (int i = 0; i < D; i++) wh[i] = q[off + i] * qscale;
             k3_kda_step(S + (size_t)h * D * D, o + off, wh, k + off, v + off,
-                        al + off, bt[(size_t)t * H + h], D, D);
+                        al + off, bt[(size_t)t * H + h], D, D, uh);
         }
     }
 
