@@ -129,6 +129,30 @@ not needing the bytes at all.
   went over what the walk owed. The aggregate byte total could say a run went over and
   never which layers; two explanations for the 13.7% were argued from the pinned set's
   shape before this existed, and both were wrong.
+- **Batched MoE prefill summed uninitialised memory into the output when an expert failed
+  to load.** `moe_prefill_chunk`'s `contrib` buffer was `malloc`'d, not zeroed; step 2
+  only writes a (token, slot) whose expert loaded, and skips every slot belonging to a
+  dropped expert without touching it, while step 3 sums every slot unconditionally. The
+  single-token path (`k3_moe`) already gave a dropped expert a clean zero contribution;
+  the batched path now does the same.
+- `--gen 0` printed `-nan` for `s/token average` and wrote invalid `"seconds_per_token":`
+  JSON, from dividing by a token count of zero. Both sites now guard the division.
+- The trunk bind-timing breakdown (`bind wall ... = read + widen + other`) was three
+  process-global counters, so hybrid decode's second `K3Trunk` (`--draft-trunk`) silently
+  folded the draft model's bind time into the exact model's reported breakdown. The
+  counters now live on the `K3Trunk` they measure.
+
+### Performance
+
+- `k3_kda_step`, the KDA recurrence's innermost per-head-per-token kernel, `malloc`'d and
+  `free`'d a small temporary on every call -- up to prompt-length × heads × 69 KDA layers
+  times in one prefill, most of them from OpenMP threads racing the allocator in
+  parallel. It is now a bound-checked stack array.
+- `moe_prefill_chunk` malloc'd and freed its per-chunk buffers (~14.7 MB of `contrib`
+  alone at the released topk/latent width) on every 64-token chunk of every MoE layer, a
+  fresh multi-megabyte allocation and its first-touch page faults on the critical path of
+  a long prefill. The buffers are now acquired once, sized for the widest chunk, and
+  reused for the life of the process.
 
 ## [1.0.0] - 2026-08-07
 
