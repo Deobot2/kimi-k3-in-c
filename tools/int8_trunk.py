@@ -77,6 +77,17 @@ def main():
         for name, t in items:
             o, nb, dt, shape = t["off"], t["nbytes"], t["dtype"], t.get("shape", [])
             raw = run[o:o + nb]
+            # Unlike mxfp4_trunk.py and awq_trunk.py, this has no DENY_SUFFIX excluding
+            # .block_sparse_moe.gate.weight. That is deliberate here, not an oversight:
+            # those two tools produce the trunk the exact model runs against, and
+            # k3_bind.c's resident/MXFP4 paths read the gate as an ordinary fp32 tensor
+            # with no dequantise step, so a quantised gate there would be read as the
+            # wrong bytes outright. This tool only ever feeds --draft-trunk, whose sole
+            # job is proposing candidates the exact model verifies -- k3_bind_mem's I8R
+            # "wide" request (k3_bind.c, the K3_DT_I8R branch) dequantises row-scale *
+            # int8 back to fp32 before k3_router ever sees it, so the gate is read
+            # correctly either way. Quantising it costs the draft a little routing
+            # precision, never correctness, since a mismatched draft is just rejected.
             if dt == "BF16" and len(shape) == 2:
                 f = bf16_to_f32(np.frombuffer(raw, dtype=np.uint16)).reshape(shape[0], shape[1])
                 enc, enb = quant_row_int8(f)
