@@ -1159,6 +1159,27 @@ int main(int argc, char **argv)
             "  the rewind would read them as history. Drop one of the two.\n");
         return 2;
     }
+    /* A named preset (everything but auto, which computes resident-vs-streamed itself
+     * from the trunk manifest when one is given, and falls back to a sane assumption
+     * otherwise) is a fixed trunk_gb/cache_gb pair that only means what it says when the
+     * trunk actually streams. Without --trunk the run silently falls back to binding the
+     * whole ~113 GB trunk resident, trunk_gb is never consulted again, and the startup
+     * banner still prints the preset's small trunk figure as if it had taken effect --
+     * "--preset laptop" (documented as 8.2 GB peak RSS) would actually cost on the order
+     * of 113 GB. k3_preset_list already tells the user presets need --trunk; this is
+     * that requirement enforced rather than merely documented. */
+    if (preset_name && strcmp(preset_name, "auto") != 0 && !trunk_dir) {
+        fprintf(stderr,
+            "--preset %s needs --trunk <packed_dir>: presets are a streaming budget, "
+            "and without a\n"
+            "  trunk to stream, the run falls back to binding the whole ~113 GB trunk "
+            "resident\n"
+            "  instead of the %.1f GB the preset promises. Pass --trunk, or drop "
+            "--preset and use\n"
+            "  --trunk-gb/--cache-gb directly for a resident run.\n",
+            preset_name, trunk_gb);
+        return 2;
+    }
     if (incremental) {
         const int npos = np + gen + 1;
         const double per_pos = mla_latent ? K3_KV_LATENT_BYTES_PER_POS
