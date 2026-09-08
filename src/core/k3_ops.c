@@ -279,9 +279,23 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 }
 
 /* -------------------------------------------------------- KDA recurrence ---- */
+/* d_v is 128 at the released scale (kda_head_dim, d_k == d_v); 512 is headroom. This
+ * kernel runs once per head per token -- up to K3_MAX_PROMPT * kda_heads * 69 times in
+ * one prefill -- so `u` used to be a calloc()/free() pair per call. On that many calls
+ * the allocator traffic was measurable next to the recurrence's own arithmetic (0.4% of
+ * FLOPs, per the note below, but a majority of non-matmul wall time at high core counts),
+ * and every thread in the OpenMP loop over heads was doing it in parallel. A stack array
+ * costs nothing to acquire or release and needs no fatal-OOM path, unlike the temporaries
+ * described in the file-header note: this one now has a fixed size it can be checked
+ * against instead. */
+#define K3_KDA_STEP_MAX_DV 512
+
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
+    if (dv > K3_KDA_STEP_MAX_DV)
+        k3_fatal_bound("KDA recurrence d_v", (long)dv, (long)K3_KDA_STEP_MAX_DV);
+
     /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
      *    channel, not a scalar, which is what "channel-wise forget gate" means. */
     for (int i = 0; i < dk; i++) {
@@ -291,11 +305,11 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     }
 
     /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
-     * would leave the recurrent state permanently scaled but never updated -- silent,
-     * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    /* Zeroed AFTER the decay above has already modified S, same as the calloc() this
+     * replaced: returning early here would leave the recurrent state permanently scaled
+     * but never updated -- silent, unrecoverable corruption of every subsequent token. */
+    float u[K3_KDA_STEP_MAX_DV];
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -320,7 +334,6 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
 }
 
 /* ---------------------------------------------------------------- matmul ---- */
