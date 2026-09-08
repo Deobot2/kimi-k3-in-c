@@ -184,8 +184,14 @@ def main():
     print("\nrouted experts, measured:")
     print("  parameters            : %s" % format(routed_params, ","))
     print("  bytes                 : %s" % human(routed_bytes))
-    print("  bytes per parameter   : %.6f  (MXFP4 predicts %.6f)"
-          % (routed_bytes / routed_params, MXFP4_BYTES_PER_PARAM))
+    if routed_params:
+        print("  bytes per parameter   : %.6f  (MXFP4 predicts %.6f)"
+              % (routed_bytes / routed_params, MXFP4_BYTES_PER_PARAM))
+    else:
+        # A partial checkout that has not yet reached a `weight_packed` tensor: the
+        # docstring promises this script covers "the shards present," not that every
+        # shard has one, so this is a real state to hit, not just a bound to satisfy.
+        print("  bytes per parameter   : n/a (no weight_packed tensor in the shards seen)")
     nlayers_moe = len(per_layer_expert_bytes)
     if nlayers_moe:
         per = sorted(set(per_layer_expert_bytes.values()))
@@ -207,13 +213,17 @@ def main():
         print("  layers WITHOUT routed experts: %s (expect [0], the dense layer)" % missing)
 
     print("\nwhat this means for hardware:")
-    for ram in (32, 48, 64, 96, 128, 192, 256):
-        fits = ram * 1e9 - resident
-        n = int(fits / (routed_bytes / (nlayers_moe * 896))) if fits > 0 else 0
-        pct = 100.0 * n * (routed_bytes / (nlayers_moe * 896)) / stream if n > 0 else 0.0
-        print("  %3d GB RAM -> %s for experts, about %6d of %d cached (%.1f%%)"
-              % (ram, human(fits) if fits > 0 else "  DOES NOT FIT",
-                 max(n, 0), nlayers_moe * 896, pct))
+    if nlayers_moe and routed_bytes:
+        bytes_per_expert = routed_bytes / (nlayers_moe * 896)
+        for ram in (32, 48, 64, 96, 128, 192, 256):
+            fits = ram * 1e9 - resident
+            n = int(fits / bytes_per_expert) if fits > 0 else 0
+            pct = 100.0 * n * bytes_per_expert / stream if n > 0 else 0.0
+            print("  %3d GB RAM -> %s for experts, about %6d of %d cached (%.1f%%)"
+                  % (ram, human(fits) if fits > 0 else "  DOES NOT FIT",
+                     max(n, 0), nlayers_moe * 896, pct))
+    else:
+        print("  n/a: no routed-expert tensors in the shards seen")
     return 0
 
 
