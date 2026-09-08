@@ -1061,6 +1061,13 @@ size_t k3_moe_scratch(const K3Cfg *c)
 static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
                               const K3Cfg *c, int T, float *scratch);
 
+/* Fixed sub-chunks bound the contribution buffer (14.7 MB at 64 tokens) no matter how
+ * long the prompt is; a 32k prefill would otherwise want 7.3 GB of it. Most of the dedup
+ * is already captured at this width: the unique-expert count grows far slower than the
+ * request count under near-uniform routing. Shared with moe_prefill_chunk below, which
+ * sizes its reusable buffers to this width rather than to whatever T it is called with. */
+#define K3_MOE_PREFILL_CHUNK 64
+
 void k3_moe_prefill(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
                     int T, int *idx, float *wt, float *scratch)
 {
@@ -1075,11 +1082,7 @@ void k3_moe_prefill(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
         k3_moe(out, x, w, c, T, idx, wt, scratch);
         return;
     }
-    /* Fixed sub-chunks bound the contribution buffer (14.7 MB at 64 tokens) no matter
-     * how long the prompt is; a 32k prefill would otherwise want 7.3 GB of it. Most of
-     * the dedup is already captured at this width: the unique-expert count grows far
-     * slower than the request count under near-uniform routing. */
-    const int CHUNK = 64;
+    const int CHUNK = K3_MOE_PREFILL_CHUNK;
     for (int t0 = 0; t0 < T; t0 += CHUNK) {
         const int n = (T - t0) < CHUNK ? (T - t0) : CHUNK;
         if (n == 1) { k3_moe(out + (size_t)t0 * c->hidden, x + (size_t)t0 * c->hidden,
@@ -1097,25 +1100,46 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
 
     /* Per-token routing decisions and latent inputs, plus a contribution buffer holding
      * every routed expert's latent output for every token: [T][K][Ll]. At T=32, K=16,
-     * Ll=3584 that is ~7.3 MB, trivial beside the tens of GB already reserved. */
-    int   *ridx = (int *)  malloc((size_t)T * K * sizeof(int));
-    float *rwt  = (float *)malloc((size_t)T * K * sizeof(float));
-    float *zz   = (float *)malloc((size_t)T * Ll * sizeof(float));
-    /* calloc, not malloc: step 2 below only writes contrib[t][j] for a (token, slot)
-     * whose expert loaded successfully, and `continue`s past every token that had
-     * selected a DROPPED expert without touching its slot at all. Step 3 then sums
-     * every slot unconditionally. malloc left a dropped expert's slots holding
-     * whatever the heap allocator handed back -- uninitialised memory summed straight
-     * into the output -- instead of the zero contribution k3_moe's single-token path
-     * gives the same failure. */
-    float *contrib = (float *)calloc((size_t)T * K * Ll, sizeof(float));
-    if (!ridx || !rwt || !zz || !contrib)
-        k3_fatal_oom("MoE prefill batch", (size_t)T * K * Ll * sizeof(float));
+     * Ll=3584 that is ~7.3 MB, trivial beside the tens of GB already reserved.
+     *
+     * Sized once for the WIDEST chunk this function is ever called with
+     * (K3_MOE_PREFILL_CHUNK, not this call's T) and kept for the life of the process,
+     * rather than malloc'd and freed on every one of the potentially thousands of chunks
+     * a long prefill walks -- each a fresh multi-megabyte allocation and its first-touch
+     * page faults. Safe as a lazily-initialised static because this function runs on the
+     * caller's thread only (the OpenMP parallelism inside k3_mmw/k3_matmul_mxfp4 does not
+     * re-enter it) and because K, Ll and n_experts come from the one K3Cfg a process loads
+     * and never change out from under a static sized for them. */
+    static int   *ridx = NULL, *uniq = NULL;
+    static float *rwt = NULL, *zz = NULL, *contrib = NULL;
+    static char  *seen = NULL;
+    if (!contrib) {
+        const size_t TC = K3_MOE_PREFILL_CHUNK;
+        ridx    = (int *)  malloc(TC * (size_t)K * sizeof(int));
+        rwt     = (float *)malloc(TC * (size_t)K * sizeof(float));
+        zz      = (float *)malloc(TC * (size_t)Ll * sizeof(float));
+        contrib = (float *)malloc(TC * (size_t)K * Ll * sizeof(float));
+        uniq    = (int *)  malloc(TC * (size_t)K * sizeof(int));
+        seen    = (char *) malloc((size_t)c->n_experts);
+        if (!ridx || !rwt || !zz || !contrib || !uniq || !seen)
+            k3_fatal_oom("MoE prefill batch", TC * (size_t)K * Ll * sizeof(float));
+    }
+    /* `seen` is reused across calls, so last call's marks must not leak into this one.
+     * calloc gave a fresh zeroed buffer every time in the old malloc-per-call version;
+     * a plain memset is the same reset now that the allocation itself is not fresh.
+     * contrib does NOT need the same treatment: every element either gets written in
+     * step 2 below or is covered by the memset a few lines further down, which replaces
+     * the calloc a dropped expert's un-written slots used to rely on. */
+    memset(seen, 0, (size_t)c->n_experts);
+    /* calloc, not malloc's leftover contents: step 2 below only writes contrib[t][j] for
+     * a (token, slot) whose expert loaded successfully, and `continue`s past every token
+     * that had selected a DROPPED expert without touching its slot at all. Step 3 then
+     * sums every slot unconditionally, so every call must start from zero here exactly as
+     * the one-shot calloc this buffer replaced did -- a dropped expert must contribute a
+     * zero, not this call's leftovers or a previous call's contribution. */
+    memset(contrib, 0, (size_t)T * K * Ll * sizeof(float));
 
     /* 1. route every token and down-project it, and collect the batch's unique experts. */
-    int  *uniq = (int *)malloc((size_t)T * K * sizeof(int));
-    char *seen = (char *)calloc((size_t)c->n_experts, 1);
-    if (!uniq || !seen) k3_fatal_oom("MoE prefill index", (size_t)c->n_experts);
     int nu = 0;
     /* Same hint as the per-token path: routing has not happened yet and the source may
      * have a guess worth starting now. */
@@ -1189,8 +1213,8 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
         for (int i = 0; i < E; i++) ot[i] += sdn[i];
     }
-
-    free(ridx); free(rwt); free(zz); free(contrib); free(uniq); free(seen);
+    /* ridx/rwt/zz/contrib/uniq/seen are NOT freed: they are the static, process-lifetime
+     * buffers acquired above, reused by the next call rather than released here. */
 }
 
 /* --------------------------------------------------------- KDA full layer ---- */
