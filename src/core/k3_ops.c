@@ -1101,7 +1101,14 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
     int   *ridx = (int *)  malloc((size_t)T * K * sizeof(int));
     float *rwt  = (float *)malloc((size_t)T * K * sizeof(float));
     float *zz   = (float *)malloc((size_t)T * Ll * sizeof(float));
-    float *contrib = (float *)malloc((size_t)T * K * Ll * sizeof(float));
+    /* calloc, not malloc: step 2 below only writes contrib[t][j] for a (token, slot)
+     * whose expert loaded successfully, and `continue`s past every token that had
+     * selected a DROPPED expert without touching its slot at all. Step 3 then sums
+     * every slot unconditionally. malloc left a dropped expert's slots holding
+     * whatever the heap allocator handed back -- uninitialised memory summed straight
+     * into the output -- instead of the zero contribution k3_moe's single-token path
+     * gives the same failure. */
+    float *contrib = (float *)calloc((size_t)T * K * Ll, sizeof(float));
     if (!ridx || !rwt || !zz || !contrib)
         k3_fatal_oom("MoE prefill batch", (size_t)T * K * Ll * sizeof(float));
 
