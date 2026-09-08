@@ -161,6 +161,16 @@ typedef struct {
      * both wrong. k3_trunk_report prints the offenders. */
     uint32_t    *reads_of;
     double       load_seconds;
+
+    /* Wall clock inside k3_trunk_bind, and how much of it was k3_bind_layer_mem's widen
+     * step; see the note above k3_trunk_bind in the .c. Per-TRUNK, not process-global:
+     * hybrid decode (--draft-trunk) opens a second K3Trunk for the draft model and binds
+     * it every step alongside the exact model's own trunk. A global here would let the
+     * draft's binds silently inflate the exact model's reported bind wall, which is
+     * exactly the diagnostic this breakdown exists to get right. */
+    double       bind_wall;
+    double       widen_wall;
+    long         binds;
 } K3Trunk;
 
 /* Read ONLY the manifest: total packed bytes, layer count, and whether the weights were
