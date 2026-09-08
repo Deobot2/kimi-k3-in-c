@@ -1529,6 +1529,27 @@ int main(int argc, char **argv)
             fprintf(stderr, "packed trunk has %d layers, need %d\n", trunk.n_layers, NL);
             return 1;
         }
+        /* --calib-dump's whole premise, stated in --help and above the --ppl/calib
+         * block below, is that "the statistics must come from the model being
+         * approximated, not from an approximation of it." k3_trunk_open already prints
+         * a loud banner when trunk.quantised, but a banner is not a refusal: piped
+         * through a script, or just scrolled past in a long calibration run, it lets
+         * --calib-dump silently collect statistics from an ALREADY-quantised trunk and
+         * feed them to tools/awq_trunk.py, compounding one approximation's error into
+         * the next quantisation with nothing to say the result is now measuring the
+         * wrong thing. Resident binds never hit this: only --trunk can point at a
+         * quantised container. */
+        if (calib_dump && trunk.quantised) {
+            fprintf(stderr, "--calib-dump needs the BF16 trunk, not a quantised one: "
+                            "%s is quantised (see the banner above).\n"
+                            "  Statistics for AWQ must come from the model being "
+                            "approximated, not from an\n"
+                            "  approximation of it. Drop --trunk (resident, always the "
+                            "released bf16 weights)\n"
+                            "  or point --trunk at an unquantised packed trunk.\n",
+                    trunk_dir);
+            return 2;
+        }
         w.trunk = &trunk;
         w.n_bound = NL;
         printf("trunk streaming enabled from %s in %.1f s\n", trunk_dir, now_s() - t0);
