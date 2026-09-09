@@ -408,6 +408,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
         return -1;
     }
     tr->layer_of = (int *)malloc((size_t)RING * sizeof(int));
+    if (!tr->layer_of) return -1;
     for (int i = 0; i < RING; i++) tr->layer_of[i] = -1;
     tr->widen_bytes = (int64_t)widen;
 
