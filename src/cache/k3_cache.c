@@ -665,11 +665,6 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
         if (huge) madvise(c->arena, want, MADV_HUGEPAGE);
 #endif
     }
-    if (0) {
-        fprintf(stderr, "k3_cache: cannot allocate %.2f GB arena\n",
-                (double)c->nslot * c->slot_bytes / 1e9);
-        return -1;
-    }
 
     const size_t nkey = (size_t)c->n_layers * c->n_experts;
     c->slot_of = (int32_t *)malloc(nkey * sizeof(int32_t));
