@@ -75,7 +75,7 @@ flowchart LR
     SRC["6 C files<br/>+ 2 headers"] --> CC["cc -O3 -fopenmp<br/>-ffp-contract=off"]
     CC --> BIN["bin/k3<br/>179,736 bytes"]
     CC --> T["7 test binaries"]
-    T --> G["22 passed<br/>0 failed"]
+    T --> G["27 passed<br/>0 failed"]
     BIN --> RUN["runs a 1.56 TB model"]
 """, {"SRC": "gray", "CC": "blue", "BIN": "green", "T": "amber", "G": "teal", "RUN": "purple"})
 
