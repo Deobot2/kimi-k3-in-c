@@ -799,8 +799,13 @@ int k3_cache_dump_trace(const K3Cache *c, const char *path)
 
 int k3_cache_pin(K3Cache *c, int layer, int expert, int pin)
 {
+    /* Validate layer and expert individually, the same guard cache_get and
+     * cache_resident use, rather than only bounding their combined key: an
+     * out-of-range layer paired with a compensating expert could otherwise land on a
+     * coincidentally in-range key and pin the wrong slot instead of being rejected. */
+    if (layer < 0 || layer >= c->n_layers || expert < 0 || expert >= c->n_experts)
+        return 0;
     const int32_t key = layer * c->n_experts + expert;
-    if (key < 0 || key >= c->n_layers * c->n_experts) return 0;
     pthread_mutex_lock(&c->mu);
     const int slot = c->slot_of[key];
     if (slot >= 0) c->pinned[slot] = pin ? 1 : 0;
