@@ -208,6 +208,10 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
     for (int i = 7; i >= 0; i--) hlen = (hlen << 8) | lenbuf[i];   /* little endian */
 
     off_t fsize = lseek(fd, 0, SEEK_END);
+    if (fsize < 0) {
+        fprintf(stderr, "k3_st: cannot seek %s\n", path);
+        close(fd); return -1;
+    }
     if (hlen == 0 || (uint64_t)fsize < 8 + hlen) {
         fprintf(stderr, "k3_st: %s header length %llu is impossible (file %lld bytes)\n",
                 path, (unsigned long long)hlen, (long long)fsize);
@@ -373,9 +377,23 @@ int k3_st_open(K3St *s, const char *dir)
     while ((e = readdir(d))) {
         size_t n = strlen(e->d_name);
         if (n < 12 || strcmp(e->d_name + n - 12, ".safetensors")) continue;
-        if (nf == cf) { cf = cf ? cf * 2 : 32; files = (char **)realloc(files, cf * sizeof *files); }
+        if (nf == cf) {
+            cf = cf ? cf * 2 : 32;
+            char **nfiles = (char **)realloc(files, cf * sizeof *files);
+            if (!nfiles) {
+                fprintf(stderr, "k3_st: out of memory listing %s\n", dir);
+                for (int i = 0; i < nf; i++) free(files[i]);
+                free(files); closedir(d); return -1;
+            }
+            files = nfiles;
+        }
         size_t len = strlen(dir) + 1 + n + 1;
         files[nf] = (char *)malloc(len);
+        if (!files[nf]) {
+            fprintf(stderr, "k3_st: out of memory listing %s\n", dir);
+            for (int i = 0; i < nf; i++) free(files[i]);
+            free(files); closedir(d); return -1;
+        }
         snprintf(files[nf], len, "%s/%s", dir, e->d_name);
         nf++;
     }
