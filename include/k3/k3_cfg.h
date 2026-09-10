@@ -270,6 +270,7 @@ static inline int k3_cfg_load_file(K3Cfg *c, int *fa, int fa_max, const char *pa
     char *arena = NULL;
     jval *root = json_parse(txt, &arena);
     if (!root) { fprintf(stderr, "%s: not valid JSON\n", path); free(txt); return 0; }
+    free(txt);   /* arena holds copies of every string; txt itself is done (see k3_trunk.c) */
     return k3_cfg_load(c, fa, fa_max, root, path);
 }
 
