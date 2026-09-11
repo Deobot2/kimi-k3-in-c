@@ -68,6 +68,15 @@ not needing the bytes at all.
   the structural check catches it. Both omissions are equally wrong.
 - **`tools/make_random_checkpoint.py`**: a loadable checkpoint of noise, numpy only, so
   the quantisers and the harness can be exercised without torch or the 110 GB download.
+- **`--temp X` / `--top-p X` / `--seed N`**: opt-in sampling (roadmap item 5). Default
+  `--temp 0` keeps plain greedy decode, the only path any correctness gate exercises and
+  the only one that is identical across memory budgets; `--temp > 0` draws from
+  `softmax(logits/X)` through a seeded splitmix64 generator, so the same seed reproduces
+  the same run. `--top-p` truncates to the smallest probability-sorted nucleus reaching
+  that mass and needs `--temp > 0` to mean anything. Refused together with `--spec` and
+  `--draft-trunk`: both accept a draft by comparing it token-for-token against the exact
+  model's own greedy argmax, so sampling the exact side would reject proposals for a
+  reason unrelated to whether they were good.
 
 ### Changed
 

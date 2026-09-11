@@ -71,9 +71,11 @@ new and it is scalar.
 
 ## 5. Sampling
 
-Greedy only today. Adding temperature and top-p is small, but note the trade-off: greedy
-decoding is what makes output identical across memory budgets, which is a property the
-test-suite depends on. Sampling must be opt-in and off by default.
+Done: `--temp` (softmax sampling) and `--top-p` (nucleus truncation), both off by
+default so greedy stays the only path any gate exercises. They are refused together
+with `--spec` and `--draft-trunk`, whose correctness contract is comparing a draft
+against the exact model's own greedy argmax — sampling the exact side would reject
+drafts for a reason unrelated to whether they were good.
 
 ## 6. Chat template
 

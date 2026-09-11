@@ -3,7 +3,8 @@
  * WHAT THIS IS
  *   The full engine: safetensors index over 96 shards, resident trunk bound by name,
  *   routed experts streamed from disk through an LRU cache and multiplied straight out
- *   of MXFP4. Greedy decode. Token ids in, token ids out.
+ *   of MXFP4. Greedy decode by default; --temp opts into sampling. Token ids in, token
+ *   ids out.
  *
  * MEMORY. The banner this program prints before allocating is a PLAN, not a measurement.
  *   It reports requested budgets rather than actual reservations, and in practice it
@@ -122,6 +123,82 @@ static int real_cfg(K3Cfg *c, int *fa, int fa_max,
 
 static int argmax_(const float *v, int n)
 { int b = 0; for (int i = 1; i < n; i++) if (v[i] > v[b]) b = i; return b; }
+
+/* ------------------------------------------------------------- sampling ----
+ * Greedy (argmax_) is the default and the only path any correctness gate exercises:
+ * it is what makes output identical across memory budgets, and it is the primitive
+ * both the speculative and hybrid-draft paths verify a proposal against by direct
+ * comparison. --temp turns sampling on; main() refuses it together with --spec and
+ * --draft-trunk for exactly that reason, so the call sites below never see temp > 0
+ * while a draft is in flight and stay byte-identical to plain argmax_ when it is not.
+ *
+ * splitmix64 (Vigna, public domain): small, fast, and good enough to draw tokens from
+ * a distribution -- this is not a security or statistical-test context. Seeded once
+ * from --seed so a sampled run is reproducible.
+ */
+static uint64_t g_rng_state_;
+static uint64_t rng_next_(void)
+{
+    uint64_t z = (g_rng_state_ += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+static double rng_uniform_(void)   /* [0, 1) at 53 bits of precision */
+{ return (double)(rng_next_() >> 11) * (1.0 / 9007199254740992.0); }
+
+/* qsort's comparator takes no user-data pointer in C99; the sort below only ever runs
+ * on the main thread between forward passes, so a file-scope pointer is safe. */
+static const double *g_sample_cmp_probs_;
+static int sample_cmp_desc_(const void *a, const void *b)
+{
+    const double pa = g_sample_cmp_probs_[*(const int *)a];
+    const double pb = g_sample_cmp_probs_[*(const int *)b];
+    return (pa < pb) - (pa > pb);
+}
+
+/* Sample one token from softmax(v/temp), restricted to the smallest probability-sorted
+ * prefix whose cumulative mass reaches top_p (nucleus sampling; top_p = 1 keeps the
+ * whole distribution and skips the sort, since order does not matter when nothing is
+ * discarded). probs/idx are caller-owned scratch of length n, reused every step so
+ * sampling allocates nothing per token. temp <= 0 is not a valid call here; callers
+ * gate on it and use argmax_ directly, matching the refusal in main(). */
+static int sample_token_(const float *v, int n, float temp, float top_p,
+                         double *probs, int *idx)
+{
+    float m = v[0];
+    for (int i = 1; i < n; i++) if (v[i] > m) m = v[i];
+    const double inv_t = 1.0 / (double)temp;
+    double z = 0.0;
+    for (int i = 0; i < n; i++) {
+        probs[i] = exp(((double)v[i] - (double)m) * inv_t);
+        z += probs[i];
+        idx[i] = i;
+    }
+    for (int i = 0; i < n; i++) probs[i] /= z;
+
+    int nucleus = n;
+    if (top_p < 1.0f) {
+        g_sample_cmp_probs_ = probs;
+        qsort(idx, (size_t)n, sizeof(int), sample_cmp_desc_);
+        double cum = 0.0;
+        for (nucleus = 0; nucleus < n; nucleus++) {
+            cum += probs[idx[nucleus]];
+            if (cum >= (double)top_p) { nucleus++; break; }
+        }
+        if (nucleus == 0) nucleus = 1;   /* the top token alone can exceed top_p */
+    }
+
+    double mass = 0.0;
+    for (int i = 0; i < nucleus; i++) mass += probs[idx[i]];
+    const double r = rng_uniform_() * mass;
+    double acc = 0.0;
+    for (int i = 0; i < nucleus; i++) {
+        acc += probs[idx[i]];
+        if (r <= acc) return idx[i];
+    }
+    return idx[nucleus - 1];   /* fp rounding fallback: last token of the nucleus */
+}
 
 /* ---------------------------------------------------------------- perplexity ----
  * ONE RECORD PER PREDICTED POSITION, because a mean cannot answer the question a
@@ -604,6 +681,17 @@ static void usage(FILE *f)
 "\n"
 "generation:\n"
 "  --gen N               tokens to generate (default 8)\n"
+"  --temp X              sample instead of greedy: draw from softmax(logits/X).\n"
+"                        Default 0 selects greedy decode, the only path any\n"
+"                        correctness gate checks and the only one identical across\n"
+"                        memory budgets. Cannot combine with --spec or --draft-trunk,\n"
+"                        both of which verify a proposal against the exact model's\n"
+"                        own greedy argmax\n"
+"  --top-p X             nucleus sampling: restrict to the smallest set of tokens\n"
+"                        whose probability sums to at least X (default 1, the whole\n"
+"                        distribution). Needs --temp > 0\n"
+"  --seed N              RNG seed for --temp (default 0). Same seed, same run,\n"
+"                        same sampled tokens\n"
 "  --incremental         carry KV cache and recurrent state between tokens\n"
 "  --mla-latent          cache the 576-float MLA latent instead of expanded per-head\n"
 "                        k and v: 55.3 KB per position instead of 2.37 MB, a 42.9x\n"
@@ -924,6 +1012,8 @@ int main(int argc, char **argv)
     int incremental = 0;
     int mla_latent = 0, kv_window = 0, kv_sinks = 4;
     int trunk_ring = 0;   /* 0 selects k3_trunk_open's default of 2 */
+    float temp = 0.0f, top_p = 1.0f;   /* 0 == greedy, the only path any gate checks */
+    uint64_t seed = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
@@ -931,6 +1021,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) { gen = atoi(argv[++i]); gen_set = 1; }
+        else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) top_p = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) want_layers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
@@ -1149,6 +1242,33 @@ int main(int argc, char **argv)
             "--kv-window cannot be combined with --spec or --draft-trunk.\n"
             "  A rejected draft's rows wrap onto positions the replay still needs, so\n"
             "  the rewind would read them as history. Drop one of the two.\n");
+        return 2;
+    }
+    if (temp < 0.0f) {
+        fprintf(stderr, "--temp %.4g must be >= 0 (0 selects greedy decode)\n", (double)temp);
+        return 2;
+    }
+    if (top_p <= 0.0f || top_p > 1.0f) {
+        fprintf(stderr, "--top-p %.4g must be in (0, 1]\n", (double)top_p);
+        return 2;
+    }
+    if (top_p < 1.0f && temp <= 0.0f) {
+        fprintf(stderr, "--top-p needs --temp > 0; it has nothing to restrict under "
+                        "greedy decode\n");
+        return 2;
+    }
+    if (temp > 0.0f && (spec_n > 0 || draft_dir)) {
+        /* Both drafting paths accept a proposal by comparing it, token for token,
+         * against the exact model's OWN argmax -- that is the entire correctness
+         * contract ("output is identical to serial decode by construction"). Sampling
+         * the exact side would make every proposal wrong for a reason that has nothing
+         * to do with whether the draft was good, so there is no meaningful policy here,
+         * only a refusal. */
+        fprintf(stderr,
+            "--temp cannot be combined with --spec or --draft-trunk.\n"
+            "  Both verify a draft by comparing it to the exact model's greedy argmax;\n"
+            "  sampling the exact side would reject drafts for a reason unrelated to\n"
+            "  whether they were good. Drop one of the two.\n");
         return 2;
     }
     if (incremental) {
@@ -1588,7 +1708,14 @@ int main(int argc, char **argv)
     }
     float *sc = (float *)malloc(sc_need * sizeof(float));
     float *lg = (float *)malloc((size_t)c.vocab * sizeof(float));
-    if (!h || !br || !ks || !sc || !lg) { fprintf(stderr, "buffer allocation failed\n"); return 1; }
+    /* Sampling scratch, reused every generated token so --temp allocates nothing on
+     * the hot path; unused and unallocated under the default greedy decode. */
+    double *sm_probs = temp > 0.0f ? (double *)malloc((size_t)c.vocab * sizeof(double)) : NULL;
+    int *sm_idx = temp > 0.0f ? (int *)malloc((size_t)c.vocab * sizeof(int)) : NULL;
+    if (!h || !br || !ks || !sc || !lg || (temp > 0.0f && (!sm_probs || !sm_idx))) {
+        fprintf(stderr, "buffer allocation failed\n"); return 1;
+    }
+    g_rng_state_ = seed;   /* splitmix64 mixes the increment in, so seed 0 is fine too */
     human((double)(kper * NL) * 4, b1, sizeof b1);
     printf("recurrent state for %d layers: %s\n\n", NL, b1);
 
@@ -1970,7 +2097,12 @@ int main(int argc, char **argv)
             const int base = w.cached;
             const int nT0 = T - base;
             frc = forward(&w, &c, &cache, seq + base, nT0, lg, sc, h, br, ks, NULL, NULL);
-            if (frc == 0) { w.cached = base + nT0; emit[emitn++] = argmax_(lg, c.vocab); }
+            if (frc == 0) {
+                w.cached = base + nT0;
+                emit[emitn++] = temp > 0.0f
+                    ? sample_token_(lg, c.vocab, temp, top_p, sm_probs, sm_idx)
+                    : argmax_(lg, c.vocab);
+            }
             /* The draft model must absorb the same context, or its first proposals
              * come from a shorter one; one draft sweep, paid once. Saved state does
              * not include the draft's, so a resumed run replays the WHOLE sequence
@@ -2059,7 +2191,12 @@ int main(int argc, char **argv)
                 }
             } else {
                 frc = forward(&w, &c, &cache, seq + base, 1, lg, sc, h, br, ks, NULL, NULL);
-                if (frc == 0) { w.cached = base + 1; emit[emitn++] = argmax_(lg, c.vocab); }
+                if (frc == 0) {
+                    w.cached = base + 1;
+                    emit[emitn++] = temp > 0.0f
+                        ? sample_token_(lg, c.vocab, temp, top_p, sm_probs, sm_idx)
+                        : argmax_(lg, c.vocab);
+                }
                 /* keep the draft in lockstep through non-drafted steps */
                 if (dw.trunk && frc == 0) {
                     if (forward(&dw, &c, &cache, seq + base, 1, lg, sc, h, br,
@@ -2069,7 +2206,10 @@ int main(int argc, char **argv)
             }
         } else {
             frc = forward(&w, &c, &cache, seq, T, lg, sc, h, br, ks, NULL, NULL);
-            if (frc == 0) emit[emitn++] = argmax_(lg, c.vocab);
+            if (frc == 0)
+                emit[emitn++] = temp > 0.0f
+                    ? sample_token_(lg, c.vocab, temp, top_p, sm_probs, sm_idx)
+                    : argmax_(lg, c.vocab);
         }
         /* Abort the run rather than argmax a buffer the forward never wrote. */
         if (frc != 0 || emitn == 0) {
@@ -2229,7 +2369,7 @@ int main(int argc, char **argv)
     free(w.lay);
     k3_bind_model_free(&w.mb);
     k3_st_close(&st);
-    free(h); free(br); free(ks); free(sc); free(lg);
+    free(h); free(br); free(ks); free(sc); free(lg); free(sm_probs); free(sm_idx);
 
     /* A dropped expert means some token was computed with part of its routed sum
      * missing. The run still produced token ids and they still look plausible, which is
