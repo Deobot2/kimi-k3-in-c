@@ -207,6 +207,18 @@ static void touch(K3Cache *c, int slot)
     if (c->policy != K3_POLICY_LRU && c->freq[slot] < 3) c->freq[slot]++;
 }
 
+/* A slot the caller is about to use, whether from a genuine cache hit in admit() or
+ * from cache_resident() peeking on the draft model's behalf: touch it for the
+ * replacement policy and protect it from eviction for the rest of this layer. The two
+ * operations touch disjoint state (used_at/freq vs. the recent[] ring) so the order
+ * between them never mattered; this just gives the pair one name instead of four
+ * copies that could drift independently. */
+static void serve_hit(K3Cache *c, int slot)
+{
+    touch(c, slot);
+    mark_recent(c, slot);
+}
+
 /* Take a slot out of whatever queue it is in, for reuse. The victim pickers already
  * popped it; this is for the LRU path, which has no queues, and for slots reclaimed
  * from the free list. */
@@ -287,8 +299,7 @@ static int admit(K3Cache *c, int layer, int expert, int count_stats)
         const int32_t slot = c->slot_of[key];
         if (slot >= 0) {
             if (count_stats) c->hits++;
-            touch(c, slot);
-            mark_recent(c, slot);
+            serve_hit(c, slot);
             pthread_mutex_unlock(&c->mu);
             return slot;
         }
@@ -314,8 +325,7 @@ static int admit(K3Cache *c, int layer, int expert, int count_stats)
     /* Recheck: the wait above dropped the lock, and so did the ref lookup. */
     if (c->slot_of[key] >= 0) {
         const int slot = c->slot_of[key];
-        touch(c, slot);
-        mark_recent(c, slot);
+        serve_hit(c, slot);
         pthread_mutex_unlock(&c->mu);
         return slot;
     }
@@ -325,8 +335,7 @@ static int admit(K3Cache *c, int layer, int expert, int count_stats)
             pthread_cond_wait(&c->cv, &c->mu);
             if (c->slot_of[key] >= 0) {
                 slot = c->slot_of[key];
-                touch(c, slot);
-                mark_recent(c, slot);
+                serve_hit(c, slot);
                 pthread_mutex_unlock(&c->mu);
                 return slot;
             }
@@ -547,8 +556,7 @@ static int cache_resident(K3ExpertSrc *self, int layer, int expert, K3ExpertQ *o
     if (slot >= 0) {
         /* The caller is about to multiply out of this slot, so it must be protected
          * from eviction for the same reason get()'s result is. */
-        mark_recent(c, slot);
-        touch(c, slot);
+        serve_hit(c, slot);
     }
     pthread_mutex_unlock(&c->mu);
     if (slot < 0) return 0;
