@@ -279,6 +279,13 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 }
 
 /* -------------------------------------------------------- KDA recurrence ---- */
+/* Real head_dim is 128; 256 is the wf[64]-style 2x headroom (see the MXFP4 kernels
+ * below), not a config-derived figure. k3_kda_step runs once per (head, token) --
+ * H=96 heads times the whole re-run prefix on every step by default, or the prompt
+ * length once under --incremental -- so a stack buffer here replaces tens to hundreds
+ * of millions of malloc/free pairs per run with nothing, on a kernel whose own
+ * arithmetic (dv multiply-adds) an allocator round-trip otherwise dwarfs. */
+#define K3_KDA_STEP_MAXD 256
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
@@ -291,11 +298,13 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     }
 
     /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
+    /* Zeroed AFTER the decay above has already modified S. Returning early here
      * would leave the recurrent state permanently scaled but never updated -- silent,
      * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    if (dv > K3_KDA_STEP_MAXD)
+        k3_fatal_bound("KDA recurrence value width", (long)dv, (long)K3_KDA_STEP_MAXD);
+    float u[K3_KDA_STEP_MAXD];
+    memset(u, 0, (size_t)dv * sizeof(float));
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -320,7 +329,6 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
 }
 
 /* ---------------------------------------------------------------- matmul ---- */
