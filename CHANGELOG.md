@@ -101,6 +101,14 @@ not needing the bytes at all.
 - Saved state records the KV layout and window geometry and refuses a mismatch: the two
   caches hold different tensors of the same float count, so restoring one as the other
   would be fluent and wrong. State version 1 → 2.
+- **`k3_kda_step` has an AVX2 path** (roadmap item 4), 8 value-channels per lane. Every
+  loop in the recurrence reduces over the key dimension into an output that never
+  crosses channels, so vectorising over the channel dimension carries none of the
+  reduction-order risk the matmul kernels' AVX2 paths have to manage — each lane just
+  runs the same sequential scalar accumulation, eight at a time. Verified bit-identical
+  against the scalar build across dv from 1 to 256, including values on both sides of
+  every multiple of 8, since the repository's fixtures only ever use dv=16 and never
+  exercise the tail loop on their own.
 
 ### Fixed
 
