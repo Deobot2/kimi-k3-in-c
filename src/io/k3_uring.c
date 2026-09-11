@@ -262,6 +262,45 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
         __atomic_store_n(u->cq_head, chead, __ATOMIC_RELEASE);
     }
 
+    /* On the failure exit above, `posted` can still be > 0: `failed` can be set either
+     * by io_uring_enter itself failing (break, skipping the reap section entirely for
+     * that iteration) or by a bad CQE partway through draining ONE snapshot of the
+     * completion queue (chead..ctail as read at the top of this iteration), and either
+     * way requests already accepted by the kernel keep completing on their own
+     * schedule. This ring is a long-lived object reused for every later
+     * k3_uring_read on the same K3Uring, so a completion that lands after ck/again
+     * are freed still carries a user_data index into them -- the NEXT call's reap
+     * loop would read it as one of ITS OWN chunk indices, which is an out-of-bounds
+     * heap write if the index is out of range for the new call, or silent corruption
+     * of an unrelated read if it happens to land in range. Block here until every
+     * chunk this call handed to the ring has actually been reaped before freeing
+     * anything; the result this call returns is already decided by `failed`, so what
+     * comes back in this drain is discarded, not accumulated into `got`. */
+    while (posted > 0) {
+        unsigned chead = __atomic_load_n(u->cq_head, __ATOMIC_RELAXED);
+        unsigned ctail = __atomic_load_n(u->cq_tail, __ATOMIC_ACQUIRE);
+        if (chead == ctail) {
+            int r;
+            do {
+                r = sys_io_uring_enter(u->fd, 0, (unsigned)posted, IORING_ENTER_GETEVENTS);
+            } while (r < 0 && errno == EINTR);
+            if (r < 0) {
+                /* The kernel cannot tell us these are done either. Continuing to use
+                 * this ring from here on cannot be made safe, so this is the same
+                 * class of failure k3_ops.c treats as unrecoverable: abort loudly
+                 * rather than free ck/again under completions still in flight. */
+                fprintf(stderr,
+                    "k3_uring: cannot drain %d in-flight read(s) after a failure "
+                    "(io_uring_enter: %s); this ring cannot be reused safely.\n",
+                    posted, strerror(errno));
+                abort();
+            }
+            continue;
+        }
+        posted -= (int)(ctail - chead);
+        __atomic_store_n(u->cq_head, ctail, __ATOMIC_RELEASE);
+    }
+
     free(ck); free(again);
     if (failed) return -1;
     return got;
