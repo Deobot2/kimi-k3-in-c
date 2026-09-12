@@ -1083,14 +1083,19 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
     const int SI = I * c->n_shared, K = c->topk;
 
     /* Per-token routing decisions and latent inputs, plus a contribution buffer holding
-     * every routed expert's latent output for every token: [T][K][Ll]. At T=32, K=16,
-     * Ll=3584 that is ~7.3 MB, trivial beside the tens of GB already reserved. */
+     * every routed expert's latent output for every token: [T][K][Ll]. At the CHUNK=64
+     * k3_moe_prefill calls this with, K=16, Ll=3584, that is ~14.7 MB, trivial beside
+     * the tens of GB already reserved. */
     int   *ridx = (int *)  malloc((size_t)T * K * sizeof(int));
     float *rwt  = (float *)malloc((size_t)T * K * sizeof(float));
     float *zz   = (float *)malloc((size_t)T * Ll * sizeof(float));
     float *contrib = (float *)malloc((size_t)T * K * Ll * sizeof(float));
-    if (!ridx || !rwt || !zz || !contrib)
-        k3_fatal_oom("MoE prefill batch", (size_t)T * K * Ll * sizeof(float));
+    /* Reported separately, not as one combined check, so an operator sees which
+     * allocation actually failed rather than always being told it was the largest. */
+    if (!ridx)    k3_fatal_oom("MoE prefill batch (routed idx)", (size_t)T * K * sizeof(int));
+    if (!rwt)     k3_fatal_oom("MoE prefill batch (routed weights)", (size_t)T * K * sizeof(float));
+    if (!zz)      k3_fatal_oom("MoE prefill batch (latent inputs)", (size_t)T * Ll * sizeof(float));
+    if (!contrib) k3_fatal_oom("MoE prefill batch (contributions)", (size_t)T * K * Ll * sizeof(float));
 
     /* 1. route every token and down-project it, and collect the batch's unique experts. */
     int  *uniq = (int *)malloc((size_t)T * K * sizeof(int));
