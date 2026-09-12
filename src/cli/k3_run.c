@@ -977,12 +977,9 @@ int main(int argc, char **argv)
             cache_gb = p->cache_gb;
             preset_name = p->name;
         }
-        else if (!strcmp(argv[i], "--list-presets")) { k3_preset_list(stdout); return 0; }
-        else if (!strcmp(argv[i], "--version")) {
-            printf("k3 %s\n", K3_VERSION);
-            return 0;
-        }
-        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
+        /* --help/--version/--list-presets are NOT re-checked here: the loop above already
+         * scans the whole of argv for them and returns before this loop ever starts, so by
+         * this point none of argv[2..] can be one of the three. */
         else { fprintf(stderr, "unknown option %s\n\n", argv[i]); usage(stderr); return 2; }
     }
     {
