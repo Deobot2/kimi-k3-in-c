@@ -102,7 +102,12 @@ static char *slurp(const char *p, size_t *n)
 {
     FILE *f = fopen(p, "rb");
     if (!f) return NULL;
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    /* ftell failing here (-1) is the case worth guarding: (size_t)-1 + 1 wraps to 0,
+     * which would malloc a near-empty buffer and then ask fread for (size_t)-1 bytes
+     * into it -- a heap overflow rather than the clean NULL every caller expects. */
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long sz = ftell(f);
+    if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
     char *b = (char *)malloc((size_t)sz + 1);
     if (!b) { fclose(f); return NULL; }
     if (fread(b, 1, (size_t)sz, f) != (size_t)sz) { free(b); fclose(f); return NULL; }
@@ -872,6 +877,9 @@ void k3_trunk_report(const K3Trunk *tr, const char *label)
 {
     const uint64_t n = tr->hits + tr->misses;
     printf("trunk [%s]\n", label ? label : "");
+    if (tr->quantised)
+        printf("  *** QUANTISED TRUNK: these bytes are not the released checkpoint's; every\n"
+               "  *** bit-identity gate in this repository is void for the numbers below.\n");
     printf("  pinned %d/%d layers, ring %d slots\n", tr->npin, tr->n_layers, tr->nslot);
     printf("  binds %llu, hits %llu (%.1f%%), reads %llu\n",
            (unsigned long long)n, (unsigned long long)tr->hits,
