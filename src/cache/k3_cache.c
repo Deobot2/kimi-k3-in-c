@@ -840,8 +840,9 @@ void k3_cache_report(const K3Cache *c, const char *label)
            c->policy == K3_POLICY_LRU ? "LRU" : "S3-FIFO",
            c->policy == K3_POLICY_LRU ? "" : " (small/main/ghost)");
     if (c->policy != K3_POLICY_LRU)
-        printf("                 small %d of %d target, main %d, ghost %d keys\n",
-               c->s_len, c->s_target, c->m_len, c->ghost_len);
+        printf("                 small %d of %d target, main %d, ghost %d keys "
+               "(one token's working set: %d slots)\n",
+               c->s_len, c->s_target, c->m_len, c->ghost_len, c->working_set);
     printf("  slots        : %d of %.2f MB = %.2f GB arena (%d resident, %d pinned)\n",
            c->nslot, (double)c->slot_bytes / 1e6,
            (double)c->nslot * c->slot_bytes / 1e9, resident, pinned);
