@@ -51,6 +51,7 @@
 #include "k3.h"
 #include "k3_bind.h"
 #include "k3_trunk.h"
+#include "k3_uring.h"
 
 static int g_fail = 0;
 
@@ -467,6 +468,64 @@ static void t_formats(void)
     }
 }
 
+/* ---- 7: a failed read must not poison the ring for the NEXT one ----
+ *
+ * k3_uring_read used to return -1 the moment any chunk failed, even while OTHER chunks
+ * of the same request were still in flight in the kernel. K3Uring instances are
+ * long-lived (one per reader thread, reused for every layer read for the whole run), so
+ * those abandoned completions would land later and be reaped by a FUTURE, unrelated
+ * k3_uring_read on the same ring -- corrupting it via a stray user_data index into that
+ * call's own, differently-sized bookkeeping.
+ *
+ * This writes a file that ends partway into its second 8 MB chunk, requests two chunks
+ * (so the read fails on real EOF), and then issues a second, independent, in-bounds read
+ * on the SAME K3Uring and checks it comes back byte-correct. It cannot force the exact
+ * kernel-level interleaving the bug depended on, but it does exercise the documented
+ * contract end to end: a failed multi-chunk read must fail cleanly and leave the ring
+ * usable, not just eventually return an error code. */
+static void t_uring_drain_after_failure(const char *dir)
+{
+    K3Uring *u = k3_uring_new(8);
+    if (!u) {
+        printf("  SKIP  uring drain after failure   io_uring unavailable on this kernel\n");
+        return;
+    }
+
+    char path[512];
+    snprintf(path, sizeof path, "%s/uring_fail.bin", dir);
+    const int64_t chunk = 8 * 1024 * 1024;      /* mirrors K3_URING_CHUNK in k3_uring.c */
+    const int64_t file_len = chunk + 1024 * 1024;  /* one full chunk, 1 MB into the next */
+
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ok("uring: file created", fd >= 0, "%s", path);
+    if (fd < 0) { k3_uring_free(u); return; }
+
+    unsigned char *pattern = (unsigned char *)malloc((size_t)file_len);
+    for (int64_t i = 0; i < file_len; i++) pattern[i] = (unsigned char)(i * 2654435761u);
+    const ssize_t wrote = pwrite(fd, pattern, (size_t)file_len, 0);
+    ok("uring: file written", wrote == file_len, "%lld of %lld bytes",
+       (long long)wrote, (long long)file_len);
+
+    unsigned char *buf = (unsigned char *)malloc((size_t)(2 * chunk));
+    memset(buf, 0xAA, (size_t)(2 * chunk));
+    const int64_t r = k3_uring_read(u, fd, buf, 2 * chunk, 0);
+    ok("uring: truncated read fails", r < 0, "got %lld (want -1, file ends %lld short)",
+       (long long)r, (long long)(2 * chunk - file_len));
+
+    /* The ring must still be usable for a fresh, unrelated, fully in-bounds read. */
+    unsigned char small[65536];
+    const int64_t r2 = k3_uring_read(u, fd, small, sizeof small, 4096);
+    const int good = (r2 == (int64_t)sizeof small) &&
+                      memcmp(small, pattern + 4096, sizeof small) == 0;
+    ok("uring: ring usable after failure", good, "got %lld bytes, content %s",
+       (long long)r2, good ? "correct" : "WRONG");
+
+    free(pattern); free(buf);
+    close(fd);
+    unlink(path);
+    k3_uring_free(u);
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = argc > 1 ? argv[1] : ".";
@@ -565,6 +624,9 @@ int main(int argc, char **argv)
         run_case(dir, &c, len, budget, 3, "pread only (K3_NOURING)");
         unsetenv("K3_NOURING");
     }
+
+    /* ---- 7: a failed multi-chunk read must not corrupt a later one ---- */
+    t_uring_drain_after_failure(dir);
 
     printf("\n%s\n", g_fail ? "TRUNK TEST FAILED" : "TRUNK TEST PASSED");
     return g_fail ? 1 : 0;

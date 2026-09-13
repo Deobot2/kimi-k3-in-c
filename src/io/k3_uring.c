@@ -176,12 +176,20 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
     int      nagain = 0;
     if (!again) { free(ck); return -1; }
 
-    while (!failed && (next < nchunk || nagain > 0 || posted > 0)) {
-        /* ---- fill the submission queue ---- */
+    /* Once `failed` is set, this loop stops SUBMITTING but keeps REAPING until `posted`
+     * reaches zero. K3Uring instances are long-lived (one per reader thread, reused for
+     * every layer for the whole run), so a read abandoned mid-flight would leave the
+     * kernel completing it after this call has already freed `ck`/`again` and returned:
+     * the next, unrelated k3_uring_read on this same ring would then reap a stray CQE
+     * whose user_data indexes into ITS freshly allocated ck[], corrupting that read's
+     * bookkeeping or writing out of bounds. A disk error or a truncated file (EOF short
+     * of the requested run) must not poison every later read on the ring. */
+    while ((!failed && (next < nchunk || nagain > 0)) || posted > 0) {
+        /* ---- fill the submission queue (skipped once failed: draining only) ---- */
         unsigned tail = __atomic_load_n(u->sq_tail, __ATOMIC_RELAXED);
         unsigned head = __atomic_load_n(u->sq_head, __ATOMIC_ACQUIRE);
         unsigned queued = 0;
-        while ((tail - head) < u->entries && (next < nchunk || nagain > 0)) {
+        while (!failed && (tail - head) < u->entries && (next < nchunk || nagain > 0)) {
             const int64_t idx = nagain > 0 ? again[--nagain] : next++;
             struct io_uring_sqe *sqe = &u->sqes[tail & *u->sq_mask];
             memset(sqe, 0, sizeof *sqe);
@@ -225,6 +233,12 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
                                            in_kernel > 0 ? 1u : 0u,
                                            IORING_ENTER_GETEVENTS);
                 } while (r < 0 && errno == EINTR);
+                /* This call also drives the drain-after-failure path above (to_submit
+                 * becomes 0, in_kernel becomes plain `posted`), so a failure here is a
+                 * different, much rarer class than a per-request I/O error: the
+                 * submission mechanism itself is refusing, not one read among many. That
+                 * is not expected to self-heal by retrying, so this still gives up on
+                 * whatever remains `posted` rather than spin on a broken ring. */
                 if (r < 0) { failed = 1; break; }
             }
         } else {
