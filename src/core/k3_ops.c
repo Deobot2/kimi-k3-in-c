@@ -566,6 +566,14 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
             const int slot = k3_kv_slot(kv, p);
             if (slot < 0)
                 k3_fatal_bound("MLA latent slot for the position being written", (long)p, 0);
+            /* k3_kv_slot's windowed branch only ever returns a value < kv->window, on
+             * the invariant that the caller sized cap == window whenever windowing is
+             * on (true of every current caller). That invariant lives outside this
+             * file, so check it here too rather than trust it silently: a violation
+             * would otherwise memcpy past kv->lat's actual allocation. */
+            if (slot >= kv->cap)
+                k3_fatal_bound("MLA latent slot for the position being written",
+                               (long)slot, (long)kv->cap - 1);
             memcpy(kv->lat + (size_t)slot * kvw, ct, (size_t)kvw * sizeof(float));
         }
 
