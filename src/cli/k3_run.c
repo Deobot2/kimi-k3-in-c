@@ -44,6 +44,7 @@
 #define _DARWIN_C_SOURCE
 #endif
 
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -931,7 +932,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) { gen = atoi(argv[++i]); gen_set = 1; }
-        else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) { cache_gb = atof(argv[++i]); budget_auto = 0; }
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) want_layers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
         else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
@@ -972,17 +973,15 @@ int main(int argc, char **argv)
                 return 2;
             }
             /* A preset sets the budget; an explicit --trunk-gb/--cache-gb after it still
-             * wins, because the flags are applied in argv order. */
+             * wins, because the flags are applied in argv order. A NAMED preset also
+             * overrides a preceding `--preset auto`, for the same reason. */
             trunk_gb = p->trunk_gb;
             cache_gb = p->cache_gb;
             preset_name = p->name;
+            budget_auto = 0;
         }
-        else if (!strcmp(argv[i], "--list-presets")) { k3_preset_list(stdout); return 0; }
-        else if (!strcmp(argv[i], "--version")) {
-            printf("k3 %s\n", K3_VERSION);
-            return 0;
-        }
-        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
+        /* --help/--version/--list-presets are handled by the pre-scan above, which
+         * covers this whole argv range, so they never reach this loop. */
         else { fprintf(stderr, "unknown option %s\n\n", argv[i]); usage(stderr); return 2; }
     }
     {
@@ -1081,7 +1080,14 @@ int main(int argc, char **argv)
         printf("  tokenized: %ld bytes -> %d ids\n", plen, np);
     } else {
         for (const char *p = ids_s; *p && np < K3_MAX_PROMPT; ) {
-            prompt[np++] = (int)strtol(p, (char **)&p, 10);
+            char *end;
+            long v = strtol(p, &end, 10);
+            if (end == p) {
+                fprintf(stderr, "--ids: cannot parse a token id near \"%s\"\n", p);
+                return 2;
+            }
+            prompt[np++] = (int)v;
+            p = end;
             while (*p == ',' || *p == ' ') p++;
         }
     }
@@ -1906,6 +1912,8 @@ int main(int argc, char **argv)
             fprintf(pf, "],\"teacher_forced\":true}\n");
             fclose(pf);
             printf("  wrote %s\n", outp);
+        } else {
+            fprintf(stderr, "k3: cannot write %s: %s\n", outp, strerror(errno));
         }
         free(dnll); free(dpos); free(pp.rec);
         return 0;
@@ -1940,6 +1948,8 @@ int main(int argc, char **argv)
             fprintf(tf, "{\"tf_positions\":%d,\"tf_matches\":%d,\"tf_agreement\":%.4f}\n",
                     np - 1, match, (double)match / (np - 1));
             fclose(tf);
+        } else {
+            fprintf(stderr, "k3: cannot write %s: %s\n", outp, strerror(errno));
         }
         free(arg);
         return 0;
@@ -2137,7 +2147,8 @@ int main(int argc, char **argv)
     }
     free(spec_snap);
     printf("--------------------------------------------------------------------\n");
-    printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total, t_total / nout);
+    printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total,
+           nout > 0 ? t_total / nout : 0.0);
 
     /* Decoded text, when a tokenizer is loaded. Printed as a distinct block rather than
      * streamed per token: a partially-decoded multi-byte sequence is not valid UTF-8, so
@@ -2166,9 +2177,12 @@ int main(int argc, char **argv)
         for (int i = 0; i < nout; i++) fprintf(f, "%s%d", i ? "," : "", outtok[i]);
         fprintf(f, "],\"full_ids\":[");
         for (int i = 0; i < T; i++) fprintf(f, "%s%d", i ? "," : "", seq[i]);
-        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f}\n", NL, t_total / nout);
+        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f}\n", NL,
+                nout > 0 ? t_total / nout : 0.0);
         fclose(f);
         printf("\nwrote %s\n", outp);
+    } else {
+        fprintf(stderr, "k3: cannot write %s: %s\n", outp, strerror(errno));
     }
     if (trace_dir) {
         char p[4096];
