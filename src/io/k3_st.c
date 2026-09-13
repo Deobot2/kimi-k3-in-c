@@ -373,6 +373,20 @@ static int cmp_str(const void *a, const void *b)
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
+/* Every other allocation failure in this file is checked and reported; the directory
+ * scan below was the one exception, where a failed realloc/malloc fell straight
+ * through into a NULL dereference (a failed realloc also overwrites `files` with NULL,
+ * leaking the block it was resizing). Frees what the scan collected so far, closes the
+ * directory, and returns the -1 the caller already treats as fatal. */
+static int scan_oom_fail(char **files, int nf, const char *dir, DIR *d)
+{
+    fprintf(stderr, "k3_st: out of memory scanning %s\n", dir);
+    for (int i = 0; i < nf; i++) free(files[i]);
+    free(files);
+    closedir(d);
+    return -1;
+}
+
 int k3_st_open(K3St *s, const char *dir)
 {
     memset(s, 0, sizeof *s);
@@ -385,9 +399,15 @@ int k3_st_open(K3St *s, const char *dir)
     while ((e = readdir(d))) {
         size_t n = strlen(e->d_name);
         if (n < 12 || strcmp(e->d_name + n - 12, ".safetensors")) continue;
-        if (nf == cf) { cf = cf ? cf * 2 : 32; files = (char **)realloc(files, cf * sizeof *files); }
+        if (nf == cf) {
+            const int ncf = cf ? cf * 2 : 32;
+            char **nfiles = (char **)realloc(files, (size_t)ncf * sizeof *files);
+            if (!nfiles) return scan_oom_fail(files, nf, dir, d);
+            files = nfiles; cf = ncf;
+        }
         size_t len = strlen(dir) + 1 + n + 1;
         files[nf] = (char *)malloc(len);
+        if (!files[nf]) return scan_oom_fail(files, nf, dir, d);
         snprintf(files[nf], len, "%s/%s", dir, e->d_name);
         nf++;
     }
