@@ -40,6 +40,10 @@ static int sys_io_uring_enter(int fd, unsigned to_submit, unsigned min_complete,
                         (void *)NULL, (size_t)0);
 }
 
+/* One chunk of a split read. `done` tracks partial completions so a short read is
+ * resubmitted at the right offset instead of being mistaken for a failure. */
+typedef struct { int64_t off, len, done; unsigned char *buf; } Chunk;
+
 struct K3Uring {
     int       fd;
     unsigned  entries;
@@ -55,6 +59,13 @@ struct K3Uring {
     void     *cq_ptr;   size_t cq_sz;
     unsigned *cq_head, *cq_tail, *cq_mask;
     struct io_uring_cqe *cqes;
+
+    /* k3_uring_read scratch, persistent across calls rather than malloc'd on every one
+     * (up to 93 calls per generated token for a streamed trunk). This ring serves one
+     * caller at a time, so reusing it across calls is safe. Grown, never shrunk. */
+    Chunk    *ck;
+    int64_t  *again;
+    int64_t   chunk_cap;
 };
 
 static void uring_unmap(K3Uring *u)
@@ -136,15 +147,13 @@ void k3_uring_free(K3Uring *u)
     if (!u) return;
     uring_unmap(u);
     if (u->fd >= 0) close(u->fd);
+    free(u->ck);
+    free(u->again);
     free(u);
 }
 
 unsigned k3_uring_depth(const K3Uring *u) { return u ? u->entries : 0u; }
 int      k3_uring_sqpoll(const K3Uring *u) { return u ? u->sqpoll : 0; }
-
-/* One chunk of a split read. `done` tracks partial completions so a short read is
- * resubmitted at the right offset instead of being mistaken for a failure. */
-typedef struct { int64_t off, len, done; unsigned char *buf; } Chunk;
 
 /* 8 MB per request: large enough that per-request overhead is irrelevant against a
  * 1.27 GB layer, small enough that a ring of 8 covers 64 MB and keeps the device busy
@@ -157,8 +166,21 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
     if (!u || nbytes <= 0) return 0;
 
     const int64_t nchunk = (nbytes + K3_URING_CHUNK - 1) / K3_URING_CHUNK;
-    Chunk *ck = (Chunk *)malloc((size_t)nchunk * sizeof(Chunk));
-    if (!ck) return -1;
+    if (nchunk > u->chunk_cap) {
+        /* Grown, never shrunk: the largest layer seen so far sets the high-water mark,
+         * and every later call -- same trunk, same ring, up to 93 calls per token --
+         * reuses it with no allocation at all. realloc leaves the existing block
+         * untouched on failure, so u->ck/u->again stay valid (just not big enough,
+         * which the caller sees as this call failing, not as a leak or a stale size). */
+        Chunk *nck = (Chunk *)realloc(u->ck, (size_t)nchunk * sizeof(Chunk));
+        if (!nck) return -1;
+        u->ck = nck;
+        int64_t *nagain = (int64_t *)realloc(u->again, (size_t)nchunk * sizeof(int64_t));
+        if (!nagain) return -1;
+        u->again = nagain;
+        u->chunk_cap = nchunk;
+    }
+    Chunk *ck = u->ck;
     for (int64_t i = 0; i < nchunk; i++) {
         const int64_t a = i * (int64_t)K3_URING_CHUNK;
         ck[i].off = off + a;
@@ -172,9 +194,8 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
     int64_t got = 0;
     int     failed = 0;
     /* Chunks needing resubmission after a short read, as a simple stack. */
-    int64_t *again = (int64_t *)malloc((size_t)nchunk * sizeof(int64_t));
+    int64_t *again = u->again;
     int      nagain = 0;
-    if (!again) { free(ck); return -1; }
 
     /* Once `failed` is set, this loop stops SUBMITTING but keeps REAPING until `posted`
      * reaches zero. K3Uring instances are long-lived (one per reader thread, reused for
@@ -276,7 +297,6 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
         __atomic_store_n(u->cq_head, chead, __ATOMIC_RELEASE);
     }
 
-    free(ck); free(again);
     if (failed) return -1;
     return got;
 }
