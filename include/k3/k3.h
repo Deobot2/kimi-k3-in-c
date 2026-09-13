@@ -205,9 +205,12 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
  *    2. read    u = S^T k
  *    3. write   S += k (beta*(v-u))^T
  *    4. output  o = S^T q          from the ALREADY UPDATED state
- * q must arrive pre-scaled by d_k^-0.5. */
+ * q must arrive pre-scaled by d_k^-0.5. u_scratch is caller-owned, at least dv floats,
+ * and its incoming content is irrelevant (step 2 overwrites it before reading it) --
+ * this runs once per (head, token), so the caller must not allocate it per call. */
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
-                 const float *v, const float *alpha, float beta, int dk, int dv);
+                 const float *v, const float *alpha, float beta, int dk, int dv,
+                 float *u_scratch);
 
 /* y[out] = W[out][in] . x[in].  W is row-major, no bias anywhere in this model. */
 void k3_matmul(float *y, const float *x, const float *W, int in, int out);

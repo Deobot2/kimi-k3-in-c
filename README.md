@@ -1570,7 +1570,8 @@ per channel and per token.
 
 ```c
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
-                 const float *v, const float *alpha, float beta, int dk, int dv)
+                 const float *v, const float *alpha, float beta, int dk, int dv,
+                 float *u_scratch)
 {
     /* 1. decay: scale ROW i of S by alpha[i], per key channel */
     for (int i = 0; i < dk; i++) {
@@ -1580,8 +1581,8 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     }
 
     /* 2. read the state along k: u = S^T k */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    float *u = u_scratch;
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -1605,14 +1606,15 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
 }
 ```
 
-That `calloc` happens **after** step one has already scaled the state, so an early return
-on allocation failure would leave the recurrent matrix permanently decayed but never
-updated. Every subsequent token would then be computed from a state that is quietly wrong,
-with nothing to indicate it. That is why the failure path aborts instead of returning.
+`u_scratch` is caller-owned rather than allocated here. This runs once per (head, token)
+in the sequential recurrence — `H * n_kda_layers` times per generated token — so a malloc
+in this function was a heap round trip on the hottest per-token path, and under the
+head-parallel OpenMP loop in `k3_kda_layer` every thread hit the allocator on every step.
+`k3_kda_layer` now carves one D-wide row per head out of its own scratch, the same way it
+already does for the pre-scaled query.
 
 ![Nine ordered steps, and the numbering is not decoration](docs/images/kda-nine-steps.png)
 
@@ -1627,7 +1629,8 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
     float *v  = k + (size_t)T * P;       float *z  = v + (size_t)T * P;
     float *al = z + (size_t)T * P;       float *bt = al + (size_t)T * P;
     float *o  = bt + (size_t)T * H;      float *gb = o + (size_t)T * P;
-    float *wr = gb + P;                  float *fa = wr + P;
+    float *wr = gb + P;                  float *us = wr + P;
+    float *fa = us + P;
 
     /* 1. projections */
     for (int t = 0; t < T; t++) {
@@ -1674,7 +1677,7 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
             const size_t off = (size_t)t * P + (size_t)h * D;
             for (int i = 0; i < D; i++) wr[i] = q[off + i] * qscale;
             k3_kda_step(S + (size_t)h * D * D, o + off, wr, k + off, v + off,
-                        al + off, bt[(size_t)t * H + h], D, D);
+                        al + off, bt[(size_t)t * H + h], D, D, us);
         }
 
     /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection */
