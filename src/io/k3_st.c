@@ -45,7 +45,7 @@ int64_t k3_st_numel(const K3Tensor *t)
 {
     int64_t n = 1;
     for (int i = 0; i < t->ndim; i++) n *= t->shape[i];
-    return t->ndim ? n : 1;
+    return n;
 }
 
 static K3Dtype dtype_of(const char *s, size_t n)
@@ -125,7 +125,19 @@ static int i64_(Scan *s, int64_t *v)
     if (s->p < s->end && (*s->p == '-' || *s->p == '+')) neg = (*s->p++ == '-');
     if (s->p >= s->end || *s->p < '0' || *s->p > '9') return 0;
     int64_t a = 0;
-    while (s->p < s->end && *s->p >= '0' && *s->p <= '9') a = a * 10 + (*s->p++ - '0');
+    while (s->p < s->end && *s->p >= '0' && *s->p <= '9') {
+        /* This feeds data_offsets/shape directly into byte offsets that every later
+         * pread trusts (k3_st_open's own consistency checks catch most malformed
+         * results downstream, but not every path composes; an arbitrarily long digit
+         * run signed-overflowing `a` is undefined behaviour regardless). Reject rather
+         * than wrap: a header this malformed was never going to describe a real
+         * tensor. Checked per digit, not with a fixed 9-digit margin, so INT64_MAX
+         * itself still parses. */
+        const int64_t digit = *s->p - '0';
+        if (a > (INT64_MAX - digit) / 10) return 0;
+        a = a * 10 + digit;
+        s->p++;
+    }
     *v = neg ? -a : a;
     return 1;
 }
