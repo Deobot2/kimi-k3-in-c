@@ -665,11 +665,6 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
         if (huge) madvise(c->arena, want, MADV_HUGEPAGE);
 #endif
     }
-    if (0) {
-        fprintf(stderr, "k3_cache: cannot allocate %.2f GB arena\n",
-                (double)c->nslot * c->slot_bytes / 1e9);
-        return -1;
-    }
 
     const size_t nkey = (size_t)c->n_layers * c->n_experts;
     c->slot_of = (int32_t *)malloc(nkey * sizeof(int32_t));
@@ -837,6 +832,13 @@ void k3_cache_reset_stats(K3Cache *c)
 
 void k3_cache_report(const K3Cache *c, const char *label)
 {
+    /* Every field read below is documented on K3Cache.mu as "guards EVERY field above;
+     * reads happen outside it" -- that contract is for the hot get()/admit() path, which
+     * tolerates a stale read. This report is not on that path and is called (k3_run.c)
+     * before the speculation thread that writes these counters is joined, so an
+     * unlocked read here is a genuine data race rather than an accepted staleness. */
+    pthread_mutex_t *mu = (pthread_mutex_t *)&c->mu;
+    pthread_mutex_lock(mu);
     const uint64_t n = c->hits + c->misses;
     int resident = 0, pinned = 0;
     for (int i = 0; i < c->nslot; i++) { if (c->key_of[i] >= 0) resident++; if (c->pinned[i]) pinned++; }
@@ -879,6 +881,7 @@ void k3_cache_report(const K3Cache *c, const char *label)
     printf("  read from disk: %.2f GB in %.2f s (%.0f MB/s while loading)\n",
            (double)c->bytes_read / 1e9, c->load_seconds,
            c->load_seconds > 0 ? (double)c->bytes_read / 1e6 / c->load_seconds : 0.0);
+    pthread_mutex_unlock(mu);
 }
 
 int k3_cache_dump_hist(const K3Cache *c, const char *path)

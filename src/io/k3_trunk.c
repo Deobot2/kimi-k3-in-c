@@ -764,7 +764,9 @@ int k3_trunk_fetch(K3Trunk *tr, int L, unsigned char **out)
             pthread_mutex_unlock(&io->mu);
             if (rc != 0) return -1;
         } else {
+            pthread_mutex_lock(&io->mu);
             tr->hits++;
+            pthread_mutex_unlock(&io->mu);
         }
         pthread_mutex_lock(&io->mu);
         io->held = -1;                       /* no ring slot is in use */
@@ -870,6 +872,13 @@ void k3_trunk_prefetch(K3Trunk *tr, int L)
 
 void k3_trunk_report(const K3Trunk *tr, const char *label)
 {
+    /* hits, misses, bytes_read, load_seconds and reads_of[] are all written under
+     * io->mu (tally_locked and its neighbours), and the reader thread that writes them
+     * can still be running when this is called -- k3_cache_free/k3_trunk_close, which
+     * join it, run AFTER this report in k3_run.c. Reading them without the lock is a
+     * data race on every one of those fields. */
+    K3TrunkIO *io = (K3TrunkIO *)tr->io_state;
+    if (io) pthread_mutex_lock(&io->mu);
     const uint64_t n = tr->hits + tr->misses;
     printf("trunk [%s]\n", label ? label : "");
     printf("  pinned %d/%d layers, ring %d slots\n", tr->npin, tr->n_layers, tr->nslot);
@@ -952,4 +961,5 @@ void k3_trunk_report(const K3Trunk *tr, const char *label)
                        100.0 * other / k3_trunk_bind_wall);
         }
     }
+    if (io) pthread_mutex_unlock(&io->mu);
 }
