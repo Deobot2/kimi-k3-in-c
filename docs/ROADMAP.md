@@ -57,17 +57,21 @@ Two background threads now exist as well — the trunk reader and the expert-cac
 speculator — so the sweep should cover their interaction with the OpenMP pool rather
 than assuming the pool has the machine to itself.
 
-## 4. SIMD in the KDA recurrence
+## 4. SIMD in the KDA recurrence — done for bf16, MXFP4/int8 remain
 
-The bf16 trunk matmul and the MXFP4 expert matmul already have hand-written AVX2 paths
-(`src/core/k3_ops.c`), each written to reproduce the scalar reduction order exactly. The
-KDA recurrence does not: it is still plain scalar C, and it is the largest remaining
-un-vectorised kernel on the non-I/O path.
+The bf16 trunk matmul and the MXFP4 expert matmul already had hand-written AVX2 paths
+(`src/core/k3_ops.c`), each written to reproduce the scalar reduction order exactly.
+`k3_kda_step` and `k3_matmul_tr`'s bf16 branch now do too — see CHANGELOG — measured at
+~1.7x and ~6.3x respectively on the released dimensions, both bit-identical to the
+scalar path by construction (block-local or lane-local accumulators, same summation
+order, no cross-lane or cross-thread reduction) and verified so directly (same source
+built with and without `__AVX2__`), not just within the fixtures' numeric tolerance.
 
-`k3_matmul_tr`, added for the latent KV cache's query absorption, is the second: it is a
-strided column sweep with a double accumulator per output and no vector path at all. It
-runs 96 times per MLA layer per token, so it is small next to the recurrence but it is
-new and it is scalar.
+What is left: `k3_matmul_tr`'s MXFP4 and int8 branches are still scalar. They only run
+against a quantised trunk (`tools/mxfp4_trunk.py` / `tools/awq_trunk.py`), which is
+opt-in and off by default, so they are lower value than the bf16 branch was, but the
+same block-of-8 restructuring applies — MXFP4 additionally needs the nibble select and
+per-group E8M0 lookup to happen per block rather than per column.
 
 ## 5. Sampling
 

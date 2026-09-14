@@ -31,6 +31,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
  * scratch without changing a published signature. They are hundreds of bytes to a few
@@ -279,16 +283,59 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 }
 
 /* -------------------------------------------------------- KDA recurrence ---- */
+/* THE VECTOR PATH IS BIT-IDENTICAL TO THE SCALAR PATH. Every loop below is "outer over
+ * i (a scalar per iteration), inner over j (a contiguous row)", so the 8 lanes of a
+ * __m256 each replicate one j's scalar accumulation, in the same i-order, independently
+ * of every other lane -- unlike k3_matmul's row reduction, there is no cross-lane sum to
+ * get wrong. MUL THEN ADD, never _mm256_fmadd_ps, because -ffp-contract=off makes the
+ * scalar code round the product and the sum separately. The scalar tail below handles
+ * dv % 8; D is 128 in the released config, so it is untested by the release shape but
+ * exercised by tests/fixtures/ops/kda_recur*.json, whose d_v is 16 -- also a multiple of
+ * 8, so make the remainder correct by inspection, not by assuming it never runs. */
+
+/* row[j] *= a[i], for every row i. */
+static void k3_kda_scale_rows_(float *S, const float *alpha, int dk, int dv)
+{
+    for (int i = 0; i < dk; i++) {
+        float *row = S + (size_t)i * dv;
+        const float a = alpha[i];
+        int j = 0;
+#if defined(__AVX2__)
+        const __m256 va = _mm256_set1_ps(a);
+        for (; j + 8 <= dv; j += 8)
+            _mm256_storeu_ps(row + j, _mm256_mul_ps(_mm256_loadu_ps(row + j), va));
+#endif
+        for (; j < dv; j++) row[j] *= a;
+    }
+}
+
+/* dst[j] += sum_i coef[i] * S[i][j], into a caller-zeroed dst. Shared by step 2
+ * (u = S^T k) and step 4 (o = S^T q) below, which differ only in which vector supplies
+ * coef and which buffer receives the result. */
+static void k3_kda_accum_rows_(float *dst, const float *S, const float *coef, int dk, int dv)
+{
+    for (int i = 0; i < dk; i++) {
+        const float ci = coef[i];
+        if (ci == 0.0f) continue;
+        const float *row = S + (size_t)i * dv;
+        int j = 0;
+#if defined(__AVX2__)
+        const __m256 vc = _mm256_set1_ps(ci);
+        for (; j + 8 <= dv; j += 8) {
+            __m256 prod = _mm256_mul_ps(_mm256_loadu_ps(row + j), vc);
+            _mm256_storeu_ps(dst + j, _mm256_add_ps(_mm256_loadu_ps(dst + j), prod));
+        }
+#endif
+        for (; j < dv; j++) dst[j] += ci * row[j];
+    }
+}
+
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
     /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
      *    channel, not a scalar, which is what "channel-wise forget gate" means. */
-    for (int i = 0; i < dk; i++) {
-        float *row = S + (size_t)i * dv;
-        const float a = alpha[i];
-        for (int j = 0; j < dv; j++) row[j] *= a;
-    }
+    k3_kda_scale_rows_(S, alpha, dk, dv);
 
     /* 2. read the state along k:  u = S^T k */
     /* Allocated AFTER the decay above has already modified S. Returning early here
@@ -296,30 +343,30 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
      * unrecoverable corruption of every subsequent token. */
     float *u = (float *)calloc((size_t)dv, sizeof(float));
     if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
-    for (int i = 0; i < dk; i++) {
-        const float ki = k[i];
-        if (ki == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) u[j] += ki * row[j];
-    }
+    k3_kda_accum_rows_(u, S, k, dk, dv);
 
     /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
      *    it a DELTA rule rather than plain accumulation. */
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
+        const float kib = ki * beta;                 /* same left-to-right order as before */
         float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
+        int j = 0;
+#if defined(__AVX2__)
+        const __m256 vkib = _mm256_set1_ps(kib);
+        for (; j + 8 <= dv; j += 8) {
+            __m256 diff = _mm256_sub_ps(_mm256_loadu_ps(v + j), _mm256_loadu_ps(u + j));
+            __m256 prod = _mm256_mul_ps(vkib, diff);
+            _mm256_storeu_ps(row + j, _mm256_add_ps(_mm256_loadu_ps(row + j), prod));
+        }
+#endif
+        for (; j < dv; j++) row[j] += kib * (v[j] - u[j]);
     }
 
     /* 4. output from the ALREADY UPDATED state: o = S^T q */
     for (int j = 0; j < dv; j++) o[j] = 0.0f;
-    for (int i = 0; i < dk; i++) {
-        const float qi = q[i];
-        if (qi == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) o[j] += qi * row[j];
-    }
+    k3_kda_accum_rows_(o, S, q, dk, dv);
     free(u);
 }
 
@@ -688,11 +735,25 @@ size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span)
  *
  * Column-outer rather than row-outer: each output element gets its own double
  * accumulator summed over rows in index order, so the result does not depend on how the
- * loop is scheduled and the OpenMP and serial forms agree to the bit. Row-outer would
- * need an accumulator array and a reduction whose order changes with the thread count.
+ * loop is scheduled and the OpenMP and serial forms agree to the bit. A flat row-outer
+ * sweep would need one shared accumulator array spanning all of `in` and a final
+ * reduction whose order changes with the thread count.
  *
  * The stride is unfriendly -- consecutive rows are `in` elements apart -- but the whole
- * of W_UK[h] is 128 KB at the released dimensions and stays in L2 across the sweep. */
+ * of W_UK[h] is 128 KB at the released dimensions and stays in L2 across the sweep.
+ *
+ * THE bf16 PATH additionally processes columns in blocks of 8: each block still gets its
+ * own private double accumulators (now 8 of them, one per lane) summed over rows in
+ * index order exactly as above, only now eight columns at a time -- so it is the same
+ * column-outer accumulation as the scalar path, not the row-outer one the note above
+ * warns about, and stays bit-identical across thread counts for the same reason. Inside
+ * a block this turns the unfriendly stride into a contiguous 16-byte load per row,
+ * because eight bf16 columns of one row ARE contiguous even though the columns of one
+ * output are not. MUL THEN ADD, never _mm256_fmadd_pd, to match -ffp-contract=off. The
+ * MXFP4 and int8 paths are unaccelerated: MXFP4 needs a nibble select and a per-group
+ * E8M0 lookup that block nicely too, but bf16 is what the default (unquantised) trunk
+ * ships and where this function is on the hot path (`--mla-latent`'s query absorption,
+ * 96 calls per MLA layer per token), so it is the one worth the added complexity today. */
 void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int rows)
 {
     if (wdt == K3_WBF16) {
@@ -700,11 +761,37 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++)
-                acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
-            y[j] = (float)acc;
+        for (int jb = 0; jb < in; jb += 8) {
+            const int width = (jb + 8 <= in) ? 8 : (in - jb);
+#if defined(__AVX2__)
+            if (width == 8) {
+                __m256d acc_lo = _mm256_setzero_pd(), acc_hi = _mm256_setzero_pd();
+                for (int r = 0; r < rows; r++) {
+                    const __m128i h = _mm_loadu_si128(
+                        (const __m128i *)(w16 + (size_t)r * in + jb));
+                    /* same widening as k3_bf16f: zero-extend then shift into place */
+                    const __m256 wf = _mm256_castsi256_ps(
+                        _mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
+                    const __m256d xr = _mm256_set1_pd((double)x[r]);
+                    acc_lo = _mm256_add_pd(acc_lo,
+                        _mm256_mul_pd(_mm256_cvtps_pd(_mm256_castps256_ps128(wf)), xr));
+                    acc_hi = _mm256_add_pd(acc_hi,
+                        _mm256_mul_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(wf, 1)), xr));
+                }
+                double tmp[8];
+                _mm256_storeu_pd(tmp,     acc_lo);
+                _mm256_storeu_pd(tmp + 4, acc_hi);
+                for (int jj = 0; jj < 8; jj++) y[jb + jj] = (float)tmp[jj];
+                continue;
+            }
+#endif
+            for (int jj = 0; jj < width; jj++) {
+                const int j = jb + jj;
+                double acc = 0.0;
+                for (int r = 0; r < rows; r++)
+                    acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
+                y[j] = (float)acc;
+            }
         }
     } else if (wdt == K3_WMX4) {
         /* A quantised trunk. Column j of row r is the nibble at byte j/2 of that row,
@@ -1456,11 +1543,9 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
 
 /* ---------------------------------------------------------------- MXFP4 ---- */
 /* K3_E2M1 lives near the top of this file: k3_matmul_tr needs it too, for the
- * transposed sweep over a quantised trunk, and that is defined well before here. */
-
-#if defined(__AVX2__)
-#include <immintrin.h>
-#endif
+ * transposed sweep over a quantised trunk, and that is defined well before here.
+ * <immintrin.h> is included once, near the top of the file, because k3_kda_step
+ * needs it too. */
 
 /* y[out] = W[out][in] . x[in], with W stored as bf16 and widened on read.
  *

@@ -71,6 +71,27 @@ not needing the bytes at all.
 
 ### Changed
 
+- **The KDA recurrence (`k3_kda_step`) and `k3_matmul_tr`'s bf16 path now have AVX2
+  paths — roadmap item 4, the two remaining un-vectorised kernels on the non-I/O path.**
+  `k3_kda_step`'s inner loops are all "outer over a scalar coefficient, inner over a
+  contiguous row," the same shape `k3_matmul`'s row reduction is not, so unlike a matmul
+  reduction there is no cross-lane sum to get wrong — each of the 8 SIMD lanes just
+  replicates the scalar per-channel accumulation independently. `k3_matmul_tr` processes
+  output columns in blocks of 8 instead of one at a time, each block keeping its own 8
+  private double accumulators summed over rows in index order exactly as the scalar
+  column-outer path does — so it is still column-outer, not the row-outer form the
+  function's own comment warns produces a thread-count-dependent reduction, just eight
+  columns of it at once, which also turns the unfriendly per-row stride into a
+  contiguous 16-byte load. Mul-then-add throughout both, never `_mm256_fmadd_p{s,d}`, to
+  match what `-ffp-contract=off` makes the scalar code do. Verified bit-identical
+  against the scalar path — same source compiled with and without `__AVX2__`, including
+  the non-multiple-of-8 remainder in each — and against `tests/fixtures/ops/kda_recur*`
+  and the MLA-latent oracle gates (GATE 4/5, which exercise `k3_matmul_tr`'s bf16 path
+  directly). Standalone microbenchmarks at the released dimensions (head_dim 128 for the
+  recurrence; kv_lora 512 × qk_nope 128 for the absorbed-query matmul, its real call
+  shape) measured **~1.7×** and **~6.3×** respectively; only `k3_matmul_tr`'s bf16 branch
+  is accelerated, the MXFP4 and int8 branches are unchanged since the default
+  (unquantised) trunk never takes them.
 - **Expert cache replacement is S3-FIFO, not LRU.** The project's own simulator put 25.5
   points between LRU and Belady at 64 GB, and its own conclusion was that the lever is the
   policy rather than the size. Small FIFO, main FIFO, ghost queue; uniform object size
