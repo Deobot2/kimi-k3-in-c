@@ -10,7 +10,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(kimi-k3-in-c
-        VERSION 0.1.0
+        VERSION 1.0.0
         DESCRIPTION "Kimi K3 inference engine in portable C"
         LANGUAGES C)
 
