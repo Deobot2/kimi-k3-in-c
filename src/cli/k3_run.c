@@ -977,12 +977,10 @@ int main(int argc, char **argv)
             cache_gb = p->cache_gb;
             preset_name = p->name;
         }
-        else if (!strcmp(argv[i], "--list-presets")) { k3_preset_list(stdout); return 0; }
-        else if (!strcmp(argv[i], "--version")) {
-            printf("k3 %s\n", K3_VERSION);
-            return 0;
-        }
-        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
+        /* --help/-h, --version and --list-presets are NOT re-checked here: the
+         * unconditional scan above already answers and exits for any of the three
+         * anywhere in argv[1..], which covers this whole loop's range (i starts at 2),
+         * so a branch for them here could never be reached. */
         else { fprintf(stderr, "unknown option %s\n\n", argv[i]); usage(stderr); return 2; }
     }
     {
