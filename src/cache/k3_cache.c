@@ -207,14 +207,21 @@ static void touch(K3Cache *c, int slot)
     if (c->policy != K3_POLICY_LRU && c->freq[slot] < 3) c->freq[slot]++;
 }
 
-/* Take a slot out of whatever queue it is in, for reuse. The victim pickers already
- * popped it; this is for the LRU path, which has no queues, and for slots reclaimed
- * from the free list. */
+/* Take a slot out of whatever queue it is in, for reuse.
+ *
+ * Both early returns below are dead against the current callers, provably: LRU has no
+ * queues at all, and every return path of pick_victim_s3 (the free list, and both
+ * q_pop_head results) already clears q_of[slot] to K3_Q_FREE before handing the slot
+ * back, so reserve()'s call here never reaches the unlink body either. Kept anyway, and
+ * not simplified away, because it is the only thing that would catch a future victim
+ * picker or caller that hands detach() a slot still linked in a queue -- the failure mode
+ * a missing unlink produces is a corrupted queue that runs and evicts the wrong slot
+ * later, not a crash here. (An earlier version of this comment claimed the unlink body
+ * was reachable via pick_victim_lru; it is not, LRU is exactly the return-early case.) */
 static void detach(K3Cache *c, int slot)
 {
     if (c->policy == K3_POLICY_LRU) return;
     if (c->q_of[slot] == K3_Q_FREE) return;
-    /* Only reachable via pick_victim_lru, which does not maintain the queues. */
     const int q = c->q_of[slot];
     int32_t *head = (q == K3_Q_SMALL) ? &c->s_head : &c->m_head;
     int32_t *tail = (q == K3_Q_SMALL) ? &c->s_tail : &c->m_tail;
