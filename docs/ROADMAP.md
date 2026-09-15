@@ -59,15 +59,21 @@ than assuming the pool has the machine to itself.
 
 ## 4. SIMD in the KDA recurrence
 
-The bf16 trunk matmul and the MXFP4 expert matmul already have hand-written AVX2 paths
-(`src/core/k3_ops.c`), each written to reproduce the scalar reduction order exactly. The
-KDA recurrence does not: it is still plain scalar C, and it is the largest remaining
-un-vectorised kernel on the non-I/O path.
+**The KDA half of this is done, and it took no code.** The bf16 trunk matmul and the
+MXFP4 expert matmul have hand-written AVX2 paths (`src/core/k3_ops.c`) because their
+reduction is a genuine cross-element sum that needs a specific tree to stay bit-identical
+across thread counts. `k3_kda_step`'s four loops are not that: `i` (dk) is the only
+sequential axis, `j` (dv) carries no reduction at all, so vectorising over `j` changes no
+arithmetic and GCC already does it — measured, a hand-written AVX2 path using the same
+`mul_ps`/`add_ps` lane ops timed within noise of the plain scalar loop already in the tree
+(~8.8 vs ~8.6 μs per head-step at `-O3 -march=native`, both ~4x faster than the same
+binary built with `-fno-tree-vectorize`), so it was reverted rather than kept for no
+measured gain. See the Research notes entry in `CHANGELOG.md`.
 
-`k3_matmul_tr`, added for the latent KV cache's query absorption, is the second: it is a
-strided column sweep with a double accumulator per output and no vector path at all. It
-runs 96 times per MLA layer per token, so it is small next to the recurrence but it is
-new and it is scalar.
+`k3_matmul_tr`, added for the latent KV cache's query absorption, is still open: it is a
+strided column sweep with a single double accumulator per output, a genuine sequential
+reduction over `rows` with no automatic vectorisation to fall back on. It runs 96 times
+per MLA layer per token, so it is small next to the recurrence, and unmeasured.
 
 ## 5. Sampling
 

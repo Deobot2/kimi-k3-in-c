@@ -130,6 +130,19 @@ not needing the bytes at all.
   never which layers; two explanations for the 13.7% were argued from the pinned set's
   shape before this existed, and both were wrong.
 
+### Research notes, not shipped as features
+
+- **AVX2 intrinsics for the KDA recurrence, measured and dropped.** `k3_kda_step`'s four
+  loops reduce only along `i` (dk); `j` (dv) carries no cross-element reduction, so a
+  hand-written AVX2 path using the same `mul_ps`/`add_ps` lane arithmetic the scalar loop
+  already implies is bit-identical to it, unlike the FMA-based paths `k3_matmul` and
+  `k3_matmul_bf16` need for their genuine reductions. Built and timed against the plain
+  scalar loop already in the tree at `-O3 -march=native`: ~8.8 μs vs ~8.6 μs per
+  head-step, within noise, because GCC already auto-vectorises this shape (both ~4x
+  faster than the same binary built with `-fno-tree-vectorize`, which confirms the
+  vectorisation is happening, just not from source). The intrinsics were reverted rather
+  than kept for no measured gain. See `docs/ROADMAP.md` item 4.
+
 ## [1.0.0] - 2026-08-07
 
 Verified end to end on the full released checkpoint, and made substantially faster, with
