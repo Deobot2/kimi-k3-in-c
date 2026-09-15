@@ -166,6 +166,28 @@ Experts stay in packed MXFP4 throughout. `k3_matmul_mxfp4` consumes nibbles dire
 never materialises a dequantised matrix, one expert is 17.5 MB packed against 132 MB
 expanded, and a token touches 1,472 of them.
 
+## Calibration
+
+`k3_calib_begin`/`k3_calib_observe`/`k3_calib_write`/`k3_calib_end` collect
+per-input-channel activation statistics — sum|x| and sum x² over the five slots in
+`enum { K3_CAL_IN, K3_CAL_POST, K3_CAL_QA, K3_CAL_KVA, K3_CAL_LAT }` — which
+`tools/awq_trunk.py` needs for activation-aware quantisation and only this engine can
+produce at full scale. It is off by default (every observation point in `k3_mla`,
+`k3_mla_latent`, `k3_kda_layer` and `k3_moe` costs one `k3_calib_active()`-style NULL test
+when off) and turns on for the run with `k3_calib_begin(n_layers)`:
+
+```c
+if (k3_calib_begin(cfg.n_layers)) return 1;
+/* run the model, one full pass over the calibration suite */
+k3_calib_write("calib.bin");
+k3_calib_end();
+```
+
+`k3_calib_layer(L)` sets which layer subsequent observations belong to; `k3_decoder_layer_kv`
+calls it, so callers driving layers directly through the lower-level kernels must call it
+themselves before each layer. See the comment above the declarations in `include/k3/k3.h`
+for why this is a file-scope sink rather than a threaded context argument.
+
 ## Error handling
 
 Two failure modes need explicit attention from callers.
@@ -187,7 +209,9 @@ if (k3_expert_drops) {
 ## Thread safety
 
 The kernels are reentrant and parallelise internally with OpenMP. They hold no global
-state except `k3_expert_drops`.
+state except `k3_expert_drops` and, while calibration is active (see above), the
+per-channel accumulators `k3_calib_begin` allocates. One calibration pass at a time
+per process, same as the trunk and cache restriction below.
 
 The safetensors index is **not** thread-safe. One inference at a time per instance.
 
