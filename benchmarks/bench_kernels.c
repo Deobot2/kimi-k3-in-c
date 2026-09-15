@@ -128,6 +128,34 @@ int main(void)
         free(pk); free(sc); free(x); free(y);
     }
 
+    /* ---------- transposed matmul: --mla-latent's absorbed query, kv_lora=512 ---- */
+    {
+        const int in = 512, rows = 128; /* kv_lora, qk_nope at the released dimensions */
+        uint16_t *W = (uint16_t *)malloc((size_t)in * rows * sizeof(uint16_t));
+        float *x = (float *)malloc((size_t)rows * sizeof(float));
+        float *y = (float *)malloc((size_t)in * sizeof(float));
+        if (!W || !x || !y) { printf("alloc failed\n"); return 1; }
+        fillb((unsigned char *)W, (size_t)in * rows * 2, 24680u);
+        fillf(x, rows, 1357u);
+
+        k3_matmul_tr(y, x, W, K3_WBF16, in, rows);      /* warm */
+        const int reps = 2000;
+        const double t0 = now_s();
+        for (int r = 0; r < reps; r++) k3_matmul_tr(y, x, W, K3_WBF16, in, rows);
+        const double dt = (now_s() - t0) / reps;
+        const double gflop = 2.0 * in * rows / 1e9;
+        printf("\nmatmul_tr    %5d x %-5d  %7.2f us  %8.1f GFLOP/s\n",
+               in, rows, dt * 1e6, gflop / dt);
+
+        /* One call per head per MLA layer per token: 96 heads x 24 MLA layers. This
+         * is what changed 4.4-5.0x when the loop went rows-outer -- rerun this after
+         * touching k3_matmul_tr to see whether a change helped or regressed it. */
+        fnv("mmtr ", y, in);
+        printf("             96 heads x 24 MLA layers -> %.2f ms/token\n",
+               dt * 96 * 24 * 1e3);
+        free(W); free(x); free(y);
+    }
+
     printf("\nmeasured compute budget at the floor is about 10 s/token; whichever line\n"
            "above dominates it is the one worth vectorising.\n");
     return 0;
