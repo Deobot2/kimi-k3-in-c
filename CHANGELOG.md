@@ -92,6 +92,14 @@ not needing the bytes at all.
 - Saved state records the KV layout and window geometry and refuses a mismatch: the two
   caches hold different tensors of the same float count, so restoring one as the other
   would be fluent and wrong. State version 1 → 2.
+- **`k3_matmul_tr` reads each row once, contiguously, instead of striding a column across
+  every row.** It fed the latent KV cache's absorbed query projection and used to walk
+  column-outer on the argument that the whole operand stays resident in L2 — true, but
+  fitting in cache bounds capacity misses, not the cost of a fresh cache line for two
+  bytes of it on every access. Rewritten rows-outer into a tiled output buffer, same
+  summation order so the result is bit-identical at any thread count: 4.4-5.0x faster,
+  measured at the real call-site shape (in=512, rows=128, bf16). See `docs/ROADMAP.md`
+  item 4.
 
 ### Fixed
 

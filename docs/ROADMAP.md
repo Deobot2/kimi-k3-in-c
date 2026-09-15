@@ -70,10 +70,13 @@ arithmetic and GCC already does it — measured, a hand-written AVX2 path using 
 binary built with `-fno-tree-vectorize`), so it was reverted rather than kept for no
 measured gain. See the Research notes entry in `CHANGELOG.md`.
 
-`k3_matmul_tr`, added for the latent KV cache's query absorption, is still open: it is a
-strided column sweep with a single double accumulator per output, a genuine sequential
-reduction over `rows` with no automatic vectorisation to fall back on. It runs 96 times
-per MLA layer per token, so it is small next to the recurrence, and unmeasured.
+**`k3_matmul_tr` is also done, but the fix was not vectorisation.** It walked its output
+column-outer, reading one element from every row per column — `in` elements apart, a
+fresh cache line every access. The comment argued this was fine because the whole operand
+fits in L2; measured, that bounded capacity misses but not the cost of touching a new
+line for two bytes of it each time. Rewritten rows-outer (each row read once,
+contiguously, into a small tiled output buffer, same summation order, bit-identical): 4.4
+-5.0x faster, measured at the real call-site shape (in=512, rows=128, bf16).
 
 ## 5. Sampling
 
