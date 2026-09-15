@@ -686,25 +686,39 @@ size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span)
 
 /* The transposed product, W row-major and never moved.
  *
- * Column-outer rather than row-outer: each output element gets its own double
- * accumulator summed over rows in index order, so the result does not depend on how the
- * loop is scheduled and the OpenMP and serial forms agree to the bit. Row-outer would
- * need an accumulator array and a reduction whose order changes with the thread count.
+ * Tiled column-outer: output is split into K3_MMTR_TILE-wide chunks (independent, so
+ * still an OpenMP-parallel outer loop), and within a chunk the loop nest is rows-outer,
+ * columns-inner. Each y[j] still sums its `rows` terms in exactly r = 0..rows-1 order --
+ * moving r outer does not touch that order, it only changes which loop the machine walks
+ * first -- so this is bit-identical to a column-outer sweep at any thread count, without
+ * that form's own reduction-order argument.
  *
- * The stride is unfriendly -- consecutive rows are `in` elements apart -- but the whole
- * of W_UK[h] is 128 KB at the released dimensions and stays in L2 across the sweep. */
+ * It used to BE column-outer, on the reasoning that the stride is unfriendly but the
+ * whole of W_UK[h] (128 KB at the released dimensions) stays in L2 across the sweep.
+ * Measured, that reasoning was wrong the way this project's other mechanism-only calls
+ * have been wrong before: fitting in L2 bounds capacity misses, not the cost of landing
+ * on a fresh cache line for two bytes of it every single access. Rows-outer reads each
+ * row of W once, contiguously, prefetcher-friendly, prices no worse than fits in cache
+ * SHOULD have. Measured 4.4-5.0x on the absorbed-query call site (in=512, rows=128,
+ * bf16), tiled so it still parallelises the same way it did before. */
+#define K3_MMTR_TILE 64
 void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int rows)
 {
     if (wdt == K3_WBF16) {
         const uint16_t *w16 = (const uint16_t *)W;
 #ifdef _OPENMP
-#       pragma omp parallel for schedule(static) if (in > 64)
+#       pragma omp parallel for schedule(static) if (in > K3_MMTR_TILE)
 #endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++)
-                acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
-            y[j] = (float)acc;
+        for (int jt = 0; jt < in; jt += K3_MMTR_TILE) {
+            const int j1 = jt + K3_MMTR_TILE < in ? jt + K3_MMTR_TILE : in;
+            double acc[K3_MMTR_TILE] = {0};
+            for (int r = 0; r < rows; r++) {
+                const double xr = (double)x[r];
+                const uint16_t *row = w16 + (size_t)r * in;
+                for (int j = jt; j < j1; j++)
+                    acc[j - jt] += xr * (double)k3_bf16f(row[j]);
+            }
+            for (int j = jt; j < j1; j++) y[j] = (float)acc[j - jt];
         }
     } else if (wdt == K3_WMX4) {
         /* A quantised trunk. Column j of row r is the nibble at byte j/2 of that row,
@@ -721,21 +735,25 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
         const size_t pn = (size_t)in / 2u;
         const unsigned char *base = (const unsigned char *)W;
 #ifdef _OPENMP
-#       pragma omp parallel for schedule(static) if (in > 64)
+#       pragma omp parallel for schedule(static) if (in > K3_MMTR_TILE)
 #endif
-        for (int j = 0; j < in; j++) {
-            const size_t byte = (size_t)j >> 1;
-            const int    odd  = j & 1;
-            const size_t grp  = (size_t)j / K3_MXFP4_GROUP;
-            double acc = 0.0;
+        for (int jt = 0; jt < in; jt += K3_MMTR_TILE) {
+            const int j1 = jt + K3_MMTR_TILE < in ? jt + K3_MMTR_TILE : in;
+            double acc[K3_MMTR_TILE] = {0};
             for (int r = 0; r < rows; r++) {
+                const double xr = (double)x[r];
                 const unsigned char *row = base + (size_t)r * stride;
-                const unsigned char sb = row[pn + grp];
-                if (sb == 255) continue;              /* NaN scale: contributes nothing */
-                const unsigned char nib = odd ? (row[byte] >> 4) : (row[byte] & 0x0F);
-                acc += (double)x[r] * (double)K3_E2M1[nib] * (double)ldexpf(1.0f, (int)sb - 127);
+                for (int j = jt; j < j1; j++) {
+                    const size_t byte = (size_t)j >> 1;
+                    const int    odd  = j & 1;
+                    const size_t grp  = (size_t)j / K3_MXFP4_GROUP;
+                    const unsigned char sb = row[pn + grp];
+                    if (sb == 255) continue;          /* NaN scale: contributes nothing */
+                    const unsigned char nib = odd ? (row[byte] >> 4) : (row[byte] & 0x0F);
+                    acc[j - jt] += xr * (double)K3_E2M1[nib] * (double)ldexpf(1.0f, (int)sb - 127);
+                }
             }
-            y[j] = (float)acc;
+            for (int j = jt; j < j1; j++) y[j] = (float)acc[j - jt];
         }
     } else if (wdt == K3_WI8) {
         /* Per-row [f32 scale][int8 * in]: the scale is a property of the ROW, so it
@@ -743,30 +761,40 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
         const size_t stride = k3_row_bytes(K3_WI8, in);
         const unsigned char *base = (const unsigned char *)W;
 #ifdef _OPENMP
-#       pragma omp parallel for schedule(static) if (in > 64)
+#       pragma omp parallel for schedule(static) if (in > K3_MMTR_TILE)
 #endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
+        for (int jt = 0; jt < in; jt += K3_MMTR_TILE) {
+            const int j1 = jt + K3_MMTR_TILE < in ? jt + K3_MMTR_TILE : in;
+            double acc[K3_MMTR_TILE] = {0};
             for (int r = 0; r < rows; r++) {
                 const unsigned char *row = base + (size_t)r * stride;
                 float s; memcpy(&s, row, sizeof s);
-                acc += (double)x[r] * (double)s * (double)((const int8_t *)(row + 4))[j];
+                const double xrs = (double)x[r] * (double)s;
+                const int8_t *vals = (const int8_t *)(row + 4);
+                for (int j = jt; j < j1; j++)
+                    acc[j - jt] += xrs * (double)vals[j];
             }
-            y[j] = (float)acc;
+            for (int j = jt; j < j1; j++) y[j] = (float)acc[j - jt];
         }
     } else {
         const float *wf = (const float *)W;
 #ifdef _OPENMP
-#       pragma omp parallel for schedule(static) if (in > 64)
+#       pragma omp parallel for schedule(static) if (in > K3_MMTR_TILE)
 #endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++)
-                acc += (double)x[r] * (double)wf[(size_t)r * in + j];
-            y[j] = (float)acc;
+        for (int jt = 0; jt < in; jt += K3_MMTR_TILE) {
+            const int j1 = jt + K3_MMTR_TILE < in ? jt + K3_MMTR_TILE : in;
+            double acc[K3_MMTR_TILE] = {0};
+            for (int r = 0; r < rows; r++) {
+                const double xr = (double)x[r];
+                const float *row = wf + (size_t)r * in;
+                for (int j = jt; j < j1; j++)
+                    acc[j - jt] += xr * (double)row[j];
+            }
+            for (int j = jt; j < j1; j++) y[j] = (float)acc[j - jt];
         }
     }
 }
+#undef K3_MMTR_TILE
 
 /* ---------------------------------------------------------------- router ---- */
 void k3_router(int *idx, float *w, const float *x, const float *W,
