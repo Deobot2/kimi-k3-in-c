@@ -100,6 +100,51 @@ enough to be tractable.
 No HTTP API. Deliberately last: it is product surface, and everything above changes what
 would be served.
 
+## 9. The trunk reader goes idle at every token boundary, not just the first
+
+Found while reviewing the streaming path; not yet fixed, because fixing it correctly
+touches the one subsystem this project has been wrong about from mechanism three times
+running (S3-FIFO, speculative prefetch, the ring re-read bugs), and there is no checkpoint
+or real disk in this environment to measure the actual wall-clock effect. Recorded here
+rather than shipped, per the project's own rule that this class of change needs a number,
+not an argument.
+
+**The mechanism.** `k3_trunk_prefetch(tr, L)` (`src/io/k3_trunk.c`) scans
+`for (n = L; n < tr->n_layers && io->nq < tr->nslot; n++)` — forward only, never wrapping
+past the last layer. The only production call site,
+`k3_trunk_prefetch(w->trunk, L + 1)` in the per-layer loop in `src/cli/k3_run.c`, therefore
+does nothing on the last layer of every walk (`L + 1 == n_bound` makes the loop condition
+false immediately). Since `forward()` runs this whole loop once per generated token, the
+reader thread has nothing queued at the end of every token, not just the first — whatever
+the first unpinned layer of the NEXT token's walk is gets read with zero overlap against
+the previous token's tail (final norm, lm_head, sampling), which is exactly the class of
+cost the ring exists to hide. `tests/unit/test_trunk.c`'s own `walk()` harness calls
+`k3_trunk_prefetch(tr, L + 1)` the same way, so it has never exercised a wraparound either
+— this gap would not show up in any currently passing test.
+
+**Why it is a safer bet than speculative expert prefetch, which was rejected.** That
+guess is uncertain about WHICH experts the next token's router will pick, and was measured
+losing (43.8 GB/token read to net 25.8 GB useful). This is not a guess: the walk order is
+fixed 0..92 on every token by construction (already relied on elsewhere in this file's own
+comments), so IF there is a next token, it is certain to need layer 0 (or whichever layer
+follows the pinned run at the start) first. The only uncertainty is whether generation
+continues at all — wrong only on the very last token of a run, a one-time cost bounded by
+the ring depth, not a per-token gamble.
+
+**The complication that stopped a quick fix.** The obvious patch — wrap the scan modulo
+`tr->n_layers` — changes `test_trunk.c`'s strict per-layer bound
+(`reads_of[L] > (pinned ? 1 : passes)` fails the test) at the tail of the final pass: the
+wrapped scan queues a read for pass `passes + 1` of up to `nslot - 1` layers near the start
+of the walk, which the test's fixed-`passes` loop never consumes but the reader thread
+still completes, so `reads_of[L]` for those layers exceeds `passes`. In production this is
+harmless (the read is simply wasted I/O on the last token of the run, once per whole
+generation rather than once per token); in the test it is a real invariant violation that
+needs a deliberate decision, not a silent loosening — e.g. bounding the tolerance to
+`passes + 1` for at most `nslot - 1` layers rather than weakening the check for every
+layer. Whoever picks this up should settle that test change first, then measure the actual
+per-token latency saved against a real checkpoint before it ships, the same way largest-first
+pinning and the ring depth were.
+
 ## Explicitly not planned
 
 **A precision dial for the trunk, as a default.** The trunk streams losslessly and always
