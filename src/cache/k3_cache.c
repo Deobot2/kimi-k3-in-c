@@ -863,13 +863,28 @@ void k3_cache_report(const K3Cache *c, const char *label)
            (unsigned long long)c->misses, (unsigned long long)c->evictions);
     /* The prefetch makes the raw hit rate above flattering: an expert the batch read
      * from disk moments earlier is resident by the time get() asks, so it counts as a
-     * hit. Report what was actually served from RAM without touching the disk. */
-    if (c->prefetch_reads) {
-        const unsigned long long served = (c->hits > c->prefetch_reads)
-                                        ? c->hits - c->prefetch_reads : 0;
-        printf("  of those hits : %llu came from the batch prefetch, i.e. read from disk\n"
-               "                  this token; TRUE resident hit rate %.2f%%\n",
-               (unsigned long long)c->prefetch_reads, n ? 100.0 * served / n : 0.0);
+     * hit. Report what was actually served from RAM without touching the disk.
+     *
+     * A speculative read that pays off is the same flattery one token later: admit()
+     * cannot tell "resident because a previous run kept it" from "resident because the
+     * previous token's guess read it moments ago", so every spec_used match also lands
+     * in hits above with nothing to say it was disk, not cache. Subtracting only
+     * prefetch_reads here would let K3_SPEC inflate this exact metric right after the
+     * comment above explains why prefetch must not be allowed to. */
+    if (c->prefetch_reads || c->spec_used) {
+        const unsigned long long correction = c->prefetch_reads + c->spec_used;
+        const unsigned long long served = (c->hits > correction) ? c->hits - correction : 0;
+        if (c->spec_used)
+            printf("  of those hits : %llu came from the batch prefetch and %llu from a\n"
+                   "                  speculative read paying off -- both read from disk\n"
+                   "                  rather than genuinely resident; TRUE resident hit "
+                   "rate %.2f%%\n",
+                   (unsigned long long)c->prefetch_reads, (unsigned long long)c->spec_used,
+                   n ? 100.0 * served / n : 0.0);
+        else
+            printf("  of those hits : %llu came from the batch prefetch, i.e. read from disk\n"
+                   "                  this token; TRUE resident hit rate %.2f%%\n",
+                   (unsigned long long)c->prefetch_reads, n ? 100.0 * served / n : 0.0);
     }
     if (c->spec_on) {
         /* A guess is worth making only if the bandwidth it spends comes back as hits.
