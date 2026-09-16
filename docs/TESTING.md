@@ -53,13 +53,15 @@ the arrangement that escapes is not there.**
 **`test_st`**, the safetensors reader: dtype widening, offsets, tail bytes, escaped
 tensor names, and a tensor deliberately containing non-finite values.
 
-**`test_cfg`**, the config reader against the fixture layout, plus three malformed configs
+**`test_cfg`**, the config reader against the fixture layout, plus four malformed configs
 in `tests/fixtures/cfg/` it must **refuse**: `no_layermap.json` (no `full_attn_layers` at
-all), `bad_layer_index.json` (a one-based index outside `1..n_layers`), and
-`bad_topk.json` (a top-k above `K3_MAX_TOPK`). Each is the working config with exactly one
-field mutated, so a rejection can only come from that field. This matters more than it
-looks: a config reader that substitutes defaults for missing fields produces a model that
-loads, runs, and is architecturally wrong, with nothing to indicate it.
+all), `bad_layer_index.json` (a one-based index outside `1..n_layers`), `bad_topk.json`
+(a top-k above `K3_MAX_TOPK`), and `bad_dims.json` (a negative `v_head_dim`, standing in
+for any of the MLA/KDA/MoE dimensions that feed pointer/size arithmetic downstream). Each
+is the working config with exactly one field mutated, so a rejection can only come from
+that field. This matters more than it looks: a config reader that substitutes defaults
+for missing fields produces a model that loads, runs, and is architecturally wrong, with
+nothing to indicate it.
 
 **`scale_test`**, the same kernels at the real released dimensions: 7168 wide, 93 layers,
 96 heads, 896 experts. It checks the layer map really is 69 KDA + 24 MLA, that every
