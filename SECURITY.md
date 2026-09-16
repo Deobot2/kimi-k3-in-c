@@ -7,9 +7,12 @@ than a public issue.
 
 ## Scope
 
-**The trust boundary is the model files.** This engine parses binary and JSON input that
-users routinely download from third-party mirrors: safetensors headers, a packed trunk
-file, config.json, and tokenizer files. It treats all of them as untrusted.
+**The trust boundary is any file this engine reads that it did not just write itself.**
+That covers binary and JSON input users routinely download from third-party mirrors --
+safetensors headers, a packed trunk file, config.json, and tokenizer files -- and it also
+covers a `--load-state PATH` file: conversation state saved by `--save-state` and handed
+to a later run, which is exactly the kind of file people share or pass between machines.
+All of it is treated as untrusted.
 
 The parsers bound what they read, nesting depth, tensor element counts, header lengths,
 index sizes, and refuse implausible values rather than trusting the file. A crafted
