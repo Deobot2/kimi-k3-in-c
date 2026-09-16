@@ -323,8 +323,15 @@ def main():
 
     src = open(os.path.join(a.src, "trunk.bin"), "rb")
     dst = open(os.path.join(a.dst, "trunk.bin"), "wb")
-    out = {"n_layers": man.get("n_layers", len(man["layers"])), "align": align,
-           "group": GROUP, "awq": True, "layers": []}
+    # Copy every key this reader does not know about rather than re-listing the ones it
+    # does: int8_trunk.py already does this, and hand-naming fields here is a silent
+    # place for a future manifest field to be dropped rather than an error.
+    out = {k: v for k, v in man.items() if k != "layers"}
+    out["n_layers"] = man.get("n_layers", len(man["layers"]))
+    out["align"] = align
+    out["group"] = GROUP
+    out["awq"] = True
+    out["layers"] = []
     if not a.fold_only:
         out["quant"] = "mxfp4"
 
