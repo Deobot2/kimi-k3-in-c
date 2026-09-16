@@ -384,7 +384,11 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
 
     tr->pin_of = (int32_t *)malloc((size_t)tr->n_layers * sizeof(int32_t));
     tr->pin = (unsigned char **)calloc((size_t)(npin ? npin : 1), sizeof(unsigned char *));
-    if (!tr->pin || !tr->pin_of) { free(order); free(chosen); return -1; }
+    tr->pin_bind    = (K3LayerBind *)calloc((size_t)(npin ? npin : 1), sizeof(K3LayerBind));
+    tr->pin_bind_ok = (unsigned char *)calloc((size_t)(npin ? npin : 1), 1);
+    if (!tr->pin || !tr->pin_of || !tr->pin_bind || !tr->pin_bind_ok) {
+        free(order); free(chosen); return -1;
+    }
     for (int i = 0; i < tr->n_layers; i++) tr->pin_of[i] = -1;
     {
         int k = 0;
@@ -530,6 +534,7 @@ void k3_trunk_close(K3Trunk *tr)
     if (tr->fd >= 0) close(tr->fd);
     if (tr->pin) { for (int i = 0; i < tr->npin; i++) free(tr->pin[i]); free(tr->pin); }
     free(tr->arena); free(tr->layer_of); free(tr->slot_of); free(tr->pin_of);
+    free(tr->pin_bind); free(tr->pin_bind_ok);
     free(tr->reads_of);
     if (tr->lay) { for (int i = 0; i < tr->n_layers; i++) free(tr->lay[i].t); free(tr->lay); }
     /* LAST: every K3TrunkTensor.name points into the parsed manifest, so the structures
@@ -821,6 +826,18 @@ int k3_trunk_bind(K3Trunk *tr, const K3Cfg *c, int L, K3LayerBind *b)
     unsigned char *base = NULL;
     if (k3_trunk_fetch(tr, L, &base) != 0) return -1;
 
+    /* A pinned layer's bytes never change after the first load (see k3_trunk_fetch:
+     * "first touch: load once, keep forever"), so the K3LayerBind computed from them is
+     * the same struct on every later bind -- re-running k3_bind_layer_mem repeats its
+     * whole widen loop (the router gate alone is n_experts*hidden elements per MoE
+     * layer) for a result already known. Skip straight to the cached copy. */
+    const int32_t pidx = tr->pin_of[L];
+    if (pidx >= 0 && tr->pin_bind_ok[pidx]) {
+        *b = tr->pin_bind[pidx];
+        k3_trunk_bind_wall += now_s() - t_bind0;
+        return 0;
+    }
+
     Finder f; f.L = &tr->lay[L];
     K3MemSrc src; src.find = find_in_layer; src.ctx = &f;
     unsigned char *widen = base + (((tr->lay[L].nbytes + K3_TRUNK_ALIGN - 1)
@@ -832,6 +849,7 @@ int k3_trunk_bind(K3Trunk *tr, const K3Cfg *c, int L, K3LayerBind *b)
     const double tnow = now_s();
     k3_trunk_widen_wall += tnow - tw;
     k3_trunk_bind_wall  += tnow - t_bind0;
+    if (rc == 0 && pidx >= 0) { tr->pin_bind[pidx] = *b; tr->pin_bind_ok[pidx] = 1; }
     return rc;
 }
 

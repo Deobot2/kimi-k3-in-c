@@ -129,6 +129,13 @@ typedef struct {
      * to the largest layer still streaming. */
     unsigned char **pin;        /* [npin] one exact allocation per pinned layer */
     int32_t       *pin_of;      /* [n_layers] -> index into pin[], or -1        */
+    /* A pinned layer's bytes never change after the first load, so the K3LayerBind
+     * k3_bind_layer_mem computes from them -- entirely pointers into `pin[k]` and its
+     * widen area, both fixed addresses for the layer's whole lifetime -- is the same
+     * struct on every later bind. [npin] each; pin_bind_ok[k] is 0 until the first
+     * successful bind of that pinned layer caches pin_bind[k]. See k3_trunk_bind. */
+    K3LayerBind   *pin_bind;
+    unsigned char *pin_bind_ok;
     unsigned char *arena;       /* [nslot] uniform ring slots                   */
     int64_t      slot_bytes;    /* raw run + the widen area                     */
     int64_t      widen_bytes;   /* of slot_bytes, the fp32 expansion area       */
