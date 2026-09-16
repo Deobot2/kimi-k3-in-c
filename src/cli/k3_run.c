@@ -1574,7 +1574,24 @@ int main(int argc, char **argv)
             return 2;
         }
         if (k3_state_peek(load_state, &shd) != 0) return 1;
+        /* nseq sizes and offsets everything below (seq's allocation, Tmax, the memcpy
+         * that plants the new prompt after it) before k3_state_load's own header
+         * checks ever run. It is otherwise unvalidated file content: negative makes
+         * `seq + prior` a pointer BEFORE the allocation (memcpy then writes out of
+         * bounds under it), and a huge value overflows the int arithmetic below it
+         * feeds. Refuse here, the same way an out-of-range --gen or prompt is refused,
+         * rather than trusting a count this build did not itself just write. */
+        if (shd.nseq < 0 || shd.nseq > K3_MAX_PROMPT + K3_MAX_GEN) {
+            fprintf(stderr, "REFUSING: %s claims %d prior positions, outside 0..%d\n",
+                    load_state, shd.nseq, K3_MAX_PROMPT + K3_MAX_GEN);
+            return 1;
+        }
         prior = shd.nseq;
+        if (prior + np + gen + 1 > K3_MAX_PROMPT + K3_MAX_GEN) {
+            fprintf(stderr, "REFUSING: %d prior + %d new + %d gen exceeds the %d-position "
+                            "ceiling\n", prior, np, gen, K3_MAX_PROMPT + K3_MAX_GEN);
+            return 1;
+        }
         printf("resuming from %s: %d prior positions, %d new\n\n", load_state, prior, np);
     }
     const int Tmax = prior + np + gen + 1;
