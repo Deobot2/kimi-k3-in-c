@@ -25,6 +25,15 @@ import numpy as np
 ALIGN = 4096
 CHUNK = 64 << 20
 
+# mxfp4_trunk.py and awq_trunk.py both carve this tensor out of quantization: it is
+# read elementwise as fp32 by k3_router's own inline matmul (unlike every other 2D BF16
+# weight here, which is a k3_matmul_q8 row), and awq_trunk.py's own measurement is that
+# perturbing it moves log-probabilities by 1.9e-04 nats, an order of magnitude above its
+# rounding floor. This container is draft-only -- the exact model always re-verifies, so
+# a less accurate gate costs proposal accuracy, never correctness -- but there is no
+# reason to spend that cost for free when passing the tensor through costs nothing.
+DENY_SUFFIX = (".block_sparse_moe.gate.weight",)
+
 
 def bf16_to_f32(u16):
     return (u16.astype(np.uint32) << 16).view(np.float32)
@@ -77,7 +86,9 @@ def main():
         for name, t in items:
             o, nb, dt, shape = t["off"], t["nbytes"], t["dtype"], t.get("shape", [])
             raw = run[o:o + nb]
-            if dt == "BF16" and len(shape) == 2:
+            do_q = (dt == "BF16" and len(shape) == 2
+                    and not any(name.endswith(s) for s in DENY_SUFFIX))
+            if do_q:
                 f = bf16_to_f32(np.frombuffer(raw, dtype=np.uint16)).reshape(shape[0], shape[1])
                 enc, enb = quant_row_int8(f)
                 outp.write(enc)
