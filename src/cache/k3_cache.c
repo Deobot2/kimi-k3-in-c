@@ -804,8 +804,13 @@ int k3_cache_dump_trace(const K3Cache *c, const char *path)
 
 int k3_cache_pin(K3Cache *c, int layer, int expert, int pin)
 {
+    /* Every other lookup here (cache_get, cache_resident) checks layer/expert
+     * individually before combining them into a key; this is the one path that
+     * combined first. A negative expert can still land the combined key inside
+     * [0, n_layers*n_experts) by aliasing the previous layer's tail, e.g.
+     * key(layer, -1) == key(layer-1, n_experts-1). */
+    if (layer < 0 || layer >= c->n_layers || expert < 0 || expert >= c->n_experts) return 0;
     const int32_t key = layer * c->n_experts + expert;
-    if (key < 0 || key >= c->n_layers * c->n_experts) return 0;
     pthread_mutex_lock(&c->mu);
     const int slot = c->slot_of[key];
     if (slot >= 0) c->pinned[slot] = pin ? 1 : 0;
