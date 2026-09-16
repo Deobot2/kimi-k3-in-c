@@ -1297,6 +1297,21 @@ int main(int argc, char **argv)
      *   and the difference belongs in the trunk. Auto now gives the cache either the
      *   minimum or at least a whole working set, and never a useless amount in between. */
     if (budget_auto) {
+        /* Every branch below trades trunk-streaming budget against expert-cache budget,
+         * on the premise that the trunk is what --trunk makes it: STREAMED, so trunk_gb
+         * bounds what actually gets read per token. Without --trunk the resident loader
+         * (below) ignores trunk_gb entirely and loads the whole trunk regardless, so this
+         * split would compute cache_gb against a trunk allocation nothing enforces --
+         * the "memory plan" guard downstream still catches an outright OOM, but the cache
+         * a resident, RAM-rich machine gets is sized for a plan that never runs. Refuse
+         * up front instead, matching what k3_preset_list() already documents. */
+        if (!trunk_dir) {
+            fprintf(stderr, "--preset auto / --trunk-gb auto needs --trunk <packed_dir>: "
+                            "the split it computes is between trunk-streaming budget and\n"
+                            "expert-cache budget, which is meaningless without a trunk to "
+                            "stream. Pass --cache-gb directly for a resident load.\n");
+            return 2;
+        }
         const double avail = mem_available_bytes();
         if (avail <= 0.0) {
             fprintf(stderr, "--preset auto needs /proc/meminfo; pass explicit "
