@@ -121,9 +121,43 @@ TOK_FILES  ?= $(HOME)/k3model
 .PHONY: all test test-all bench portable debug asan ubsan format clean install help \
         tok cfg ops cache st oracle weights-test
 
+# GNU make's default goal is the first rule with a recipe in the file. `all:` was that
+# rule until the flags-tracking block below added `forceflags` ahead of it -- pin the
+# default explicitly so a bare `make` still builds the engine rather than the bookkeeping
+# target.
+.DEFAULT_GOAL := all
+
+# make tracks source mtimes, not compiler flags. `debug`, `asan`, `ubsan` and `portable`
+# all reinvoke this file with a different CFLAGS/LDFLAGS/ARCH, but reuse the SAME
+# $(BUILD) directory -- so switching between them without an intervening `make clean`
+# finds every .o already newer than its .c and reuses it under the OLD flags. That is
+# either a link failure (a sanitizer binary linked against non-sanitized objects and
+# LDFLAGS missing -fopenmp) or, worse, silent: `make` then `make debug` reports
+# "Nothing to be done for 'all'" and leaves the previous -O3 binary in place, under a
+# target whose only promise is -O0 -g3.
+#
+# The fix is to make the flags themselves a dependency. $(FLAGSTAMP) records
+# $(CC)/$(CFLAGS)/$(INCLUDES) in $(BUILD)/.flags, and every object depends on it. The
+# `forceflags` prerequisite is phony, so make always re-examines $(FLAGSTAMP)'s recipe,
+# but that recipe only rewrites the file -- and so only advances its mtime -- when the
+# recorded line actually differs. A real flag change then touches .flags, which is
+# newer than every .o compiled under the old flags, so the next build recompiles
+# exactly what changed. An unchanged rerun (including the outer, non-recompiling `make
+# asan`/`make debug` wrapper invocation, which never reaches this rule) leaves .flags
+# alone, so repeated identical builds stay incremental.
+FLAGSTAMP := $(BUILD)/.flags
+FLAGLINE  := $(CC)|$(CFLAGS)|$(INCLUDES)
+
+.PHONY: forceflags
+forceflags: ;
+
+$(FLAGSTAMP): forceflags
+	@mkdir -p $(dir $@)
+	@[ -f $@ ] && [ "$$(cat $@)" = '$(FLAGLINE)' ] || echo '$(FLAGLINE)' > $@
+
 all: $(CLI_BIN)
 
-$(BUILD)/%.o: %.c
+$(BUILD)/%.o: %.c $(FLAGSTAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
