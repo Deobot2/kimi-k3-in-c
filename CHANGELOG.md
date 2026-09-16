@@ -181,6 +181,51 @@ not needing the bytes at all.
   "22 passed, 0 failed, 0 skipped", stale since 627d94f — `test_ops`' fixture set has
   since grown to 27 real assertions, so the string this gate looked for no longer
   appeared in `make test`'s output on either CI job.
+- **`--load-state`'s `nseq` was never validated**, unlike every other header field.
+  `prior = shd.nseq` fed `seq + prior` pointer arithmetic and a `malloc` size before
+  `k3_state_load()`'s own checks ever ran; a negative `nseq` made `seq + prior` a
+  pointer before the allocation, and the following `memcpy` wrote out of bounds under
+  it. Confirmed under ASan: a state file with `nseq = -1` crashed with a
+  heap-buffer-overflow in `memcpy` before this fix. Now refused the same way an
+  out-of-range `--gen` or prompt already is.
+- **Three pre-flight memory guards (the KV-cache advisory, `--preset auto`'s budget
+  split, and the final "memory plan" check) sized themselves from `np + gen + 1`
+  alone**, blind to a `--load-state` resume's `prior` position count — a guard whose
+  whole point is failing "with a number rather than an OOM kill" was blind to exactly
+  the case where a long resumed conversation makes that matter. The state header is now
+  read before any guard runs, and `prior` is threaded through all three.
+- **`--gen 0` (explicitly legal) divided by zero** computing `seconds_per_token` for
+  `k3_run.json`; `nan` is not a valid JSON token, so every consumer of `--out` failed to
+  parse the file for a perfectly ordinary invocation. Guarded by `nout > 0`.
+- **`--preset auto` / `--trunk-gb auto` computed a trunk/cache budget split even
+  without `--trunk`**, against a trunk allocation the resident loader ignores entirely,
+  sizing the expert cache for a streaming plan that never runs. Now refused up front,
+  matching what `k3_preset_list()` already documents.
+- **Nine numeric CLI flags** (`--gen`, `--cache-gb`, `--layers`, `--spec`,
+  `--trunk-gb`, `--trunk-ring`, `--kv-window`, `--kv-sinks`, `--draft-trunk-gb`) used
+  bare `atoi`/`atof`, which return 0 on anything unparseable — `--gen abc` silently
+  became `--gen 0` instead of being refused as the typo it almost certainly is. Now
+  parsed with `strtol`/`strtod` and an endptr check, refusing anything that does not
+  fully parse as a number.
+- **`mxfp4_trunk.py` and `awq_trunk.py` hand-built their output `trunk.json` manifest**
+  naming only the keys they knew about, unlike `int8_trunk.py`, which copies the source
+  manifest and overrides just what changes. A future manifest field would silently
+  vanish from an MXFP4 or AWQ trunk with no error. Both now copy forward, matching
+  `int8_trunk.py`; verified byte-identical `trunk.bin` and content-equal `trunk.json`
+  against a real packed trunk.
+- **`quantize_mx4`'s nearest-code search allocated an 8x-oversized temporary**,
+  `abs(v)[..., None] - MAG[...]`, before `argmin` — 7.75 GB for the trunk's largest
+  tensor alone (the dense layer's 7168x33792 MLP), and paid once per alpha in
+  `awq_trunk.py`'s grid search rather than once per tensor. Row-chunked in both copies
+  (`mxfp4_trunk.py` and `awq_trunk.py`'s independent duplicate); output is unchanged,
+  verified against an unchunked reference implementation across several shapes and via
+  an end-to-end run whose `trunk.bin` came out byte-identical.
+- **`int8_trunk.py` quantized the MoE router gate**, unlike `mxfp4_trunk.py` and
+  `awq_trunk.py`, which both exclude it because it's read elementwise as fp32 rather
+  than through a matmul kernel and `awq_trunk.py`'s own measurement puts its
+  sensitivity an order of magnitude above its rounding floor. Excluded the same way;
+  this changes `int8_trunk.py`'s output for that one tensor per layer (nothing pins its
+  exact bytes), verified against a real packed trunk and a `--draft-trunk` run.
 
 ## [1.0.0] - 2026-08-07
 
