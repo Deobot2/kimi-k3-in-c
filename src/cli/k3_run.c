@@ -2179,7 +2179,11 @@ int main(int argc, char **argv)
     }
     free(spec_snap);
     printf("--------------------------------------------------------------------\n");
-    printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total, t_total / nout);
+    /* nout can legitimately be 0 (--gen 0), and t_total / 0 is NaN: harmless in a
+     * printf but not in the JSON below, where "nan" is not a valid token and breaks
+     * every consumer of --out. */
+    const double s_per_tok = nout > 0 ? t_total / nout : 0.0;
+    printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total, s_per_tok);
 
     /* Decoded text, when a tokenizer is loaded. Printed as a distinct block rather than
      * streamed per token: a partially-decoded multi-byte sequence is not valid UTF-8, so
@@ -2208,7 +2212,7 @@ int main(int argc, char **argv)
         for (int i = 0; i < nout; i++) fprintf(f, "%s%d", i ? "," : "", outtok[i]);
         fprintf(f, "],\"full_ids\":[");
         for (int i = 0; i < T; i++) fprintf(f, "%s%d", i ? "," : "", seq[i]);
-        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f}\n", NL, t_total / nout);
+        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f}\n", NL, s_per_tok);
         fclose(f);
         printf("\nwrote %s\n", outp);
     }
