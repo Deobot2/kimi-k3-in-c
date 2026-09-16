@@ -387,13 +387,38 @@ static int32_t k3_state_rows(const Weights *w)
 }
 
 static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
-                         int *seq, float *ks, Weights *w)
+                         int *seq, int64_t kper, float *ks, Weights *w)
 {
     int32_t fp[12];
     k3_state_fp(c, fp);
     if (memcmp(fp, hd->fp, sizeof fp) != 0) {
         fprintf(stderr, "REFUSING: %s was written by a different model architecture.\n"
                         "  Restoring it would produce fluent, wrong output.\n", path);
+        return -1;
+    }
+    /* kper/kvpp/ropepp are pure functions of fields the fingerprint above already
+     * verified, so an honest file's header values can never disagree with what this run
+     * computes from `c`. They are still independent fields in the file, not derived from
+     * it at load time -- so a crafted header can carry a MATCHING fingerprint and an
+     * inflated kper/kvpp/ropepp/kv_rows, which used to size the fread()s below directly.
+     * That over-reads the file into a buffer allocated for the true (recomputed) size: a
+     * heap overflow driven entirely by file content, not a truncation this loader was
+     * built to reject. So the reads below are sized from the values THIS RUN computed,
+     * never from the header's -- the comparisons here are only for a clear diagnostic. */
+    const int64_t kvpp   = (int64_t)c->n_heads * (c->qk_nope + c->v_head);
+    const int64_t ropepp = (int64_t)c->qk_rope;
+    if (hd->kper != kper) {
+        fprintf(stderr, "REFUSING: %s claims %lld recurrent floats per layer, "
+                        "this run computes %lld\n",
+                path, (long long)hd->kper, (long long)kper);
+        return -1;
+    }
+    if (w->kv_mode != K3_KV_LATENT
+        && (hd->kvpp != kvpp || hd->ropepp != ropepp || hd->kv_rows > w->kv_cap)) {
+        fprintf(stderr, "REFUSING: %s claims %lld KV / %lld rope floats per position "
+                        "over %d rows, this run has %lld / %lld over at most %d\n",
+                path, (long long)hd->kvpp, (long long)hd->ropepp, hd->kv_rows,
+                (long long)kvpp, (long long)ropepp, w->kv_cap);
         return -1;
     }
     if (hd->n_bound != w->n_bound || hd->n_mla != w->n_mla) {
@@ -433,8 +458,8 @@ static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
 
     int rc = 0;
     if (fread(seq, sizeof(int), (size_t)hd->nseq, f) != (size_t)hd->nseq) rc = -1;
-    if (!rc && fread(ks, sizeof(float), (size_t)hd->kper * w->n_bound, f)
-               != (size_t)hd->kper * (size_t)w->n_bound) rc = -1;
+    if (!rc && fread(ks, sizeof(float), (size_t)kper * w->n_bound, f)
+               != (size_t)kper * (size_t)w->n_bound) rc = -1;
 
     if (w->kv_mode == K3_KV_LATENT) {
         const size_t kvw = kv_latent_width(c);
@@ -453,13 +478,13 @@ static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
         /* Position-major inside each layer slice, so a differently-sized destination
          * cache is written slice by slice rather than as one block. */
         for (int mi = 0; !rc && mi < w->n_mla; mi++) {
-            float *dst = w->kvc + (size_t)mi * w->kv_cap * hd->kvpp;
-            const size_t n = (size_t)hd->kv_rows * hd->kvpp;
+            float *dst = w->kvc + (size_t)mi * w->kv_cap * kvpp;
+            const size_t n = (size_t)hd->kv_rows * kvpp;
             if (fread(dst, sizeof(float), n, f) != n) rc = -1;
         }
         for (int mi = 0; !rc && mi < w->n_mla; mi++) {
-            float *dst = w->ropec + (size_t)mi * w->kv_cap * hd->ropepp;
-            const size_t n = (size_t)hd->kv_rows * hd->ropepp;
+            float *dst = w->ropec + (size_t)mi * w->kv_cap * ropepp;
+            const size_t n = (size_t)hd->kv_rows * ropepp;
             if (fread(dst, sizeof(float), n, f) != n) rc = -1;
         }
     }
@@ -1661,7 +1686,7 @@ int main(int argc, char **argv)
 
         if (load_state) {
             const double tl = now_s();
-            if (k3_state_load(load_state, &c, &shd, seq, ks, &w) != 0)
+            if (k3_state_load(load_state, &c, &shd, seq, (int64_t)kper, ks, &w) != 0)
                 return 1;
             w.cached = shd.cached;
             printf("restored %d positions in %.2f s: decode continues without "
