@@ -1479,18 +1479,20 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
  * The accumulator layout mirrors k3_matmul deliberately, four partial sums in double,
  * reduced in the same order, so the two kernels agree to the bit on identical input.
  *
- * THE AVX2 PATH IS BIT-IDENTICAL TO THE SCALAR PATH, not merely close. A __m256d holds
- * exactly four doubles, and loading four consecutive elements per iteration places
- * element i in lane i%4: the same partition as the scalar accumulators, with the same
- * sequential order within each lane. Reducing with (a0+a1)+(a2+a3) then reproduces the
- * scalar result exactly. Two details carry that guarantee:
+ * THE AVX2 PATH IS BIT-IDENTICAL TO THE SCALAR (non-AVX2) BUILD OF THIS SAME FUNCTION,
+ * not merely close, and test_ops asserts it. Four __m256d accumulators (v0..v3), each
+ * four lanes wide, are exactly sixteen accumulator slots -- v_N lane_k holds the same
+ * running sum as scalar a[4*N+k] below, so (v0+v1)+(v2+v3) lane-by-lane reproduces
+ * b0..b3 and then acc = (b0+b1)+(b2+b3) exactly, the same partition and the same tree
+ * k3_matmul's own sixteen scalar accumulators use. Two details carry that guarantee:
  *
- *   - MUL THEN ADD, never _mm256_fmadd_pd. The build sets -ffp-contract=off, so the
- *     scalar code rounds the product and the sum separately while an FMA rounds once.
- *     Here the product happens to be exact (a bf16 widens exactly, and float x float
- *     needs 48 mantissa bits, which fits double's 53), so the two would agree anyway
- *     but that is a proof about the inputs. Mul-then-add is a proof about the code.
- *   - The scalar tail loop is reused verbatim for the in % 4 remainder.
+ *   - BOTH sides use a true fused multiply-add, never separate mul-then-add: the
+ *     scalar tail (and the non-AVX2 build's own scalar loop) call fma() in double,
+ *     and the AVX2 path calls _mm256_fmadd_pd, the same IEEE operation per lane. The
+ *     build's -ffp-contract=off stops the COMPILER from silently contracting a plain
+ *     `a*b+c` into an FMA behind the reduction order's back; it says nothing about an
+ *     explicit fma()/_mm256_fmadd_pd call, which both sides use deliberately.
+ *   - The scalar tail loop is reused verbatim for the in % 16 remainder.
  */
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
 {
