@@ -199,24 +199,37 @@ def f32_to_bf16(f32):
     return (((u + 0x7FFF + ((u >> 16) & 1)) >> 16)).astype(np.uint16)
 
 
+# See mxfp4_trunk.py's identical constant: `abs(v)[..., None] - MAG[...]` below
+# broadcasts every element into 8 float32 values before argmin, an 8x-oversized
+# temporary that this function pays for on every alpha in choose_scale's grid search,
+# not once per tensor. Row-chunking bounds it without touching a single output byte --
+# each row's code depends only on that row.
+_MX4_CHUNK_ELEMS = 48_000_000
+
+
 def quantize_mx4(f32):
     """[rows][cols] float32 -> packed MXFP4 bytes. Identical rule to mxfp4_trunk.py:
     shared exponent floor(log2(absmax)) - 2, low nibble = even element."""
     rows, cols = f32.shape
     assert cols % GROUP == 0, f"cols {cols} is not a multiple of {GROUP}"
-    g = f32.reshape(rows, cols // GROUP, GROUP)
-    absmax = np.abs(g).max(axis=2)
-    with np.errstate(divide="ignore"):
-        exp = np.floor(np.log2(np.where(absmax > 0, absmax, 1.0))).astype(np.int32) - 2
-    exp = np.where(absmax > 0, exp, 0)
-    scale_byte = np.clip(exp + 127, 0, 254).astype(np.uint8)
-    scale = np.power(2.0, (scale_byte.astype(np.int32) - 127)).astype(np.float32)
-    v = g / scale[:, :, None]
-    sign = (v < 0).astype(np.uint8)
-    idx = np.abs(np.abs(v)[..., None] - MAG[None, None, None, :]).argmin(axis=-1).astype(np.uint8)
-    code = (idx | (sign << 3)).reshape(rows, cols)
-    packed = (code[:, 0::2] | (code[:, 1::2] << 4)).astype(np.uint8)
-    return np.concatenate([packed, scale_byte], axis=1)
+    chunk_rows = max(1, _MX4_CHUNK_ELEMS // cols)
+    out_chunks = []
+    for r0 in range(0, rows, chunk_rows):
+        r1 = min(r0 + chunk_rows, rows)
+        g = f32[r0:r1].reshape(r1 - r0, cols // GROUP, GROUP)
+        absmax = np.abs(g).max(axis=2)
+        with np.errstate(divide="ignore"):
+            exp = np.floor(np.log2(np.where(absmax > 0, absmax, 1.0))).astype(np.int32) - 2
+        exp = np.where(absmax > 0, exp, 0)
+        scale_byte = np.clip(exp + 127, 0, 254).astype(np.uint8)
+        scale = np.power(2.0, (scale_byte.astype(np.int32) - 127)).astype(np.float32)
+        v = g / scale[:, :, None]
+        sign = (v < 0).astype(np.uint8)
+        idx = np.abs(np.abs(v)[..., None] - MAG[None, None, None, :]).argmin(axis=-1).astype(np.uint8)
+        code = (idx | (sign << 3)).reshape(r1 - r0, cols)
+        packed = (code[:, 0::2] | (code[:, 1::2] << 4)).astype(np.uint8)
+        out_chunks.append(np.concatenate([packed, scale_byte], axis=1))
+    return out_chunks[0] if len(out_chunks) == 1 else np.concatenate(out_chunks, axis=0)
 
 
 def dequantize_mx4(blob, cols):

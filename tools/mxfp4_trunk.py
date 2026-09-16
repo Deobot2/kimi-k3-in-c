@@ -75,6 +75,16 @@ def bf16_to_f32(u16):
     return (u16.astype(np.uint32) << 16).view(np.float32)
 
 
+# Row-chunk the nearest-code search below: `a[..., None] - MAG[...]` broadcasts every
+# element into 8 float32 values before argmin, which is 8x the tensor's own footprint
+# BEFORE numpy's usual temporaries on top of that. For the trunk's largest tensor (the
+# dense layer's [7168, 33792] MLP, per include/k3/k3.h) that one array alone is 7.75 GB.
+# Chunking by rows bounds it without changing a single output byte: each row's code is a
+# function of that row alone, nothing here reduces across rows. Sized to keep the 8-wide
+# broadcast around a few hundred MB regardless of how wide a tensor's rows are.
+_MX4_CHUNK_ELEMS = 48_000_000
+
+
 def quantize_mx4(f32):
     """[rows][cols] float32 -> packed bytes, one self-contained row at a time.
 
@@ -85,32 +95,39 @@ def quantize_mx4(f32):
     """
     rows, cols = f32.shape
     assert cols % GROUP == 0, "cols %d is not a multiple of the group %d" % (cols, GROUP)
-    ngrp = cols // GROUP
 
-    g = f32.reshape(rows, ngrp, GROUP)
-    absmax = np.abs(g).max(axis=2)
+    chunk_rows = max(1, _MX4_CHUNK_ELEMS // cols)
+    out_chunks = []
+    for r0 in range(0, rows, chunk_rows):
+        r1 = min(r0 + chunk_rows, rows)
+        ngrp = cols // GROUP
 
-    with np.errstate(divide="ignore"):
-        exp = np.floor(np.log2(np.where(absmax > 0, absmax, 1.0))).astype(np.int32) - 2
-    exp = np.where(absmax > 0, exp, 0)
-    # E8M0 is a bare biased exponent; 255 is NaN by spec, so the usable range is 0..254.
-    scale_byte = np.clip(exp + 127, 0, 254).astype(np.uint8)
-    scale = np.power(2.0, (scale_byte.astype(np.int32) - 127)).astype(np.float32)
+        g = f32[r0:r1].reshape(r1 - r0, ngrp, GROUP)
+        absmax = np.abs(g).max(axis=2)
 
-    v = g / scale[:, :, None]
-    sign = (v < 0).astype(np.uint8)
-    a = np.abs(v)
-    # Nearest E2M1 magnitude. The grid is tiny and irregular, so compare against all
-    # eight rather than trying to derive an index arithmetically.
-    idx = np.abs(a[..., None] - MAG[None, None, None, :]).argmin(axis=-1).astype(np.uint8)
-    code = (idx | (sign << 3)).reshape(rows, cols)
+        with np.errstate(divide="ignore"):
+            exp = np.floor(np.log2(np.where(absmax > 0, absmax, 1.0))).astype(np.int32) - 2
+        exp = np.where(absmax > 0, exp, 0)
+        # E8M0 is a bare biased exponent; 255 is NaN by spec, so the usable range is 0..254.
+        scale_byte = np.clip(exp + 127, 0, 254).astype(np.uint8)
+        scale = np.power(2.0, (scale_byte.astype(np.int32) - 127)).astype(np.float32)
 
-    # LOW nibble = EVEN element.
-    lo = code[:, 0::2]
-    hi = code[:, 1::2]
-    packed = (lo | (hi << 4)).astype(np.uint8)
+        v = g / scale[:, :, None]
+        sign = (v < 0).astype(np.uint8)
+        a = np.abs(v)
+        # Nearest E2M1 magnitude. The grid is tiny and irregular, so compare against all
+        # eight rather than trying to derive an index arithmetically.
+        idx = np.abs(a[..., None] - MAG[None, None, None, :]).argmin(axis=-1).astype(np.uint8)
+        code = (idx | (sign << 3)).reshape(r1 - r0, cols)
 
-    return np.concatenate([packed, scale_byte.astype(np.uint8)], axis=1)
+        # LOW nibble = EVEN element.
+        lo = code[:, 0::2]
+        hi = code[:, 1::2]
+        packed = (lo | (hi << 4)).astype(np.uint8)
+
+        out_chunks.append(np.concatenate([packed, scale_byte.astype(np.uint8)], axis=1))
+
+    return out_chunks[0] if len(out_chunks) == 1 else np.concatenate(out_chunks, axis=0)
 
 
 def rel_error(f32, blob, cols):
