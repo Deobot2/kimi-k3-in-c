@@ -1132,9 +1132,38 @@ int main(int argc, char **argv)
                 np, K3_MAX_PROMPT, K3_MAX_PROMPT + K3_MAX_GEN);
         return 2;
     }
-    if (np + gen + 1 > K3_MAX_PROMPT + K3_MAX_GEN) {
-        fprintf(stderr, "prompt %d + gen %d + 1 exceeds the %d-position ceiling\n",
-                np, gen, K3_MAX_PROMPT + K3_MAX_GEN);
+
+    /* A resumed session's true size is `prior` (from the saved state) plus this
+     * request, not just this request -- read it HERE, before any size or memory guard
+     * runs, so none of them are blind to a long resumed conversation the way a guard
+     * sized from `np + gen + 1` alone would be. */
+    K3StateHdr shd;
+    int prior = 0;
+    if (load_state) {
+        if (!incremental) {
+            fprintf(stderr, "--load-state needs --incremental\n");
+            return 2;
+        }
+        if (k3_state_peek(load_state, &shd) != 0) return 1;
+        /* nseq sizes and offsets everything below (seq's allocation, Tmax, the memcpy
+         * that plants the new prompt after it) before k3_state_load's own header
+         * checks ever run. It is otherwise unvalidated file content: negative makes
+         * `seq + prior` a pointer BEFORE the allocation (memcpy then writes out of
+         * bounds under it), and a huge value overflows the int arithmetic every size
+         * below derives from it. Refuse here, the same way an out-of-range --gen or
+         * prompt is refused, rather than trusting a count this build did not itself
+         * just write. */
+        if (shd.nseq < 0 || shd.nseq > K3_MAX_PROMPT + K3_MAX_GEN) {
+            fprintf(stderr, "REFUSING: %s claims %d prior positions, outside 0..%d\n",
+                    load_state, shd.nseq, K3_MAX_PROMPT + K3_MAX_GEN);
+            return 1;
+        }
+        prior = shd.nseq;
+        printf("resuming from %s: %d prior positions, %d new\n\n", load_state, prior, np);
+    }
+    if (prior + np + gen + 1 > K3_MAX_PROMPT + K3_MAX_GEN) {
+        fprintf(stderr, "prior %d + prompt %d + gen %d + 1 exceeds the %d-position "
+                        "ceiling\n", prior, np, gen, K3_MAX_PROMPT + K3_MAX_GEN);
         return 2;
     }
     /* THE REAL CONTEXT LIMIT is the MLA KV cache, not any array size. Check it against
@@ -1177,7 +1206,7 @@ int main(int argc, char **argv)
         return 2;
     }
     if (incremental) {
-        const int npos = np + gen + 1;
+        const int npos = prior + np + gen + 1;
         const double per_pos = mla_latent ? K3_KV_LATENT_BYTES_PER_POS
                                           : K3_KV_BYTES_PER_POS;
         const int held = (kv_window > 0 && kv_window < npos) ? kv_window : npos;
@@ -1275,7 +1304,7 @@ int main(int argc, char **argv)
             return 2;
         }
         const int64_t E64 = c.hidden;
-        const int Tm = np + gen + 1;
+        const int Tm = prior + np + gen + 1;
         const int Pp = c.kda_heads * c.kda_head_dim;
         const int mb_ = c.n_layers / c.attn_res_block + 2;
 
@@ -1437,7 +1466,7 @@ int main(int argc, char **argv)
         const double w_model = 2.0 * (double)c.vocab * E64 * 2    /* embed + lm_head, bf16 */
                              + 3.0 * E64 * 4;                     /* norms, aggregator */
         const double w_cache = cache_gb * 1e9;
-        const int Tm = np + gen + 1;
+        const int Tm = prior + np + gen + 1;
         const int mb = c.n_layers / c.attn_res_block + 2;
         const int Pp = c.kda_heads * c.kda_head_dim;
         const double w_state = (double)((size_t)Pp * c.kda_head_dim
@@ -1564,36 +1593,9 @@ int main(int argc, char **argv)
 
     /* ---- buffers ----
      * A resumed session must hold the saved history as well as the new tokens, so the
-     * KV cache and every per-position buffer are sized for both. The header is read
-     * here, before anything is allocated; the payload is restored after. */
-    K3StateHdr shd;
-    int prior = 0;
-    if (load_state) {
-        if (!incremental) {
-            fprintf(stderr, "--load-state needs --incremental\n");
-            return 2;
-        }
-        if (k3_state_peek(load_state, &shd) != 0) return 1;
-        /* nseq sizes and offsets everything below (seq's allocation, Tmax, the memcpy
-         * that plants the new prompt after it) before k3_state_load's own header
-         * checks ever run. It is otherwise unvalidated file content: negative makes
-         * `seq + prior` a pointer BEFORE the allocation (memcpy then writes out of
-         * bounds under it), and a huge value overflows the int arithmetic below it
-         * feeds. Refuse here, the same way an out-of-range --gen or prompt is refused,
-         * rather than trusting a count this build did not itself just write. */
-        if (shd.nseq < 0 || shd.nseq > K3_MAX_PROMPT + K3_MAX_GEN) {
-            fprintf(stderr, "REFUSING: %s claims %d prior positions, outside 0..%d\n",
-                    load_state, shd.nseq, K3_MAX_PROMPT + K3_MAX_GEN);
-            return 1;
-        }
-        prior = shd.nseq;
-        if (prior + np + gen + 1 > K3_MAX_PROMPT + K3_MAX_GEN) {
-            fprintf(stderr, "REFUSING: %d prior + %d new + %d gen exceeds the %d-position "
-                            "ceiling\n", prior, np, gen, K3_MAX_PROMPT + K3_MAX_GEN);
-            return 1;
-        }
-        printf("resuming from %s: %d prior positions, %d new\n\n", load_state, prior, np);
-    }
+     * KV cache and every per-position buffer are sized for both; `prior` was read from
+     * the state header above, before any of the memory guards, precisely so they are
+     * not blind to it. The payload itself is restored after allocation. */
     const int Tmax = prior + np + gen + 1;
     const int E = c.hidden;
     const int maxb = c.n_layers / c.attn_res_block + 2;
