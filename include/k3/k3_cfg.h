@@ -238,6 +238,36 @@ static inline int k3_cfg_load(K3Cfg *c, int *fa, int fa_max, jval *root, const c
         fprintf(stderr, "k3_cfg: %s has short_conv_kernel_size %d\n", whence, c->conv_k);
         return 0;
     }
+    /* Every dimension below feeds unguarded pointer/size arithmetic in k3_ops.c and
+     * k3_bind.c (offsets like `ql + q_lora`, sizes like `kda_heads * kda_head_dim`), the
+     * same way n_layers/hidden/vocab/topk above do. A zero or negative value there is not
+     * a crash on the spot -- it is a wrong offset or an `int` that sign-extends into an
+     * enormous size_t a few calls downstream, exactly the "plausible-looking but wrong"
+     * failure this reader exists to refuse rather than produce. */
+    {
+        const struct { int v; const char *name; } dims[] = {
+            { c->n_heads,     "num_attention_heads" },
+            { c->q_lora,      "q_lora_rank" },
+            { c->kv_lora,     "kv_lora_rank" },
+            { c->qk_nope,     "qk_nope_head_dim" },
+            { c->qk_rope,     "qk_rope_head_dim" },
+            { c->v_head,      "v_head_dim" },
+            { c->latent,      "moe_latent (routed-expert width)" },
+            { c->moe_inter,   "moe_intermediate_size" },
+            { c->n_shared,    "n_shared_experts" },
+            { c->dense_inter, "intermediate_size (dense layer)" },
+            { c->kda_heads,   "linear_num_key_heads (KDA)" },
+            { c->kda_head_dim,"linear_key_head_dim (KDA)" },
+            { c->n_experts,   "n_routed_experts" },
+        };
+        for (size_t i = 0; i < sizeof dims / sizeof dims[0]; i++) {
+            if (dims[i].v <= 0) {
+                fprintf(stderr, "k3_cfg: %s has non-positive %s (%d)\n",
+                        whence, dims[i].name, dims[i].v);
+                return 0;
+            }
+        }
+    }
 
     printf("config: %s (%s shape) | hidden=%d layers=%d vocab=%d | %d MLA + %d KDA | "
            "experts %d top%d shared%d | latent=%d\n",
