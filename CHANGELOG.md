@@ -92,6 +92,15 @@ not needing the bytes at all.
 - Saved state records the KV layout and window geometry and refuses a mismatch: the two
   caches hold different tensors of the same float count, so restoring one as the other
   would be fluent and wrong. State version 1 → 2.
+- **A pinned trunk layer's `K3LayerBind` is cached after its first bind** instead of being
+  recomputed from scratch on every one. A pinned layer's bytes never change after the
+  first load, so the bind is the same struct every time — `k3_trunk_bind` re-ran the whole
+  bf16→fp32 widen loop anyway on every single bind, dominated by the router gate at
+  `n_experts * hidden` elements per MoE layer. Verified against a real random checkpoint +
+  packed trunk (13/13 layers pinned): generated token ids and the full `k3_run.json` trace
+  are byte-identical between a streaming/cached run and a direct from-shards run of the
+  same prompt, and a 10-token ASan+UBSan run over 130 binds (117 cache hits) reports no
+  error.
 
 ### Fixed
 
@@ -129,6 +138,49 @@ not needing the bytes at all.
   went over what the walk owed. The aggregate byte total could say a run went over and
   never which layers; two explanations for the 13.7% were argued from the pinned set's
   shape before this existed, and both were wrong.
+- **`k3_state_load()` sized `--load-state` reads from untrusted file-header fields.**
+  `hd->kper` (and, in expanded-KV mode, `hd->kvpp`/`hd->ropepp`) were used directly to
+  size the `fread()`s into buffers allocated from this run's own computed sizes. Those
+  fields are independent of the architecture-fingerprint check at load time, so a crafted
+  state file could carry a fingerprint matching this run's config exactly while claiming
+  an inflated count: `fread()` then succeeded in full and wrote past the destination
+  buffer, a heap overflow driven entirely by file content. kper/kvpp/ropepp are pure
+  functions of fields the fingerprint already verifies, so they are now recomputed from
+  the live config and used for sizing; the header's numbers only produce a diagnostic on
+  mismatch. The expanded-KV branch also gained the `kv_rows > kv_cap` bound the latent
+  branch already had. Verified under ASan: a state file with an inflated `kper` is now
+  refused (exit 1, no sanitizer report) instead of reaching the `fread()`.
+- **The Makefile silently reused objects built under different flags.** `make debug`,
+  `asan`, `ubsan` and `portable` all reinvoke the Makefile with different
+  CFLAGS/LDFLAGS/ARCH but share one `build/` object directory; make tracks source mtimes,
+  not compiler flags, so switching between them without an intervening `make clean` kept
+  whatever `.o` files were already newer than their `.c`. Depending on which flags
+  changed, that was either a link failure (a sanitizer binary linked against
+  non-sanitized objects and LDFLAGS missing `-fopenmp`) or, worse, silent: `make` then
+  `make debug` reported "Nothing to be done for 'all'" and kept the previous `-O3`
+  binary, under a target whose only promise is `-O0 -g3`. `build/.flags` now records
+  `CC`/`CFLAGS`/`INCLUDES` and every object depends on it, rewritten only when the flags
+  actually changed, so a real switch forces exactly the recompile it should and repeated
+  identical builds stay a no-op.
+- **`k3_cfg_load` accepted a non-positive MLA/KDA/MoE dimension.** `n_layers`/`hidden`/
+  `vocab`/`topk` and a few others were already refused when non-positive, but `n_heads`,
+  `q_lora`, `kv_lora`, `qk_nope`, `qk_rope`, `v_head`, `latent`, `moe_inter`, `n_shared`,
+  `dense_inter`, `kda_heads`, `kda_head_dim` and `n_experts` were not, despite feeding
+  unguarded pointer/size arithmetic throughout `k3_ops.c` and `k3_bind.c`. Now checked the
+  same way, with a new `tests/fixtures/cfg/bad_dims.json` regression fixture.
+- **The safetensors parser accepted a negative shape dimension or `data_offsets` span.**
+  Neither was rejected explicitly; the existing byte-span consistency check happened to
+  catch most malformed cases but not all of them, and let a malformed header past
+  validation as a functionally-broken-but-unflagged tensor rather than a clean refusal.
+  Both are now rejected directly with a specific diagnostic.
+- **`k3_cache_pin` combined `layer`/`expert` into a key before range-checking**, unlike
+  every other lookup in the cache (`cache_get`, `cache_resident`), which check the two
+  individually first. A negative `expert` could still land inside the valid key range by
+  aliasing the previous layer's tail. Brought in line with the other two call sites.
+- The CI "assert the suite was not silently empty" step grepped for a literal
+  "22 passed, 0 failed, 0 skipped", stale since 627d94f — `test_ops`' fixture set has
+  since grown to 27 real assertions, so the string this gate looked for no longer
+  appeared in `make test`'s output on either CI job.
 
 ## [1.0.0] - 2026-08-07
 
