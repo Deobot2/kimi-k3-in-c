@@ -857,14 +857,13 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 /* ---------------------------------------------------------------- router ---- */
 void k3_router(int *idx, float *w, const float *x, const float *W,
                const float *bias, int hidden, int n_experts, int topk,
-               int renorm, float routed_scale)
+               int renorm, float routed_scale, float *scratch)
 {
-    /* Returning early here would leave idx[] and w[] untouched, and k3_moe forms
-     * `w->w1 + idx[j]*I*L` from them one line later -- an arbitrary pointer built from
-     * uninitialised stack. */
-    float *score  = (float *)malloc((size_t)n_experts * sizeof(float));
-    float *choice = (float *)malloc((size_t)n_experts * sizeof(float));
-    if (!score || !choice) k3_fatal_oom("router scores", (size_t)n_experts * sizeof(float) * 2);
+    /* scratch is caller-owned: this runs once per token per MoE layer, and a
+     * calloc()/free() pair on that path was pure allocator churn -- see k3_kda_step
+     * above for the same fix applied to the KDA recurrence. */
+    float *score  = scratch;
+    float *choice = scratch + n_experts;
 
     /* logits in float32 with no bias, then an independent sigmoid per expert. The
      * reference upcasts both operands explicitly; a double accumulator here matches
@@ -912,8 +911,6 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
         for (int j = 0; j < topk; j++) w[j] *= inv;
     }
     for (int j = 0; j < topk; j++) w[j] *= routed_scale;
-
-    free(score); free(choice);
 }
 
 /* --------------------------------------------------------------- AttnRes ---- */
@@ -1006,6 +1003,7 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
     float *sgu  = edn  + L;             /* [2*SI] shared gate|up            */
     float *sact = sgu  + 2 * SI;        /* [SI]   shared after SiTU         */
     float *sdn  = sact + SI;            /* [E]    shared down-projection    */
+    float *rsc  = sdn  + E;             /* [2*n_experts] k3_router's score, choice */
 
     /* Before the router has seen anything, tell the source we are here. It knows what
      * this layer wanted last time and can start those reads now, so they overlap the
@@ -1021,7 +1019,7 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
 
         /* 1. route on the FULL width, before the down-projection */
         k3_router(idx, wt, xt, w->gate, w->bias, E, c->n_experts, c->topk,
-                  c->moe_renorm, c->routed_scale);
+                  c->moe_renorm, c->routed_scale, rsc);
 
         int nk = c->topk;
         /* Draft cache-only routing: keep only the top-k experts already resident, and
@@ -1110,7 +1108,8 @@ size_t k3_moe_scratch(const K3Cfg *c)
          + (size_t)3 * c->moe_inter       /* gu (2*I) + act (I) */
          + (size_t)c->latent              /* edn                */
          + (size_t)3 * SI                 /* sgu (2*SI) + sact  */
-         + (size_t)c->hidden;             /* sdn                */
+         + (size_t)c->hidden              /* sdn                */
+         + (size_t)2 * c->n_experts;      /* k3_router's score, choice */
 }
 
 /* Batched MoE for PREFILL over a chunk of T tokens, streamed experts only.
@@ -1178,6 +1177,11 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
     if (!ridx || !rwt || !zz || !contrib)
         k3_fatal_oom("MoE prefill batch", (size_t)T * K * Ll * sizeof(float));
 
+    /* k3_router's score/choice live at the tail of the caller's k3_moe_scratch-sized
+     * buffer, past gu/act/edn below -- same region k3_moe uses, just reached from the
+     * end instead of by name, since this function's own aliases start over at offset 0. */
+    float *rsc = scratch + k3_moe_scratch(c) - (size_t)2 * c->n_experts;
+
     /* 1. route every token and down-project it, and collect the batch's unique experts. */
     int  *uniq = (int *)malloc((size_t)T * K * sizeof(int));
     char *seen = (char *)calloc((size_t)c->n_experts, 1);
@@ -1191,7 +1195,7 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         int   *it = ridx + (size_t)t * K;
         float *wtt = rwt + (size_t)t * K;
         k3_router(it, wtt, xt, w->gate, w->bias, E, c->n_experts, K,
-                  c->moe_renorm, c->routed_scale);
+                  c->moe_renorm, c->routed_scale, rsc);
         k3_mmw(zz + (size_t)t * Ll, xt, w->down, w->wdt, E, Ll);
         for (int j = 0; j < K; j++) {
             const int e = it[j];

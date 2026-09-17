@@ -131,6 +131,15 @@ not needing the bytes at all.
   and MXFP4 expert matmul (8.67 s/token) on the same run. Numbers and the honest
   conclusion — worth doing because it was free, not because it moves an end-to-end
   figure — are in ROADMAP.md item 4.
+- **`k3_router` no longer calls `malloc`/`free` on its own, same fix as `k3_kda_step`
+  above, same reason.** It runs once per token per MoE layer — 92 times per token at the
+  released config — scoring all 896 experts into two heap buffers it allocated and freed
+  every call. It now takes a caller-owned scratch buffer; `k3_moe_scratch` reserves
+  `2*n_experts` extra floats for it (about 7 KB at the released config, trivial next to
+  what a layer already reserves) and both `k3_moe` and the batched prefill path hand it
+  a slice of scratch they already own. Verified against the `router`/`moe` fixtures and
+  the full-model oracle (all 5 gates) under AddressSanitizer + UndefinedBehaviorSanitizer
+  as well as the normal build, at 1 and 4 threads.
 
 ### Fixed
 

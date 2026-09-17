@@ -384,10 +384,15 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
  * Grouped routing is dead code for K3 (num_expert_group == 1) and is not implemented.
  *
  * idx and w are written in DESCENDING score order. Fills at most topk entries.
+ *
+ * scratch is caller-owned, at least 2*n_experts floats (score, then choice). This runs
+ * once per token per MoE layer -- 92 times per token at the released config -- so a
+ * calloc()/free() pair here was pure churn on the decode hot path; k3_moe_scratch()
+ * already reserves the room.
  */
 void k3_router(int *idx, float *w, const float *x, const float *W,
                const float *bias, int hidden, int n_experts, int topk,
-               int renorm, float routed_scale);
+               int renorm, float routed_scale, float *scratch);
 
 /* AttnRes aggregation over nsrc sources of width n.
  *   keys   = RMSNorm(sources)            normalised
