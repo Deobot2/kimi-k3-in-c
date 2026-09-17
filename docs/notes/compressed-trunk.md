@@ -164,6 +164,14 @@ difference between the two perplexities is the entire measurement.**
 `--tf-check` is the companion figure: how often the quantised model's greedy token agrees
 with the sequence, which is the acceptance rate a draft design stands on.
 
+> **`--ppl` alone is not sufficient, and this repository found that out the hard way.**
+> Commit `627d94f` measured an MXFP4 trunk scoring the modest-looking +13% below *while its
+> generations collapsed into an eight-token loop*. Perplexity is teacher-forced — at every
+> position the model is conditioned on the real text, never on its own output — so
+> degeneration lives in the self-conditioned trajectory and is invisible to it by
+> construction, at any corpus size. Run `benchmarks/eval/` as well, which adds a
+> self-conditioned leg for exactly this reason.
+
 ## The first measurement
 
 One 21-token prompt, 20 scored positions, identical ids, same 22 GB trunk budget:
