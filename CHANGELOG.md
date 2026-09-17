@@ -92,6 +92,14 @@ not needing the bytes at all.
 - Saved state records the KV layout and window geometry and refuses a mismatch: the two
   caches hold different tensors of the same float count, so restoring one as the other
   would be fluent and wrong. State version 1 → 2.
+- **`k3_kda_step` no longer calls `calloc`/`free` on its own.** The recurrence runs once
+  per token per head — `T * kda_heads` times per layer — and each call was allocating and
+  freeing its `u` temporary from the heap. It now takes a caller-owned scratch buffer;
+  `k3_kda_layer` hands it a per-head slice of one extra `P`-wide row it already sizes
+  through `k3_kda_scratch`, so the hot path allocates nothing. Bit-identical to the old
+  behaviour — this only removes an allocator round trip, it changes no arithmetic — and
+  covered by the existing `kda_recur*` and `kda_layer*` fixtures in `test_ops` plus the
+  full-model oracle at 1 and N threads.
 
 ### Fixed
 
