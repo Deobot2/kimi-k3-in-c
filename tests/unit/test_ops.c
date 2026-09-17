@@ -312,15 +312,16 @@ static void t_attnres(const char *dir)
         const int nsrc = nblk + 1;
         float *src = (float *)malloc((size_t)nsrc * n * sizeof(float));
         float *y = (float *)malloc((size_t)rows * n * sizeof(float));
+        float *asc = (float *)malloc((size_t)nsrc * sizeof(float));
         for (int rw = 0; rw < rows; rw++) {
             for (int b = 0; b < nblk; b++)
                 memcpy(src + (size_t)b * n,
                        br + ((size_t)rw * nblk + b) * n, (size_t)n * sizeof(float));
             memcpy(src + (size_t)nblk * n, px + (size_t)rw * n, (size_t)n * sizeof(float));
-            k3_attn_res(y + (size_t)rw * n, src, fold, nsrc, n, eps);
+            k3_attn_res(y + (size_t)rw * n, src, fold, nsrc, n, eps, asc);
         }
         report("attn_res", y, e, no);
-        free(src); free(y);
+        free(src); free(y); free(asc);
     }
     free(px); free(br); free(fold); free(e); free(txt); free(ar);
 }

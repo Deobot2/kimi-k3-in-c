@@ -140,6 +140,15 @@ not needing the bytes at all.
   a slice of scratch they already own. Verified against the `router`/`moe` fixtures and
   the full-model oracle (all 5 gates) under AddressSanitizer + UndefinedBehaviorSanitizer
   as well as the normal build, at 1 and 4 threads.
+- **`k3_attn_res` gets the same fix, closing out this pass.** Every remaining
+  `malloc`/`free` pair on the decode hot path is now gone: `k3_kda_step`, `k3_router`,
+  and now `k3_attn_res`, which ran once per token at every attn_res block boundary (up
+  to `n_layers/attn_res_block + 2` times, twice each: once before attention, once before
+  the MLP). `k3_layer_scratch_kv` now reserves that many extra floats for it, and all
+  four call sites — `k3_decoder_layer_kv` internally, the model-level aggregator in
+  `src/cli/k3_run.c`, and the two in `tests/unit/k3_model.c` — hand it a slice of scratch
+  they already own. Verified the same way as `k3_router`: fixtures, the full oracle, and
+  ASan+UBSan on both `test_ops` and the `k3_model` oracle clean.
 
 ### Fixed
 

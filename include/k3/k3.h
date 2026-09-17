@@ -398,9 +398,12 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
  *   keys   = RMSNorm(sources)            normalised
  *   score  = dot(key, fold)              fold = norm.weight * proj.weight, ONE vector
  *   out    = softmax(score) @ sources    the RAW, UNNORMALISED sources
- * Fold the two weight vectors at load time. modeling_kimi_linear.py:1075-1088 */
+ * Fold the two weight vectors at load time. modeling_kimi_linear.py:1075-1088
+ *
+ * scratch is caller-owned, at least nsrc floats. This runs once per token per attn_res
+ * block boundary; k3_layer_scratch_kv already reserves the room. */
 void k3_attn_res(float *out, const float *src, const float *fold,
-                 int nsrc, int n, float eps);
+                 int nsrc, int n, float eps, float *scratch);
 
 /* ---- weight storage format -------------------------------------------------------
  * The always-active weights ship as bf16 and total 113.49 GB; held as fp32 they are

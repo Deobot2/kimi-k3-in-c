@@ -915,12 +915,12 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
 
 /* --------------------------------------------------------------- AttnRes ---- */
 void k3_attn_res(float *out, const float *src, const float *fold,
-                 int nsrc, int n, float eps)
+                 int nsrc, int n, float eps, float *scratch)
 {
-    /* Returning early would leave `out` holding the previous layer's residual, which
-     * the caller cannot distinguish from a computed one. */
-    float *score = (float *)malloc((size_t)nsrc * sizeof(float));
-    if (!score) k3_fatal_oom("AttnRes scores", (size_t)nsrc * sizeof(float));
+    /* scratch is caller-owned, at least nsrc floats: this runs once per token per
+     * attn_res block boundary, and a malloc()/free() pair on that path was pure
+     * allocator churn, same fix and same reason as k3_kda_step and k3_router above. */
+    float *score = scratch;
 
     for (int s = 0; s < nsrc; s++) {
         const float *v = src + (size_t)s * n;
@@ -944,7 +944,6 @@ void k3_attn_res(float *out, const float *src, const float *fold,
         const float *v = src + (size_t)s * n;   /* the RAW source, not the key */
         for (int i = 0; i < n; i++) out[i] += p * v[i];
     }
-    free(score);
 }
 
 /* Exact scratch requirement for k3_mla. Callers should use this rather than
@@ -1404,11 +1403,15 @@ size_t k3_layer_scratch_kv(const K3Cfg *c, int T, int span, int mode)
     size_t m = k3_moe_scratch(c);
     size_t sub = a > b ? a : b;
     if (m > sub) sub = m;
-    /* prefix_sum, tmp, fold vectors, one attn_res source stack, plus the sub-block */
+    const size_t maxb = (size_t)(c->n_layers / c->attn_res_block + 2);
+    /* prefix_sum, tmp, fold vectors, one attn_res source stack, k3_attn_res's own score
+     * scratch (maxb floats -- one per source row, caller-owned for the same reason
+     * k3_kda_step's and k3_router's were), plus the sub-block */
     return (size_t)3 * T * c->hidden
          + (size_t)2 * c->hidden
-         + (size_t)(c->n_layers / c->attn_res_block + 2) * c->hidden
+         + maxb * c->hidden
          + (size_t)2 * c->dense_inter
+         + maxb
          + sub;
 }
 
@@ -1448,7 +1451,8 @@ void k3_decoder_layer_kv(float *h, float *block_residual, int *n_blocks,
     float *foldM  = foldA + E;                  /* [E] mlp aggregator            */
     float *src    = foldM + E;                  /* [maxb+1][E] source stack      */
     float *dgu    = src + (size_t)(maxb) * E;   /* [2*dense_inter]               */
-    float *sub    = dgu + (size_t)2 * c->dense_inter;
+    float *asc    = dgu + (size_t)2 * c->dense_inter;   /* [maxb] k3_attn_res scratch */
+    float *sub    = asc + (size_t)maxb;
 
     /* The norm gain and the scoring projection collapse to ONE vector. Folding them
      * here costs 2*hidden multiplies per layer; a real engine folds at load time. */
@@ -1469,7 +1473,7 @@ void k3_decoder_layer_kv(float *h, float *block_residual, int *n_blocks,
                        (size_t)E * sizeof(float));
             memcpy(src + (size_t)(*n_blocks) * E, pref + (size_t)t * E,
                    (size_t)E * sizeof(float));
-            k3_attn_res(h + (size_t)t * E, src, foldA, *n_blocks + 1, E, c->rms_eps);
+            k3_attn_res(h + (size_t)t * E, src, foldA, *n_blocks + 1, E, c->rms_eps, asc);
         }
     }
 
@@ -1508,7 +1512,7 @@ void k3_decoder_layer_kv(float *h, float *block_residual, int *n_blocks,
                    (size_t)E * sizeof(float));
         memcpy(src + (size_t)(*n_blocks) * E, pref + (size_t)t * E,
                (size_t)E * sizeof(float));
-        k3_attn_res(h + (size_t)t * E, src, foldM, *n_blocks + 1, E, c->rms_eps);
+        k3_attn_res(h + (size_t)t * E, src, foldM, *n_blocks + 1, E, c->rms_eps, asc);
     }
 
     for (int t = 0; t < T; t++)
