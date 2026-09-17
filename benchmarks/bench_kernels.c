@@ -128,6 +128,62 @@ int main(void)
         free(pk); free(sc); free(x); free(y);
     }
 
+    /* ---------- KDA recurrence: one step, real head_dim ----------
+     * ROADMAP.md item 4 called this "the largest remaining un-vectorised kernel on the
+     * non-I/O path" and AVX2 has since landed for it, argued from mechanism (see the
+     * comment on k3_kda_step) but never timed. This times it: 69 KDA layers x 96 heads
+     * x this call, once per generated token. */
+    {
+        const int dk = 128, dv = 128, heads = 96, kda_layers = 69;
+        float *S = (float *)malloc((size_t)dk * dv * sizeof(float));
+        float *o = (float *)malloc((size_t)dv * sizeof(float));
+        float *q = (float *)malloc((size_t)dk * sizeof(float));
+        float *k = (float *)malloc((size_t)dk * sizeof(float));
+        float *v = (float *)malloc((size_t)dv * sizeof(float));
+        float *al = (float *)malloc((size_t)dk * sizeof(float));
+        float *u = (float *)malloc((size_t)dv * sizeof(float));
+        if (!S || !o || !q || !k || !v || !al || !u) { printf("alloc failed\n"); return 1; }
+        fillf(S, (size_t)dk * dv, 2024u);
+        fillf(q, dk, 55u); fillf(k, dk, 66u); fillf(v, dv, 77u);
+        for (int i = 0; i < dk; i++) al[i] = 0.98f;    /* a plausible decay, never zero */
+
+        k3_kda_step(S, o, q, k, v, al, 0.4f, dk, dv, u);       /* warm */
+        const int reps = 2000;
+        const double t0 = now_s();
+        for (int r = 0; r < reps; r++) k3_kda_step(S, o, q, k, v, al, 0.4f, dk, dv, u);
+        const double dt = (now_s() - t0) / reps;
+        printf("\nKDA step     dk=%d dv=%d      %7.4f ms/call\n", dk, dv, dt * 1e3);
+        fnv("kda  ", o, dv);
+        printf("             %d heads x %d layers -> %.4f s/token\n",
+               heads, kda_layers, dt * heads * kda_layers);
+        free(S); free(o); free(q); free(k); free(v); free(al); free(u);
+    }
+
+    /* ---------- k3_matmul_tr: MLA latent query absorption, real dims ----------
+     * kv_lora=512, qk_nope=128, once per head per MLA layer per token (24 layers). The
+     * comment at its call site calls it "small next to the recurrence"; this checks
+     * that against the number above rather than leaving it asserted. */
+    {
+        const int in = 512, rows = 128, heads = 96, mla_layers = 24;
+        uint16_t *W = (uint16_t *)malloc((size_t)in * rows * sizeof(uint16_t));
+        float *x = (float *)malloc((size_t)rows * sizeof(float));
+        float *y = (float *)malloc((size_t)in * sizeof(float));
+        if (!W || !x || !y) { printf("alloc failed\n"); return 1; }
+        fillb((unsigned char *)W, (size_t)in * rows * 2, 88u);
+        fillf(x, rows, 33u);
+
+        k3_matmul_tr(y, x, W, K3_WBF16, in, rows);             /* warm */
+        const int reps = 2000;
+        const double t0 = now_s();
+        for (int r = 0; r < reps; r++) k3_matmul_tr(y, x, W, K3_WBF16, in, rows);
+        const double dt = (now_s() - t0) / reps;
+        printf("\nmatmul_tr    in=%d rows=%d    %7.4f ms/call\n", in, rows, dt * 1e3);
+        fnv("mtr  ", y, in);
+        printf("             %d heads x %d layers -> %.4f s/token\n",
+               heads, mla_layers, dt * heads * mla_layers);
+        free(W); free(x); free(y);
+    }
+
     printf("\nmeasured compute budget at the floor is about 10 s/token; whichever line\n"
            "above dominates it is the one worth vectorising.\n");
     return 0;

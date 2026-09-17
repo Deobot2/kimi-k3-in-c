@@ -122,6 +122,15 @@ not needing the bytes at all.
   the skip-the-row branch) against an independent scalar reimplementation, specifically
   to exercise the tail no fixture reaches. Verified bit-identical the same two ways as
   `matmul_tr_bf16` above.
+- **`benchmarks/bench_kernels.c` now times `k3_kda_step` and `k3_matmul_tr` at the
+  released dimensions**, the same way it already does the trunk and expert matmuls.
+  Measured on this machine: AVX2 gives the recurrence 1.7x (0.0711 -> 0.0415 s/token)
+  and the transposed matmul 3.0x (0.0547 -> 0.0181 s/token). Both are real and both are
+  small — together about 0.12 s/token against a ~10 s/token compute floor that is itself
+  dwarfed by I/O, three orders of magnitude under the bf16 trunk matmul (3.97 s/token)
+  and MXFP4 expert matmul (8.67 s/token) on the same run. Numbers and the honest
+  conclusion — worth doing because it was free, not because it moves an end-to-end
+  figure — are in ROADMAP.md item 4.
 
 ### Fixed
 

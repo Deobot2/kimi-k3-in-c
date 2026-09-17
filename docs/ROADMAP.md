@@ -71,10 +71,23 @@ Not yet vectorised: `k3_matmul_tr`'s MXFP4 and int8 branches, which the recurren
 fix did not touch. Whether either is worth it depends on how often a quantised trunk is
 paired with `--mla-latent` — measure before spending the effort, per item 2.
 
-Still unmeasured: what any of this is actually worth. The recurrence is 0.4% of FLOPs
-but was "a majority of non-matmul wall time at high core counts" per the comment at its
-call site — a claim about the SCALAR version, not re-measured against the vector one.
-`benchmarks/` has no entry for it yet.
+Now measured: `benchmarks/bench_kernels.c` times both at the released dimensions and
+projects the per-token cost the same way it already does for the trunk and expert
+matmuls. On this machine, AVX2 against scalar:
+
+| kernel      | scalar        | AVX2          | speedup |
+|-------------|---------------|---------------|---------|
+| KDA step    | 0.0711 s/token | 0.0415 s/token | 1.7x   |
+| matmul_tr   | 0.0547 s/token | 0.0181 s/token | 3.0x   |
+
+Both speedups are real, and both are **small in absolute terms**: together they save
+about 0.12 s/token against a measured ~10 s/token compute floor that is itself dwarfed
+by I/O. The bf16 trunk matmul alone projects to 3.97 s/token and the MXFP4 expert matmul
+to 8.67 s/token on the same run — three orders of magnitude more than either kernel
+vectorised here. This confirms rather than overturns the original framing: the
+recurrence really was "0.4% of FLOPs," vectorising it was still worth doing because it
+was free (bit-identical, already tested, no new failure mode), but nobody should expect
+it to move an end-to-end number.
 
 ## 5. Sampling
 
