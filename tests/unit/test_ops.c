@@ -1060,6 +1060,93 @@ static void t_matmul_tr_bf16(void)
     free(W); free(x); free(ya); free(yb);
 }
 
+/* Every JSON fixture that drives t_recur/t_kda_layer uses the released head_dim, 16,
+ * which is an exact multiple of 8 -- so none of them ever exercise the AVX2 tail added
+ * to k3_kda_step. This drives dk=37, dv=21 instead, deliberately not multiples of 8,
+ * across five chained steps so real recurrent state (not just zeros) reaches both the
+ * vector body and the scalar remainder, and checks the result against an independent
+ * scalar reimplementation of the same four steps in the same order. Forces a few exact
+ * zeros into k/q as well, to exercise the skip-the-row branch. */
+static void t_kda_step_tail(void)
+{
+    const int dk = 37, dv = 21, steps = 5;
+    float *Sa = (float *)malloc((size_t)dk * dv * sizeof(float));
+    float *Sb = (float *)malloc((size_t)dk * dv * sizeof(float));
+    float *q  = (float *)malloc((size_t)dk * sizeof(float));
+    float *k  = (float *)malloc((size_t)dk * sizeof(float));
+    float *v  = (float *)malloc((size_t)dv * sizeof(float));
+    float *al = (float *)malloc((size_t)dk * sizeof(float));
+    float *oa = (float *)malloc((size_t)dv * sizeof(float));
+    float *ob = (float *)malloc((size_t)dv * sizeof(float));
+    float *u  = (float *)malloc((size_t)dv * sizeof(float));
+    if (!Sa || !Sb || !q || !k || !v || !al || !oa || !ob || !u) {
+        printf("  FAIL  kda_step_tail (alloc)\n"); g_fail++; return;
+    }
+
+    unsigned s = 0x1234ABCDu;
+    for (int i = 0; i < dk * dv; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        Sa[i] = Sb[i] = (float)(s >> 8) / 8388608.0f - 1.0f;
+    }
+    for (int i = 0; i < dk; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        q[i] = (float)(s >> 8) / 8388608.0f - 1.0f;
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        k[i] = (float)(s >> 8) / 8388608.0f - 1.0f;
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        al[i] = 0.5f + 0.5f * ((float)(s >> 8) / 8388608.0f - 1.0f);
+    }
+    for (int i = 0; i < dv; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        v[i] = (float)(s >> 8) / 8388608.0f - 1.0f;
+    }
+    k[3] = 0.0f; q[5] = 0.0f; k[dk - 1] = 0.0f;   /* exercise the skip branch */
+    const float beta = 0.37f;
+
+    int bad = 0;
+    for (int t = 0; t < steps; t++) {
+        k3_kda_step(Sa, oa, q, k, v, al, beta, dk, dv, u);
+
+        /* independent scalar reimplementation, the same four steps in the same order */
+        for (int i = 0; i < dk; i++) {
+            float *row = Sb + (size_t)i * dv;
+            for (int j = 0; j < dv; j++) row[j] *= al[i];
+        }
+        for (int j = 0; j < dv; j++) u[j] = 0.0f;
+        for (int i = 0; i < dk; i++) {
+            if (k[i] == 0.0f) continue;
+            const float *row = Sb + (size_t)i * dv;
+            for (int j = 0; j < dv; j++) u[j] += k[i] * row[j];
+        }
+        for (int i = 0; i < dk; i++) {
+            if (k[i] == 0.0f) continue;
+            float *row = Sb + (size_t)i * dv;
+            for (int j = 0; j < dv; j++) row[j] += k[i] * beta * (v[j] - u[j]);
+        }
+        for (int j = 0; j < dv; j++) ob[j] = 0.0f;
+        for (int i = 0; i < dk; i++) {
+            if (q[i] == 0.0f) continue;
+            const float *row = Sb + (size_t)i * dv;
+            for (int j = 0; j < dv; j++) ob[j] += q[i] * row[j];
+        }
+
+        for (int j = 0; j < dv; j++) {
+            union { float f; uint32_t u; } a, b;
+            a.f = oa[j]; b.f = ob[j];
+            if (a.u != b.u) bad++;
+        }
+        for (int i = 0; i < dk * dv; i++) {
+            union { float f; uint32_t u; } a, b;
+            a.f = Sa[i]; b.f = Sb[i];
+            if (a.u != b.u) bad++;
+        }
+    }
+    if (bad) { printf("  FAIL  kda_step_tail  %d mismatches over %d steps\n", bad, steps); g_fail++; }
+    else     { printf("  PASS  kda_step_tail  dk=%d dv=%d x%d steps, bit-identical to reference\n",
+                       dk, dv, steps); g_pass++; }
+    free(Sa); free(Sb); free(q); free(k); free(v); free(al); free(oa); free(ob); free(u);
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -1098,6 +1185,7 @@ int main(int argc, char **argv)
     t_mxfp4(dir);
     t_matmul_bf16();
     t_matmul_tr_bf16();
+    t_kda_step_tail();
     t_kda_layer(dir, "kda_layer1");
     t_kda_layer(dir, "kda_layer8");
     t_layer(dir, "layer_kda");

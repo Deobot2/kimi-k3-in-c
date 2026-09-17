@@ -57,17 +57,24 @@ Two background threads now exist as well — the trunk reader and the expert-cac
 speculator — so the sweep should cover their interaction with the OpenMP pool rather
 than assuming the pool has the machine to itself.
 
-## 4. SIMD in the KDA recurrence
+## 4. SIMD in the KDA recurrence — done for the two named kernels
 
-The bf16 trunk matmul and the MXFP4 expert matmul already have hand-written AVX2 paths
-(`src/core/k3_ops.c`), each written to reproduce the scalar reduction order exactly. The
-KDA recurrence does not: it is still plain scalar C, and it is the largest remaining
-un-vectorised kernel on the non-I/O path.
+`k3_kda_step` and `k3_matmul_tr`'s bf16 branch both now have AVX2 paths (`src/core/
+k3_ops.c`), each proven bit-identical to the scalar code by construction (vectorising
+only the axis that is NOT the reduction, so the summation order is untouched) and by
+building `test_ops` twice — once at `-march=native`, once with `ARCH=` — and diffing raw
+output, plus two permanent regression tests: `matmul_tr_bf16` and `kda_step_tail`, both
+run at shapes that are deliberately not multiples of the vector width so the AVX2 tail is
+exercised, since every JSON fixture happens to use dimensions that are.
 
-`k3_matmul_tr`, added for the latent KV cache's query absorption, is the second: it is a
-strided column sweep with a double accumulator per output and no vector path at all. It
-runs 96 times per MLA layer per token, so it is small next to the recurrence but it is
-new and it is scalar.
+Not yet vectorised: `k3_matmul_tr`'s MXFP4 and int8 branches, which the recurrence's own
+fix did not touch. Whether either is worth it depends on how often a quantised trunk is
+paired with `--mla-latent` — measure before spending the effort, per item 2.
+
+Still unmeasured: what any of this is actually worth. The recurrence is 0.4% of FLOPs
+but was "a majority of non-matmul wall time at high core counts" per the comment at its
+call site — a claim about the SCALAR version, not re-measured against the vector one.
+`benchmarks/` has no entry for it yet.
 
 ## 5. Sampling
 

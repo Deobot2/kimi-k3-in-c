@@ -111,6 +111,17 @@ not needing the bytes at all.
   `matmul_tr_bf16` in `test_ops`, that checks the compiled path against an
   independently-written reference of the same summation order on a non-multiple-of-four
   shape.
+- **`k3_kda_step` gets an AVX2 path too — ROADMAP.md item 4's primary target, "the
+  largest remaining un-vectorised kernel on the non-I/O path."** All four steps of the
+  recurrence reduce over the recurrent state's rows (dk) with the head dimension (dv) as
+  a free axis that never interacts across that reduction, so vectorising across dv changes
+  nothing about the order dk is summed in — no accumulator-partition trick needed, unlike
+  `k3_matmul`. Every JSON fixture that exercises this kernel uses the released head_dim,
+  16, which happens to be a multiple of the vector width, so a new test,
+  `kda_step_tail`, drives dk=37/dv=21 across five chained steps (with forced zeros to hit
+  the skip-the-row branch) against an independent scalar reimplementation, specifically
+  to exercise the tail no fixture reaches. Verified bit-identical the same two ways as
+  `matmul_tr_bf16` above.
 
 ### Fixed
 
