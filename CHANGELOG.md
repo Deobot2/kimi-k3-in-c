@@ -100,6 +100,17 @@ not needing the bytes at all.
   behaviour — this only removes an allocator round trip, it changes no arithmetic — and
   covered by the existing `kda_recur*` and `kda_layer*` fixtures in `test_ops` plus the
   full-model oracle at 1 and N threads.
+- **`k3_matmul_tr`'s bf16 branch gets an AVX2 path.** Roadmap item 4 named this the
+  second-largest un-vectorised kernel on the non-I/O path — it runs 96 times per MLA
+  layer per token on `--mla-latent`'s absorbed query projection. Row `r` is contiguous
+  IN THE OUTPUT AXIS, so four output columns share one vector accumulator per row rather
+  than gathering across the unfriendly row stride; mul-then-add (never `fmadd`) keeps it
+  matching the scalar order exactly under `-ffp-contract=off`. Verified bit-identical to
+  the scalar path both by building the same fixtures once with `-march=native` and once
+  with `ARCH=` and diffing raw output, and by a new permanent regression test,
+  `matmul_tr_bf16` in `test_ops`, that checks the compiled path against an
+  independently-written reference of the same summation order on a non-multiple-of-four
+  shape.
 
 ### Fixed
 

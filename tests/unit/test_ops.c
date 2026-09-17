@@ -1014,6 +1014,52 @@ static void t_matmul_bf16(void)
     free(Wb); free(Wf); free(x); free(ya); free(yb);
 }
 
+/* k3_matmul_tr's bf16 branch must match its OWN documented order exactly: double
+ * accumulator per column, rows summed ascending, mul then add (never fused). The AVX2
+ * path packs four columns into vector lanes but must not change that order, so this
+ * reimplements the reference by hand rather than reusing any k3_ code, and dimensions
+ * are deliberately not a multiple of four to exercise the scalar tail alongside the
+ * vector body. */
+static void t_matmul_tr_bf16(void)
+{
+    const int in = 131, rows = 97;
+    uint16_t *W  = (uint16_t *)malloc((size_t)in * rows * sizeof(uint16_t));
+    float    *x  = (float *)malloc((size_t)rows * sizeof(float));
+    float    *ya = (float *)malloc((size_t)in * sizeof(float));
+    float    *yb = (float *)malloc((size_t)in * sizeof(float));
+    if (!W || !x || !ya || !yb) { printf("  FAIL  matmul_tr_bf16 (alloc)\n"); g_fail++; return; }
+
+    unsigned s = 0x5A17FEEDu;
+    for (size_t i = 0; i < (size_t)in * rows; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        uint16_t h = (uint16_t)(s >> 8);
+        if (((h >> 7) & 0xFF) == 0xFF) h &= 0x7F7Fu;   /* avoid NaN/Inf bf16 */
+        W[i] = h;
+    }
+    for (int i = 0; i < rows; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        x[i] = (float)(s >> 8) / 8388608.0f - 1.0f;
+    }
+
+    k3_matmul_tr(ya, x, W, K3_WBF16, in, rows);
+    for (int j = 0; j < in; j++) {
+        double acc = 0.0;
+        for (int r = 0; r < rows; r++)
+            acc += (double)x[r] * (double)k3_bf16f(W[(size_t)r * in + j]);
+        yb[j] = (float)acc;
+    }
+
+    int bad = 0;
+    for (int j = 0; j < in; j++) {
+        union { float f; uint32_t u; } a, b;
+        a.f = ya[j]; b.f = yb[j];
+        if (a.u != b.u) bad++;
+    }
+    if (bad) { printf("  FAIL  matmul_tr_bf16 %d/%d columns differ\n", bad, in); g_fail++; }
+    else     { printf("  PASS  matmul_tr_bf16 n=%d    bit-identical to its reference order\n", in); g_pass++; }
+    free(W); free(x); free(ya); free(yb);
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -1051,6 +1097,7 @@ int main(int argc, char **argv)
     t_moe(dir);
     t_mxfp4(dir);
     t_matmul_bf16();
+    t_matmul_tr_bf16();
     t_kda_layer(dir, "kda_layer1");
     t_kda_layer(dir, "kda_layer8");
     t_layer(dir, "layer_kda");

@@ -31,6 +31,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
  * scratch without changing a published signature. They are hundreds of bytes to a few
@@ -700,6 +704,41 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 {
     if (wdt == K3_WBF16) {
         const uint16_t *w16 = (const uint16_t *)W;
+#if defined(__AVX2__)
+        /* Four columns at a time. Row r is contiguous IN j (this is the only axis
+         * that is), so a fixed r contributes one 4-wide load to four independent
+         * accumulators -- the same per-column order as the scalar loop (r = 0..rows-1
+         * in sequence), just four columns wide. MUL THEN ADD, never fmadd, to match
+         * the scalar `acc += x[r] * w` exactly under -ffp-contract=off; see
+         * k3_matmul_bf16 above for why that distinction matters here. */
+        const int jb = in - (in % 4);
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static) if (in > 64)
+#endif
+        for (int j = 0; j < jb; j += 4) {
+            __m256d acc = _mm256_setzero_pd();
+            for (int r = 0; r < rows; r++) {
+                const __m128i h = _mm_loadl_epi64(
+                    (const __m128i *)(w16 + (size_t)r * in + j));
+                const __m256d wv = _mm256_cvtps_pd(_mm_castsi128_ps(
+                    _mm_slli_epi32(_mm_cvtepu16_epi32(h), 16)));
+                acc = _mm256_add_pd(acc, _mm256_mul_pd(wv, _mm256_set1_pd((double)x[r])));
+            }
+            double a[4];
+            _mm256_storeu_pd(a, acc);
+            y[j] = (float)a[0]; y[j + 1] = (float)a[1];
+            y[j + 2] = (float)a[2]; y[j + 3] = (float)a[3];
+        }
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static) if (in > 64)
+#endif
+        for (int j = jb; j < in; j++) {
+            double acc = 0.0;
+            for (int r = 0; r < rows; r++)
+                acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
+            y[j] = (float)acc;
+        }
+#else
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
@@ -709,6 +748,7 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
                 acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
             y[j] = (float)acc;
         }
+#endif
     } else if (wdt == K3_WMX4) {
         /* A quantised trunk. Column j of row r is the nibble at byte j/2 of that row,
          * scaled by the E8M0 exponent of the group j/32 -- so the transposed sweep needs
@@ -1463,10 +1503,6 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
 /* ---------------------------------------------------------------- MXFP4 ---- */
 /* K3_E2M1 lives near the top of this file: k3_matmul_tr needs it too, for the
  * transposed sweep over a quantised trunk, and that is defined well before here. */
-
-#if defined(__AVX2__)
-#include <immintrin.h>
-#endif
 
 /* y[out] = W[out][in] . x[in], with W stored as bf16 and widened on read.
  *
