@@ -505,7 +505,15 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
            "a pinned SET is used instead)\n", 100.0 * npin / tr->n_layers);
     return 0;
 bad:
+    /* By the time any goto above fires, tr->lay (and possibly several tr->lay[i].t
+     * sub-arrays), tr->json_root and tr->json_arena may already be allocated -- the
+     * manifest parse loop fails partway through, not atomically. k3_trunk_close
+     * already null-checks every field it tears down (see its own comment: opening
+     * two trunks back to back used to leak the whole manifest each time, which is
+     * exactly this shape of partial state), so reuse it here instead of only
+     * freeing txt and leaking the rest. tr->fd is still -1, so it closes nothing. */
     free(txt);
+    k3_trunk_close(tr);
     return -1;
 }
 

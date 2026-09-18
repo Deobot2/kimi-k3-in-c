@@ -435,6 +435,41 @@ static void bcfg(K3Cfg *c, int *fa)
     c->n_full_attn = 3; c->full_attn = fa;
 }
 
+/* A layer with no "tensors" object makes k3_trunk_open fail partway through the
+ * manifest loop, after tr->lay and the first layer's tr->lay[0].t are already
+ * allocated. The `bad:` label used to free only the raw JSON text and leak all of
+ * that (and tr->json_root / tr->json_arena, the parsed manifest itself) -- run this
+ * under `ASAN_OPTIONS=detect_leaks=1` to see it catch a regression. Here, without a
+ * leak checker, the test still guards the other half of the fix: k3_trunk_open must
+ * fail cleanly (no crash, no double free) and leave `tr` safe to close again. */
+static void t_bad_manifest(const char *dir)
+{
+    char sub[1100];
+    snprintf(sub, sizeof sub, "%s/badmanifest", dir);
+    if (mkdir(sub, 0777) != 0 && errno != EEXIST) {
+        ok("bad manifest", 0, "cannot create %s", sub);
+        return;
+    }
+    char p[1200];
+    snprintf(p, sizeof p, "%s/trunk.json", sub);
+    FILE *f = fopen(p, "w");
+    if (!f) { ok("bad manifest", 0, "cannot write %s", p); return; }
+    /* layer 0 is well formed, so tr->lay[0].t gets allocated before layer 1's
+     * missing "tensors" trips the manifest-loop's goto bad. */
+    fprintf(f, "{\"align\":4096,\"layers\":["
+               "{\"file_off\":0,\"nbytes\":4096,\"tensors\":"
+               "{\"a\":{\"off\":0,\"nbytes\":4,\"dtype\":\"F32\"}}},"
+               "{\"file_off\":4096,\"nbytes\":4096}"
+               "]}\n");
+    fclose(f);
+
+    K3Cfg c; tiny_cfg(&c);
+    K3Trunk tr;
+    const int rc = k3_trunk_open(&tr, sub, &c, 1000000, 2);
+    ok("bad manifest rejected", rc != 0, "rc=%d (want nonzero)", rc);
+    k3_trunk_close(&tr);   /* must be a safe no-op: k3_trunk_open already tore tr down */
+}
+
 static void t_formats(void)
 {
     K3Cfg c; int fa[4]; bcfg(&c, fa);
@@ -558,6 +593,9 @@ int main(int argc, char **argv)
 
     /* ---- 5: weight formats in a packed run ---- */
     t_formats();
+
+    /* ---- 6: a malformed manifest must fail cleanly, not crash or leak ---- */
+    t_bad_manifest(dir);
 
     /* ---- 4: io_uring and pread must agree ---- */
     {
