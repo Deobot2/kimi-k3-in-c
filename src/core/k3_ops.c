@@ -31,6 +31,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
  * scratch without changing a published signature. They are hundreds of bytes to a few
@@ -692,7 +696,14 @@ size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span)
  * need an accumulator array and a reduction whose order changes with the thread count.
  *
  * The stride is unfriendly -- consecutive rows are `in` elements apart -- but the whole
- * of W_UK[h] is 128 KB at the released dimensions and stays in L2 across the sweep. */
+ * of W_UK[h] is 128 KB at the released dimensions and stays in L2 across the sweep.
+ *
+ * The bf16 branch (the default trunk format) has an AVX2 path: four columns at a time,
+ * one accumulator lane each, matching the scalar reduction order exactly (see the
+ * comment at the AVX2 block below). The MXFP4 and int8 branches stay scalar -- a
+ * quantised trunk is not the bit-identity contract's problem to begin with (see
+ * K3_WMX4's comment in k3.h), so vectorising them buys speed without buying back a
+ * guarantee anything here depends on. */
 void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int rows)
 {
     if (wdt == K3_WBF16) {
@@ -700,11 +711,38 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++)
-                acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
-            y[j] = (float)acc;
+        for (int j = 0; j < in; j += 4) {
+#if defined(__AVX2__)
+            /* Four columns share one AVX2 lane apiece. Row r contributes w16[r*in+j
+             * .. j+3], four CONSECUTIVE bf16 values (columns are the fast-varying
+             * index within a row), so this is a contiguous load, not a gather. Each
+             * lane then accumulates over r in exactly the order the scalar loop
+             * below does, mul-then-add with no fma, so it is bit-identical rather
+             * than merely close (t_matmul_tr_bf16 in test_ops.c checks it). */
+            if (j + 4 <= in) {
+                __m256d acc = _mm256_setzero_pd();
+                for (int r = 0; r < rows; r++) {
+                    const __m128i h = _mm_loadl_epi64(
+                        (const __m128i *)(w16 + (size_t)r * in + j));
+                    const __m256d wv = _mm256_cvtps_pd(_mm_castsi128_ps(
+                        _mm_slli_epi32(_mm_cvtepu16_epi32(h), 16)));
+                    const __m256d xv = _mm256_set1_pd((double)x[r]);
+                    acc = _mm256_add_pd(acc, _mm256_mul_pd(wv, xv));
+                }
+                double a[4];
+                _mm256_storeu_pd(a, acc);
+                y[j] = (float)a[0]; y[j + 1] = (float)a[1];
+                y[j + 2] = (float)a[2]; y[j + 3] = (float)a[3];
+                continue;
+            }
+#endif
+            const int jend = (j + 4 < in) ? j + 4 : in;
+            for (int jj = j; jj < jend; jj++) {
+                double acc = 0.0;
+                for (int r = 0; r < rows; r++)
+                    acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + jj]);
+                y[jj] = (float)acc;
+            }
         }
     } else if (wdt == K3_WMX4) {
         /* A quantised trunk. Column j of row r is the nibble at byte j/2 of that row,
@@ -1457,10 +1495,6 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
 /* ---------------------------------------------------------------- MXFP4 ---- */
 /* K3_E2M1 lives near the top of this file: k3_matmul_tr needs it too, for the
  * transposed sweep over a quantised trunk, and that is defined well before here. */
-
-#if defined(__AVX2__)
-#include <immintrin.h>
-#endif
 
 /* y[out] = W[out][in] . x[in], with W stored as bf16 and widened on read.
  *

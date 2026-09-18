@@ -1012,6 +1012,52 @@ static void t_matmul_bf16(void)
     free(Wb); free(Wf); free(x); free(ya); free(yb);
 }
 
+/* k3_matmul_tr's K3_WBF16 branch has an AVX2 path (four columns per vector, one
+ * accumulator lane each) that must reproduce its own scalar reduction exactly, not
+ * approximately -- same argument as t_matmul_bf16 above, applied to the transposed
+ * kernel instead. Checked against k3_matmul_tr's own K3_WF32 branch on the identical
+ * bf16-representable bytes, so a divergence can only be the new AVX2 code, not a
+ * difference between two independently-written kernels.
+ *
+ * `in` deliberately not a multiple of 4, so the AVX2 block's tail path (the plain
+ * scalar loop for the last 1-3 columns) is exercised alongside the vectorised one. */
+static void t_matmul_tr_bf16(void)
+{
+    const int in = 43, rows = 37;
+    uint16_t *Wb = (uint16_t *)malloc((size_t)in * rows * sizeof(uint16_t));
+    float    *Wf = (float *)malloc((size_t)in * rows * sizeof(float));
+    float    *x  = (float *)malloc((size_t)rows * sizeof(float));
+    float    *ya = (float *)malloc((size_t)in * sizeof(float));
+    float    *yb = (float *)malloc((size_t)in * sizeof(float));
+    if (!Wb || !Wf || !x || !ya || !yb) { printf("  FAIL  matmul_tr_bf16 (alloc)\n"); g_fail++; return; }
+
+    unsigned s = 0xFACADEu;
+    for (size_t i = 0; i < (size_t)in * rows; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        uint16_t h = (uint16_t)(s >> 8);
+        if (((h >> 7) & 0xFF) == 0xFF) h &= 0x7F7Fu;   /* skip NaN/Inf exponent */
+        Wb[i] = h;
+        Wf[i] = k3_bf16f(h);
+    }
+    for (int i = 0; i < rows; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        x[i] = (float)(s >> 8) / 8388608.0f - 1.0f;
+    }
+
+    k3_matmul_tr(ya, x, Wf, K3_WF32, in, rows);
+    k3_matmul_tr(yb, x, Wb, K3_WBF16, in, rows);
+
+    int bad = 0;
+    for (int j = 0; j < in; j++) {
+        union { float f; uint32_t u; } a, b;
+        a.f = ya[j]; b.f = yb[j];
+        if (a.u != b.u) bad++;
+    }
+    if (bad) { printf("  FAIL  matmul_tr_bf16 %d/%d columns differ from the fp32 path\n", bad, in); g_fail++; }
+    else     { printf("  PASS  matmul_tr_bf16 n=%d    bit-identical to k3_matmul_tr's fp32 path\n", in); g_pass++; }
+    free(Wb); free(Wf); free(x); free(ya); free(yb);
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -1049,6 +1095,7 @@ int main(int argc, char **argv)
     t_moe(dir);
     t_mxfp4(dir);
     t_matmul_bf16();
+    t_matmul_tr_bf16();
     t_kda_layer(dir, "kda_layer1");
     t_kda_layer(dir, "kda_layer8");
     t_layer(dir, "layer_kda");
