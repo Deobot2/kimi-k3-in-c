@@ -27,6 +27,7 @@ usage: sim_cache.py expert_trace.bin [--expert-bytes 17547264] [--disk-mbs 1234]
 from __future__ import annotations
 
 import argparse
+import heapq
 import sys
 from collections import Counter, OrderedDict, deque
 
@@ -53,7 +54,27 @@ def lru(trace, cap):
 
 def belady(trace, cap):
     """Optimal: evict whatever is needed furthest in the future. Needs the whole trace,
-    which is exactly why no online cache can implement it."""
+    which is exactly why no online cache can implement it.
+
+    The victim is the max of `resident` by next-use index, found with a lazily-deleted
+    max-heap (negated for heapq, which is min-only) instead of a linear scan. A scan
+    re-examines up to `cap` entries on every one of the n misses that hits a full cache --
+    O(n*cap) total, and cap reaches ~83,000 slots at the 1.45 TB row in the sweep in
+    main() below. The heap does the same work in O(log cap) amortized per push/pop, so
+    the whole trace is O(n log cap).
+
+    CORRECTNESS ARGUMENT, not just performance: swapping the tie-break behaviour (the
+    scan picks the first-inserted maximum; the heap picks whichever equal-priority entry
+    sorts first) cannot change the hit COUNT this function returns. Two different
+    resident keys can only tie on next-use index if both equal the sentinel `n` --
+    "never requested again" -- because for any finite index j, trace[j] names exactly one
+    key, so at most one resident key can have its next use land there. An item that is
+    never used again is equally useless to evict regardless of which one of several such
+    items is chosen, since neither will ever produce a future hit either way; picking any
+    of them is a version of the same optimal decision Belady's theorem already commits
+    to. So the two implementations can disagree on WHICH ties they break without
+    disagreeing on the hits total, which is the only thing this function returns.
+    """
     n = len(trace)
     nxt = [n] * n
     last = {}
@@ -63,19 +84,28 @@ def belady(trace, cap):
         last[k] = i
 
     resident = {}                    # key -> next use index
+    heap = []                        # (-next_use, key); may hold stale entries
     hits = 0
     for i, k in enumerate(trace):
         if k in resident:
             hits += 1
             resident[k] = nxt[i]
+            heapq.heappush(heap, (-nxt[i], k))
             continue
         if len(resident) >= cap:
-            victim = max(resident, key=resident.get)
-            if resident[victim] < nxt[i]:
+            # Drop entries the heap top no longer agrees with resident about -- a key
+            # hit again since it was pushed has a newer, still-live entry elsewhere in
+            # the heap, so discarding the stale one loses no information.
+            while heap and resident.get(heap[0][1]) != -heap[0][0]:
+                heapq.heappop(heap)
+            neg_next, victim = heap[0]
+            if -neg_next < nxt[i]:
                 # Everything resident is needed sooner than this one; skip caching it.
                 continue
+            heapq.heappop(heap)
             del resident[victim]
         resident[k] = nxt[i]
+        heapq.heappush(heap, (-nxt[i], k))
     return hits
 
 
