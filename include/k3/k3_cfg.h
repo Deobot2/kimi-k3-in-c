@@ -267,9 +267,13 @@ static inline int k3_cfg_load_file(K3Cfg *c, int *fa, int fa_max, const char *pa
     fclose(f);
     txt[got] = 0;
 
+    /* json_parse copies every string it hands back into its own allocation
+     * (j_dup in third_party/json.h); the parsed tree keeps no pointer into txt, so
+     * the raw file buffer is safe to free once parsing has returned either way. */
     char *arena = NULL;
     jval *root = json_parse(txt, &arena);
-    if (!root) { fprintf(stderr, "%s: not valid JSON\n", path); free(txt); return 0; }
+    free(txt);
+    if (!root) { fprintf(stderr, "%s: not valid JSON\n", path); return 0; }
     return k3_cfg_load(c, fa, fa_max, root, path);
 }
 
