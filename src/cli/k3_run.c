@@ -600,7 +600,9 @@ static void usage(FILE *f)
 "                        computed on, the rest are reads in flight. A third slot lets\n"
 "                        the reader run a layer further ahead and costs one more slot\n"
 "                        of RAM; the budget still wins if it does not fit\n"
-"  --cache-gb X          routed-expert cache budget\n"
+"  --cache-gb X          routed-expert cache budget. Ignored under auto budgeting\n"
+"                        (--trunk-gb auto / --preset auto), which computes trunk and\n"
+"                        cache jointly from available RAM\n"
 "\n"
 "generation:\n"
 "  --gen N               tokens to generate (default 8)\n"
@@ -914,6 +916,7 @@ int main(int argc, char **argv)
     int gen = 8, want_layers = -1;
     double cache_gb = 64.0, trunk_gb = 16.0;
     int budget_auto = 0;
+    int cache_gb_explicit = 0;   /* did the user pass --cache-gb? auto overrides it anyway */
     int spec_n = 0;
     int tf_check = 0, want_ppl = 0, gen_set = 0;
     const char *ppl_file = NULL, *ppl_dump = NULL, *calib_dump = NULL;
@@ -931,7 +934,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) { gen = atoi(argv[++i]); gen_set = 1; }
-        else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) {
+            cache_gb = atof(argv[++i]); cache_gb_explicit = 1;
+        }
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) want_layers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
         else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
@@ -1243,6 +1248,9 @@ int main(int argc, char **argv)
      *   and the difference belongs in the trunk. Auto now gives the cache either the
      *   minimum or at least a whole working set, and never a useless amount in between. */
     if (budget_auto) {
+        if (cache_gb_explicit)
+            fprintf(stderr, "note: --cache-gb %.1f ignored -- auto budgeting computes both "
+                            "trunk and cache from available RAM jointly\n", cache_gb);
         const double avail = mem_available_bytes();
         if (avail <= 0.0) {
             fprintf(stderr, "--preset auto needs /proc/meminfo; pass explicit "
