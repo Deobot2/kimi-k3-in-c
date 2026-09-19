@@ -18,11 +18,12 @@ true int8 container is 56.7 GB, which fits the 64-110 GB band.
 
 Three parts.
 
-1. **Format.** `tools/pack_trunk.py --int8`: for every 2D bf16 trunk tensor, per-row symmetric
-   absmax int8 (or per-group, group 128, if per-row quality is short). Store scales INLINE,
-   one fp32 per row prepended to that row's int8 bytes, so a weight matrix stays a single
-   tagged pointer and the kernel derives the scale from `W`. This avoids threading a parallel
-   scale array through K3MlaW / K3KdaW / K3MoeW / K3LayerW. Manifest carries `dtype: "I8R"`.
+1. **Format.** `tools/int8_trunk.py <bf16_trunk_dir> <int8_out_dir>`, run against an
+   already-packed trunk (`pack_trunk.py`'s own output): for every 2D bf16 trunk tensor,
+   per-row symmetric absmax int8. Store scales INLINE, one fp32 per row prepended to that
+   row's int8 bytes, so a weight matrix stays a single tagged pointer and the kernel
+   derives the scale from `W`. This avoids threading a parallel scale array through
+   K3MlaW / K3KdaW / K3MoeW / K3LayerW. Manifest carries `dtype: "I8R"`.
 
 2. **Kernel.** `k3_matmul_q8(y, x, W, in, out)` where each row is `[f32 scale][int8[in]]`:
    widen int8 to int32, multiply by fp32 activation, accumulate, scale once at the end. It

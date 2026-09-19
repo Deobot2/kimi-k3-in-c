@@ -187,7 +187,14 @@ if (k3_expert_drops) {
 ## Thread safety
 
 The kernels are reentrant and parallelise internally with OpenMP. They hold no global
-state except `k3_expert_drops`.
+state except `k3_expert_drops`, plus the calibration sink below.
+
+**Calibration** (`k3_calib_begin`/`k3_calib_layer`/`k3_calib_observe`/`k3_calib_write`/
+`k3_calib_end`) is backed by file-scope globals, not per-instance state: `k3_calib_layer`
+sets which layer subsequent `k3_calib_observe` calls are attributed to, and every kernel
+that calls `k3_calib_observe` reads that same global. It is for one calibration run over
+one token stream at a time, from one thread; it is not reentrant and not safe to drive
+from two inference loops at once, same as the cache and trunk reader below.
 
 The safetensors index is **not** thread-safe. One inference at a time per instance.
 
