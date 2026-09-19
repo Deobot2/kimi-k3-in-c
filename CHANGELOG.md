@@ -129,6 +129,15 @@ not needing the bytes at all.
   went over what the walk owed. The aggregate byte total could say a run went over and
   never which layers; two explanations for the 13.7% were argued from the pinned set's
   shape before this existed, and both were wrong.
+- `k3_st_open`'s `.safetensors` directory scan never checked `realloc`/`malloc` before
+  writing through the result, unlike every other allocation in the file — an OOM here
+  turned into a NULL-pointer write inside `snprintf` instead of the loud, unwinding
+  failure this codebase uses everywhere else.
+- `k3_cfg_load_file` leaked the raw config-file buffer on every successful parse.
+  `json_parse` copies every string it returns into its own allocation, so the buffer is
+  safe to free once parsing returns; the stale reasoning was conflating it with the
+  parsed tree's own arena, which is deliberately kept for the process lifetime.
+- Removed an unreachable `if (0)` block left over from a `k3_cache_init` refactor.
 
 ## [1.0.0] - 2026-08-07
 
