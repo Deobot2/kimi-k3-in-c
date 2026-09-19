@@ -138,6 +138,21 @@ not needing the bytes at all.
   safe to free once parsing returns; the stale reasoning was conflating it with the
   parsed tree's own arena, which is deliberately kept for the process lifetime.
 - Removed an unreachable `if (0)` block left over from a `k3_cache_init` refactor.
+- `--trunk-gb auto` / `--preset auto` silently discarded an explicit `--cache-gb`, unlike
+  a named preset, whose explicit-flag-after-it-wins convention (documented next to that
+  branch) auto quietly did not follow. It now warns when this happens; the help text
+  says so too. The auto budgeting math is unchanged.
+- `pack_trunk.py`'s docstring cited stale int4/int8 quantisation-error numbers (12% /
+  0.54%) left over from an earlier measurement; every other citation of the same result
+  says 17.4% / 0.96% (`docs/data/trunk-quantisation.txt`).
+- `docs/API.md`'s Thread Safety section omitted the calibration sink's file-scope
+  globals from its "no global state except `k3_expert_drops`" claim, and
+  `docs/notes/int8-draft-container.md` described a `pack_trunk.py --int8` flag that was
+  never built; the shipped tool is `tools/int8_trunk.py`, as the same note's own later
+  section already said.
+- `k3_cfg_load`/`k3_cfg_load_file` return 1 on success, 0 on failure — the inverse of
+  every other loader in this codebase. Every in-tree caller already gets it right, but
+  the header now says so explicitly rather than leaving a new integrator to guess.
 
 ## [1.0.0] - 2026-08-07
 
