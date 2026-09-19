@@ -106,7 +106,13 @@ static inline int k3cfg_b(K3CfgSrc *s, const char *primary, const char *alias, i
 
 /* ------------------------------------------------------------------ load ---- */
 /* fa receives the ONE-BASED full-attention (MLA) layer list, as both config shapes
- * store it; k3_is_mla() compares against layer+1. Returns 1 on success.
+ * store it; k3_is_mla() compares against layer+1.
+ *
+ * Returns 1 on success, 0 on failure -- the INVERSE of every other loader's "0 on
+ * success" in this codebase (k3_st_open, k3_trunk_open, k3_bind_layer, k3_cache_init:
+ * see their own headers). A caller who pattern-matches the rest of the API and writes
+ * `if (k3_cfg_load(...)) return 1;` has it backwards; the idiom this file's own callers
+ * use is `if (!k3_cfg_load(...)) return 1;`.
  *
  * On failure it prints every missing key and returns 0. Callers must not proceed:
  * a half-filled K3Cfg is exactly the silent-wrong-model case this file exists to stop.
@@ -247,9 +253,10 @@ static inline int k3_cfg_load(K3Cfg *c, int *fa, int fa_max, jval *root, const c
     return 1;
 }
 
-/* Convenience: read and parse a config file, then load it. The returned arena is left
- * allocated because K3Cfg does not copy the strings it does not own; callers keep it
- * for the process lifetime, which every caller here does. */
+/* Convenience: read and parse a config file, then load it. Same return convention as
+ * k3_cfg_load above: 1 on success, 0 on failure. The returned arena is left allocated
+ * because K3Cfg does not copy the strings it does not own; callers keep it for the
+ * process lifetime, which every caller here does. */
 static inline int k3_cfg_load_file(K3Cfg *c, int *fa, int fa_max, const char *path)
 {
     FILE *f = fopen(path, "rb");
