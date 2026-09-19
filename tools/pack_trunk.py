@@ -14,8 +14,10 @@ WHY
     the MoE experts are MXFP4 with quantisation-aware training, "while all non-expert
     components (attention projections, latent MoE projections, shared experts, and MoE
     routers) remain in higher precision". That list is exactly this trunk. Moonshot
-    deliberately did not quantise it, and post-hoc 4-bit measures 12% output error on
-    real K3 weights against 0.54% for int8. So the trunk is copied here byte for byte.
+    deliberately did not quantise it, and this engine's own measurement on 31 real
+    attention tensors put post-hoc int4 at 17.4% mean relative weight error against
+    0.96% for int8 (docs/data/trunk-quantisation.txt) -- an ~18x gap. So the trunk is
+    copied here byte for byte.
 
 WHAT MAKES THIS CHEAP
     Every layer's trunk tensors form ONE contiguous run inside its shard, verified for
