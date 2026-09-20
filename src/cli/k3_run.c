@@ -1018,6 +1018,12 @@ int main(int argc, char **argv)
                "model; it is a partial stack for testing the machinery.\n\n",
                want_layers, c.n_layers);
     }
+    /* The layer count actually bound, everywhere memory is sized against it: with
+     * --layers < c.n_layers this is a partial stack, and the recurrent state and every
+     * other per-layer allocation below follows suit. Computed once, here, so the
+     * auto-budget estimate and the memory-plan report cannot size the same field
+     * against two different layer counts. */
+    const int NL = (want_layers > 0 && want_layers < c.n_layers) ? want_layers : c.n_layers;
 
     /* ---- prompt ----
      * Three entry points, one representation. --ids is the reproducible channel every
@@ -1258,7 +1264,7 @@ int main(int argc, char **argv)
          * memory of one checkpoint. */
         const double w_model = 2.0 * (double)c.vocab * E64 * 2 + 3.0 * E64 * 4;
         const double w_state = (double)((size_t)Pp * c.kda_head_dim
-                             + (size_t)3 * Pp * (c.conv_k - 1)) * c.n_layers * 4;
+                             + (size_t)3 * Pp * (c.conv_k - 1)) * NL * 4;
         const double w_buf = ((double)Tm * E64 + (double)Tm * mb_ * E64
                             + (double)k3_layer_scratch(&c, Tm) + (double)c.vocab) * 4;
         int n_mla_ = 0, n_moe_ = 0;
@@ -1380,7 +1386,6 @@ int main(int argc, char **argv)
 
     /* ---- how much will this take? Report BEFORE allocating, so a box that cannot
      * hold it fails with a number rather than an OOM kill. ---- */
-    const int NL = (want_layers > 0 && want_layers < c.n_layers) ? want_layers : c.n_layers;
     int64_t total = 0; int missing = 0;
     for (int L = 0; L < NL; L++) {
         const int64_t n = k3_bind_layer_bytes(&st, &c, L);
