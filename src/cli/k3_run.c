@@ -653,6 +653,10 @@ static void usage(FILE *f)
 "                        position-for-position between two runs this gives the TOP-1\n"
 "                        AGREEMENT RATE against a baseline model, which does not\n"
 "                        average away the way a perplexity ratio does\n"
+"  --tf-check            teacher-forced agreement over the --ids sequence in one sweep:\n"
+"                        at each position, does the argmax after 0..i match the id the\n"
+"                        sequence actually continues with. The acceptance rate a draft\n"
+"                        model would see under batched greedy verification\n"
 "  --config PATH         model config; defaults to <model_dir>/config.json\n"
 "  --layers N            bind only the first N layers (partial shard sets)\n"
 "  --dump-logits PATH    write float32 logits for the first step\n"
@@ -977,12 +981,10 @@ int main(int argc, char **argv)
             cache_gb = p->cache_gb;
             preset_name = p->name;
         }
-        else if (!strcmp(argv[i], "--list-presets")) { k3_preset_list(stdout); return 0; }
-        else if (!strcmp(argv[i], "--version")) {
-            printf("k3 %s\n", K3_VERSION);
-            return 0;
-        }
-        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
+        /* --help/-h, --version and --list-presets are NOT re-checked here: the scan at
+         * the top of main() already walks every argv entry, including everything this
+         * loop sees, and returns before this loop starts if any of the three appear
+         * anywhere on the command line. */
         else { fprintf(stderr, "unknown option %s\n\n", argv[i]); usage(stderr); return 2; }
     }
     {
@@ -1600,9 +1602,11 @@ int main(int argc, char **argv)
     /* ---- generate ----
      * Heap and sized from the ACTUAL request, not from the ceiling. These were
      * `int seq[K3_MAX_PROMPT + K3_MAX_GEN]` and `int outtok[K3_MAX_GEN]` on the stack,
-     * which is why the ceiling had to stay small enough to be a stack array. */
-    int *seq = (int *)malloc((size_t)(prior + np + gen + 8) * sizeof(int));
-    int *outtok = (int *)malloc((size_t)(gen + 8) * sizeof(int));
+     * which is why the ceiling had to stay small enough to be a stack array.
+     * The +K3_SPEC_MAX slack is for --spec: a single speculative step can emit up to
+     * K3_SPEC_MAX extra tokens before the T < Tmax bound is rechecked. */
+    int *seq = (int *)malloc((size_t)(prior + np + gen + K3_SPEC_MAX) * sizeof(int));
+    int *outtok = (int *)malloc((size_t)(gen + K3_SPEC_MAX) * sizeof(int));
     if (!seq || !outtok) { fprintf(stderr, "OOM allocating sequence buffers\n"); return 1; }
     /* On a resume the saved history occupies the front of the sequence and the prompt
      * given now is its continuation; the restore below fills seq[0..prior). */
