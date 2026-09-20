@@ -92,6 +92,16 @@ not needing the bytes at all.
 - Saved state records the KV layout and window geometry and refuses a mismatch: the two
   caches hold different tensors of the same float count, so restoring one as the other
   would be fluent and wrong. State version 1 → 2.
+- **`k3_kda_step`'s `u` accumulator is caller-owned scratch, not a `calloc`/`free` pair.**
+  This is the KDA recurrence's innermost step, called once per head per token — 96 heads
+  over a full context is tens of millions of calls, all on the serial per-head path
+  already noted above as a majority of non-matmul wall time at high core counts.
+  `k3_kda_layer` carves the buffer out of the same per-head work row it already uses for
+  the pre-scaled query, so no new allocation appears at that level either. A
+  single-threaded microbenchmark of the function alone (`dk=dv=128`, old/new alternated
+  across ten rounds to cancel drift) measured 5.55-5.70 µs/call before against
+  5.30-5.33 µs/call after: a consistent ~6.5%. Every `kda_recur`/`kda_layer` fixture in
+  `test_ops` still matches to the bit, since the arithmetic and its order are unchanged.
 
 ### Fixed
 

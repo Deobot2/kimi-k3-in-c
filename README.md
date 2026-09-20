@@ -1570,7 +1570,8 @@ per channel and per token.
 
 ```c
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
-                 const float *v, const float *alpha, float beta, int dk, int dv)
+                 const float *v, const float *alpha, float beta, int dk, int dv,
+                 float *u)
 {
     /* 1. decay: scale ROW i of S by alpha[i], per key channel */
     for (int i = 0; i < dk; i++) {
@@ -1579,9 +1580,12 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         for (int j = 0; j < dv; j++) row[j] *= a;
     }
 
-    /* 2. read the state along k: u = S^T k */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    /* 2. read the state along k: u = S^T k. u is CALLER-OWNED scratch, not
+     * allocated here: this runs once per head per token, tens of millions of
+     * times over a full context, and a heap allocation on every call measured
+     * about 6.5% of this function's own time -- pure overhead paid on top of
+     * arithmetic that needs none. */
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -1605,14 +1609,20 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
 }
 ```
 
-That `calloc` happens **after** step one has already scaled the state, so an early return
-on allocation failure would leave the recurrent matrix permanently decayed but never
-updated. Every subsequent token would then be computed from a state that is quietly wrong,
-with nothing to indicate it. That is why the failure path aborts instead of returning.
+`u` used to be a `calloc` local, freed at the end of the function. It was one of the
+few genuinely hot allocations in the engine: 96 heads times the context length, every
+one of them on the serial recurrence path the note above already singles out as a
+majority of non-matmul wall time at high core counts. Caller-owned scratch removes it
+without changing the arithmetic at all -- every KDA fixture still matches to the bit --
+and a single-threaded microbenchmark of this function alone (`dk=dv=128`, alternating
+old/new to cancel drift) measured 5.55-5.70 &micro;s/call before against 5.30-5.33
+&micro;s/call after, a consistent ~6.5%. The state's decay still happens **before** `u`
+is zeroed and filled, so the hazard that used to justify aborting rather than returning
+on a failed `calloc` here is gone along with the allocation: what moved is only where the
+dv floats for `u` come from, never the order the four steps run in.
 
 ![Nine ordered steps, and the numbering is not decoration](docs/images/kda-nine-steps.png)
 
@@ -1627,7 +1637,8 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
     float *v  = k + (size_t)T * P;       float *z  = v + (size_t)T * P;
     float *al = z + (size_t)T * P;       float *bt = al + (size_t)T * P;
     float *o  = bt + (size_t)T * H;      float *gb = o + (size_t)T * P;
-    float *wr = gb + P;                  float *fa = wr + P;
+    float *wr = gb + P;                  float *wu = wr + P;
+    float *fa = wu + P;
 
     /* 1. projections */
     for (int t = 0; t < T; t++) {
@@ -1674,7 +1685,7 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
             const size_t off = (size_t)t * P + (size_t)h * D;
             for (int i = 0; i < D; i++) wr[i] = q[off + i] * qscale;
             k3_kda_step(S + (size_t)h * D * D, o + off, wr, k + off, v + off,
-                        al + off, bt[(size_t)t * H + h], D, D);
+                        al + off, bt[(size_t)t * H + h], D, D, wu);
         }
 
     /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection */
