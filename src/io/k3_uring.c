@@ -157,8 +157,18 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
     if (!u || nbytes <= 0) return 0;
 
     const int64_t nchunk = (nbytes + K3_URING_CHUNK - 1) / K3_URING_CHUNK;
-    Chunk *ck = (Chunk *)malloc((size_t)nchunk * sizeof(Chunk));
-    if (!ck) return -1;
+    /* One allocation, not two: this runs once per trunk-layer read, up to ~93 times a
+     * token, from the main thread AND the trunk reader thread, which can call it at the
+     * same time -- exactly the window this file exists to keep the device busy through.
+     * Two mallocs per call is two chances to serialise on the same allocator lock at the
+     * moment concurrency matters most; one call halves that regardless of what glibc
+     * does internally. `ck` and the `again` stack are unrelated in type, so they are
+     * carved out of one block by hand rather than declared as a struct of two arrays. */
+    unsigned char *blk = (unsigned char *)malloc((size_t)nchunk * sizeof(Chunk)
+                                                + (size_t)nchunk * sizeof(int64_t));
+    if (!blk) return -1;
+    Chunk   *ck    = (Chunk *)blk;
+    int64_t *again = (int64_t *)(blk + (size_t)nchunk * sizeof(Chunk));
     for (int64_t i = 0; i < nchunk; i++) {
         const int64_t a = i * (int64_t)K3_URING_CHUNK;
         ck[i].off = off + a;
@@ -172,9 +182,7 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
     int64_t got = 0;
     int     failed = 0;
     /* Chunks needing resubmission after a short read, as a simple stack. */
-    int64_t *again = (int64_t *)malloc((size_t)nchunk * sizeof(int64_t));
     int      nagain = 0;
-    if (!again) { free(ck); return -1; }
 
     while (!failed && (next < nchunk || nagain > 0 || posted > 0)) {
         /* ---- fill the submission queue ---- */
@@ -262,7 +270,7 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
         __atomic_store_n(u->cq_head, chead, __ATOMIC_RELEASE);
     }
 
-    free(ck); free(again);
+    free(blk);
     if (failed) return -1;
     return got;
 }
