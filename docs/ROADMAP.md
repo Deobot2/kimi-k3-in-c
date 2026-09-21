@@ -59,15 +59,19 @@ than assuming the pool has the machine to itself.
 
 ## 4. SIMD in the KDA recurrence
 
-The bf16 trunk matmul and the MXFP4 expert matmul already have hand-written AVX2 paths
-(`src/core/k3_ops.c`), each written to reproduce the scalar reduction order exactly. The
-KDA recurrence does not: it is still plain scalar C, and it is the largest remaining
-un-vectorised kernel on the non-I/O path.
+**`k3_kda_step` is now vectorised** (AVX2, `src/core/k3_ops.c`), ~28% faster per call at
+the released 96×128 shape and bit-identical to the scalar path by construction: the
+accumulation axis (`i`, summed into `u` and `o`) stays the sequential outer loop in both
+paths, only the inner sweep over `dv` is widened to 8 lanes, so no reduction is
+reordered. What remains:
 
-`k3_matmul_tr`, added for the latent KV cache's query absorption, is the second: it is a
-strided column sweep with a double accumulator per output and no vector path at all. It
+`k3_matmul_tr`, added for the latent KV cache's query absorption, is still scalar: it is
+a strided column sweep with a double accumulator per output and no vector path at all. It
 runs 96 times per MLA layer per token, so it is small next to the recurrence but it is
-new and it is scalar.
+new and it is scalar. Note that its current loop nest (column-outer, row-inner) reads `W`
+with stride `in` elements — vectorising it well likely means restructuring to row-outer,
+column-inner (contiguous loads, same accumulation order per output column) rather than
+just widening the existing nest.
 
 ## 5. Sampling
 

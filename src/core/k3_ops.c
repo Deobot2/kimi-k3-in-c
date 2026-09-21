@@ -31,6 +31,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
  * scratch without changing a published signature. They are hundreds of bytes to a few
@@ -279,6 +283,22 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 }
 
 /* -------------------------------------------------------- KDA recurrence ---- */
+/* Every sub-loop below is vectorised over j (the dv-wide column), never over i. That
+ * choice is what keeps the AVX2 path BIT-IDENTICAL to the scalar one, not merely close:
+ *
+ *   - Steps 1 and 3 touch each row once and each element of that row independently, so
+ *     there is no reduction to preserve and no summation order to get wrong.
+ *   - Steps 2 and 4 each accumulate into an output indexed by j, summed over i. i stays
+ *     the sequential outer loop in BOTH paths; only the inner sweep over j is widened
+ *     to 8 lanes. u[j]/o[j] therefore receive the exact same additions in the exact
+ *     same order (i = 0, 1, 2, ...) whether or not AVX2 is compiled in -- vectorising
+ *     across j changes which elements are computed together, never the order in which
+ *     any one of them accumulates.
+ *
+ * Every lane uses separate mul then add (never _mm256_fmadd_ps): the scalar loops below
+ * write `u[j] += ki * row[j]`, not fma(), so -ffp-contract=off leaves the scalar build
+ * rounding the product and the sum separately, and the vector build must round the same
+ * way to agree with it to the bit. */
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
@@ -287,7 +307,13 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     for (int i = 0; i < dk; i++) {
         float *row = S + (size_t)i * dv;
         const float a = alpha[i];
-        for (int j = 0; j < dv; j++) row[j] *= a;
+        int j = 0;
+#if defined(__AVX2__)
+        const __m256 va = _mm256_set1_ps(a);
+        for (; j + 7 < dv; j += 8)
+            _mm256_storeu_ps(row + j, _mm256_mul_ps(_mm256_loadu_ps(row + j), va));
+#endif
+        for (; j < dv; j++) row[j] *= a;
     }
 
     /* 2. read the state along k:  u = S^T k */
@@ -300,16 +326,39 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float ki = k[i];
         if (ki == 0.0f) continue;
         const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) u[j] += ki * row[j];
+        int j = 0;
+#if defined(__AVX2__)
+        const __m256 vk = _mm256_set1_ps(ki);
+        for (; j + 7 < dv; j += 8) {
+            __m256 vu = _mm256_loadu_ps(u + j);
+            __m256 vr = _mm256_loadu_ps(row + j);
+            _mm256_storeu_ps(u + j, _mm256_add_ps(vu, _mm256_mul_ps(vk, vr)));
+        }
+#endif
+        for (; j < dv; j++) u[j] += ki * row[j];
     }
 
     /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
-     *    it a DELTA rule rather than plain accumulation. */
+     *    it a DELTA rule rather than plain accumulation. `ki * beta` is hoisted out of
+     *    the j loop -- it is the same float value on every iteration, so computing it
+     *    once is not a change of arithmetic, just of when the one multiply happens. */
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
         float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
+        const float kib = ki * beta;
+        int j = 0;
+#if defined(__AVX2__)
+        const __m256 vkib = _mm256_set1_ps(kib);
+        for (; j + 7 < dv; j += 8) {
+            __m256 vv = _mm256_loadu_ps(v + j);
+            __m256 vu = _mm256_loadu_ps(u + j);
+            __m256 vr = _mm256_loadu_ps(row + j);
+            __m256 diff = _mm256_sub_ps(vv, vu);
+            _mm256_storeu_ps(row + j, _mm256_add_ps(vr, _mm256_mul_ps(vkib, diff)));
+        }
+#endif
+        for (; j < dv; j++) row[j] += kib * (v[j] - u[j]);
     }
 
     /* 4. output from the ALREADY UPDATED state: o = S^T q */
@@ -318,7 +367,16 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float qi = q[i];
         if (qi == 0.0f) continue;
         const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) o[j] += qi * row[j];
+        int j = 0;
+#if defined(__AVX2__)
+        const __m256 vq = _mm256_set1_ps(qi);
+        for (; j + 7 < dv; j += 8) {
+            __m256 vo = _mm256_loadu_ps(o + j);
+            __m256 vr = _mm256_loadu_ps(row + j);
+            _mm256_storeu_ps(o + j, _mm256_add_ps(vo, _mm256_mul_ps(vq, vr)));
+        }
+#endif
+        for (; j < dv; j++) o[j] += qi * row[j];
     }
     free(u);
 }
@@ -1456,11 +1514,9 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
 
 /* ---------------------------------------------------------------- MXFP4 ---- */
 /* K3_E2M1 lives near the top of this file: k3_matmul_tr needs it too, for the
- * transposed sweep over a quantised trunk, and that is defined well before here. */
-
-#if defined(__AVX2__)
-#include <immintrin.h>
-#endif
+ * transposed sweep over a quantised trunk, and that is defined well before here.
+ * <immintrin.h> is included near the top of the file for the same reason: k3_kda_step
+ * needs it well before this point too. */
 
 /* y[out] = W[out][in] . x[in], with W stored as bf16 and widened on read.
  *

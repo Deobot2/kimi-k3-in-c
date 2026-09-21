@@ -92,6 +92,18 @@ not needing the bytes at all.
 - Saved state records the KV layout and window geometry and refuses a mismatch: the two
   caches hold different tensors of the same float count, so restoring one as the other
   would be fluent and wrong. State version 1 → 2.
+- **`k3_kda_step` is now hand-vectorised with AVX2**, closing the gap the roadmap called
+  out as the largest un-vectorised kernel on the non-I/O path. Every sub-loop is widened
+  over the `dv` (head_dim) axis, never over the accumulation axis: the channel-wise decay
+  and the delta write touch each element once and independently, so there is nothing to
+  reorder, and the two reductions (`u = S^T k`, `o = S^T q`) keep the accumulation index
+  as the sequential outer loop with only the inner sweep vectorised, so every accumulator
+  receives the same additions in the same order whether or not AVX2 is compiled in — the
+  vector and scalar paths are **bit-identical by construction**, verified with a
+  memcmp harness at non-multiple-of-8 dimensions and forced zero-skip inputs, not merely
+  passing to fixture tolerance. ~28% faster per call at the released 96×128 KDA shape
+  (9.59 µs → 6.87 µs), measured standalone since no head runs alone in the real decode
+  loop.
 
 ### Fixed
 
