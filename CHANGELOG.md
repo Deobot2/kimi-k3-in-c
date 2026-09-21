@@ -104,6 +104,17 @@ not needing the bytes at all.
   passing to fixture tolerance. ~28% faster per call at the released 96×128 KDA shape
   (9.59 µs → 6.87 µs), measured standalone since no head runs alone in the real decode
   loop.
+- **`k3_matmul_tr`'s bf16 and f32 branches are now vectorised**, the other kernel the
+  roadmap flagged as scalar. It stays column-outer (each output column's accumulator
+  still sums over rows in strictly increasing order, so the OpenMP, AVX2 and serial forms
+  agree to the bit for the same reason `k3_matmul` does), but four adjacent columns now
+  share one contiguous row read instead of each doing its own single-element strided
+  sweep through `W`. That turned out to matter more than the SIMD itself: **~4.2x** at
+  the real `W_UK[h]` shape (`in=512, rows=128`, bf16: 55.2 µs → 13.0 µs per call,
+  standalone), because the original access pattern was the actual bottleneck. Verified
+  bit-identical against the scalar path with a memcmp harness (non-multiple-of-4
+  dimensions, both dtype branches, 1 and 8 OpenMP threads). The MXFP4 and int8 branches
+  are unchanged — see docs/ROADMAP.md item 4 for why.
 
 ### Fixed
 

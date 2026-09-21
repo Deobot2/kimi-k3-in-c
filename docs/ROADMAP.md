@@ -65,13 +65,20 @@ accumulation axis (`i`, summed into `u` and `o`) stays the sequential outer loop
 paths, only the inner sweep over `dv` is widened to 8 lanes, so no reduction is
 reordered. What remains:
 
-`k3_matmul_tr`, added for the latent KV cache's query absorption, is still scalar: it is
-a strided column sweep with a double accumulator per output and no vector path at all. It
-runs 96 times per MLA layer per token, so it is small next to the recurrence but it is
-new and it is scalar. Note that its current loop nest (column-outer, row-inner) reads `W`
-with stride `in` elements — vectorising it well likely means restructuring to row-outer,
-column-inner (contiguous loads, same accumulation order per output column) rather than
-just widening the existing nest.
+**`k3_matmul_tr`'s bf16 and f32 branches are now vectorised too**, and the restructuring
+turned out to matter more than the SIMD: each 4-column block now walks `W` row by row
+with one contiguous 128-bit load per row instead of four single-element strided reads,
+column-outer still (bit-identical, same reasoning as above — each column's accumulator
+still sums over rows in strictly increasing order, only four columns do it together).
+Measured standalone at the real `W_UK[h]` shape (`in=512, rows=128`, bf16): **55.2us ->
+13.0us per call, ~4.2x**, bigger than the KDA win because the original strided access
+pattern was the actual bottleneck, not just the missing vector instructions.
+
+The MXFP4 and int8 branches are still scalar — both carry per-element branches (a NaN
+scale check, a nibble select) inside the row loop that the bf16/f32 restructuring didn't
+need to deal with, so vectorising them is a separate piece of work, lower priority since
+neither is the default path (`K3_WMX4` needs `tools/mxfp4_trunk.py` or `awq_trunk.py`;
+`K3_WI8` is draft-model only).
 
 ## 5. Sampling
 
