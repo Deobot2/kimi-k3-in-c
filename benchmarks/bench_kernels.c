@@ -10,6 +10,9 @@
  *   bf16 trunk matmuls   the attention projections, latent down/up, shared experts and
  *                        the dense MLP. Sized from the actual layer shapes.
  *   MXFP4 expert matmuls 16 experts x 3 matrices x 92 layers, in latent space.
+ *   KDA recurrence       one k3_kda_step per KDA layer per head: 69 layers x 96 heads.
+ *   matmul_tr            the latent cache's query absorption: 24 MLA layers x 96 heads,
+ *                        only present with --mla-latent.
  *
  * Reports GFLOP/s and the projected per-token seconds for each, so the two can be
  * compared directly against the measured 10 s compute budget.
@@ -62,6 +65,23 @@ static void fillb(unsigned char *p, size_t n, unsigned s)
     }
 }
 
+/* bf16 has an 8-bit exponent field, so filling it with fillb's raw random bytes gives
+ * every one of the 16 bits an even chance, and exponent == 0xFF (Inf/NaN) then hits
+ * roughly 1 in 256 elements. Summed over the 7168-wide reduction below, at least one
+ * NaN lands in every row with near certainty, and NaN then poisons the whole output --
+ * silently, since a NaN hash still LOOKS like a hash. Generate finite bf16 weights the
+ * same way fillf generates finite fp32 ones, by truncating a bounded finite float
+ * rather than randomising the bit pattern directly. */
+static void fillbf16(uint16_t *p, size_t n, unsigned s)
+{
+    for (size_t i = 0; i < n; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        const float f = ((float)(s >> 8) / 8388608.0f - 1.0f) * 0.05f;
+        uint32_t u; memcpy(&u, &f, sizeof u);
+        p[i] = (uint16_t)(u >> 16);
+    }
+}
+
 int main(void)
 {
     printf("kernel benchmark at REAL Kimi K3 dimensions\n");
@@ -78,7 +98,7 @@ int main(void)
         float *x = (float *)malloc((size_t)in * sizeof(float));
         float *y = (float *)malloc((size_t)out * sizeof(float));
         if (!W || !x || !y) { printf("alloc failed\n"); return 1; }
-        fillb((unsigned char *)W, (size_t)in * out * 2, 12345u);
+        fillbf16(W, (size_t)in * out, 12345u);
         fillf(x, in, 999u);
 
         k3_matmul_bf16(y, x, W, in, out);              /* warm */
@@ -126,6 +146,64 @@ int main(void)
         const double per_tok = dt * 3.0 * 16 * 92;
         printf("             16 experts x 3 mats x 92 layers -> %.2f s/token\n", per_tok);
         free(pk); free(sc); free(x); free(y);
+    }
+
+    /* ---------- KDA recurrence: one k3_kda_step, real 128x128 head shape ---------- */
+    {
+        const int dk = 128, dv = 128;
+        float *S = (float *)malloc((size_t)dk * dv * sizeof(float));
+        float *q = (float *)malloc((size_t)dk * sizeof(float));
+        float *k = (float *)malloc((size_t)dk * sizeof(float));
+        float *v = (float *)malloc((size_t)dv * sizeof(float));
+        float *alpha = (float *)malloc((size_t)dk * sizeof(float));
+        float *o = (float *)malloc((size_t)dv * sizeof(float));
+        if (!S || !q || !k || !v || !alpha || !o) { printf("alloc failed\n"); return 1; }
+        fillf(S, (size_t)dk * dv, 314u);
+        fillf(q, dk, 271u); fillf(k, dk, 828u); fillf(v, dv, 182u);
+        for (int i = 0; i < dk; i++) alpha[i] = 0.9f;
+
+        k3_kda_step(S, o, q, k, v, alpha, 0.37f, dk, dv);       /* warm */
+        const int reps = 20000;
+        const double t0 = now_s();
+        for (int r = 0; r < reps; r++) k3_kda_step(S, o, q, k, v, alpha, 0.37f, dk, dv);
+        const double dt = (now_s() - t0) / reps;
+        /* decay dk*dv + read 2*dk*dv + delta 3*dk*dv + output 2*dk*dv, no ki/qi == 0 */
+        const double gflop = 8.0 * dk * dv / 1e9;
+        printf("\nKDA step     %5d x %-5d  %7.3f us  %8.2f GFLOP/s\n",
+               dv, dk, dt * 1e6, gflop / dt);
+        fnv("kda  ", o, dv);
+
+        /* 69 KDA layers x 96 heads per token during decode. */
+        const double per_tok = dt * 69 * 96;
+        printf("             69 layers x 96 heads -> %.2f ms/token\n", per_tok * 1e3);
+        free(S); free(q); free(k); free(v); free(alpha); free(o);
+    }
+
+    /* ---------- matmul_tr: latent query absorption, real W_UK[h] shape ---------- */
+    {
+        const int in = 512, rows = 128;   /* kv_lora, qk_nope */
+        uint16_t *W = (uint16_t *)malloc((size_t)rows * in * sizeof(uint16_t));
+        float *x = (float *)malloc((size_t)rows * sizeof(float));
+        float *y = (float *)malloc((size_t)in * sizeof(float));
+        if (!W || !x || !y) { printf("alloc failed\n"); return 1; }
+        fillbf16(W, (size_t)rows * in, 65535u);
+        fillf(x, rows, 8080u);
+
+        k3_matmul_tr(y, x, W, K3_WBF16, in, rows);              /* warm */
+        const int reps = 2000;
+        const double t0 = now_s();
+        for (int r = 0; r < reps; r++) k3_matmul_tr(y, x, W, K3_WBF16, in, rows);
+        const double dt = (now_s() - t0) / reps;
+        const double gflop = 2.0 * rows * in / 1e9;
+        printf("\nmatmul_tr    %5d x %-5d  %7.3f us  %8.2f GFLOP/s\n",
+               in, rows, dt * 1e6, gflop / dt);
+        fnv("mtr  ", y, in);
+
+        /* 24 MLA layers x 96 heads per token, only with --mla-latent. */
+        const double per_tok = dt * 24 * 96;
+        printf("             24 layers x 96 heads -> %.2f ms/token (--mla-latent only)\n",
+               per_tok * 1e3);
+        free(W); free(x); free(y);
     }
 
     printf("\nmeasured compute budget at the floor is about 10 s/token; whichever line\n"
