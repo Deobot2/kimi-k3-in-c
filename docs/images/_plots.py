@@ -22,7 +22,7 @@ Chart type is chosen per dataset rather than defaulting to bars:
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle, FancyArrowPatch
+from matplotlib.patches import Rectangle
 import numpy as np
 from pathlib import Path
 
@@ -61,7 +61,7 @@ def lollipop(ax, labels, values, colors, fmt="{:,.0f}", xmax_pad=1.25, unit=""):
     ys = np.arange(len(labels))[::-1]
     ax.hlines(ys, 0, values, color=colors, linewidth=2.2, zorder=2)
     ax.scatter(values, ys, s=110, color=colors, zorder=3)
-    for y, v, c in zip(ys, values, colors):
+    for y, v in zip(ys, values):
         ax.text(v * 1.03, y, (fmt.format(v)) + unit, va="center", fontsize=10.5,
                 color=INK, fontweight="bold")
     ax.set_yticks(ys)
