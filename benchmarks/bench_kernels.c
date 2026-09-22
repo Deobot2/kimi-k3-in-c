@@ -166,6 +166,39 @@ int main(void)
         free(S); free(o); free(q); free(k); free(v); free(alpha);
     }
 
+    /* ---------- k3_matmul_tr: W_UK absorption, kv_lora=512 x qk_nope=128, 96 heads x
+     * 24 MLA layers/token. BF16 is the released trunk's format; F32 is what the
+     * hand-written unit fixtures exercise (K3MlaW is zeroed, and K3_WF32 is 0). */
+    {
+        const int in = 512, rows = 128;
+        uint16_t *Wb = (uint16_t *)malloc((size_t)in * rows * sizeof(uint16_t));
+        float    *Wf = (float *)malloc((size_t)in * rows * sizeof(float));
+        float *x = (float *)malloc((size_t)rows * sizeof(float));
+        float *y = (float *)malloc((size_t)in * sizeof(float));
+        if (!Wb || !Wf || !x || !y) { printf("alloc failed\n"); return 1; }
+        fillb((unsigned char *)Wb, (size_t)in * rows * 2, 2468u);
+        fillf(Wf, (size_t)in * rows, 1357u);
+        fillf(x, rows, 8642u);
+
+        k3_matmul_tr(y, x, Wb, K3_WBF16, in, rows);             /* warm */
+        const int reps = 500;
+        double t0 = now_s();
+        for (int r = 0; r < reps; r++) k3_matmul_tr(y, x, Wb, K3_WBF16, in, rows);
+        double dt = (now_s() - t0) / reps;
+        printf("\nmatmul_tr bf16 %4d x %-4d  %7.3f us/call\n", in, rows, dt * 1e6);
+        fnv("matmul_tr bf16", y, in);
+        printf("             96 heads x 24 MLA layers -> %.3f s/token\n", dt * 96 * 24);
+
+        k3_matmul_tr(y, x, Wf, K3_WF32, in, rows);              /* warm */
+        t0 = now_s();
+        for (int r = 0; r < reps; r++) k3_matmul_tr(y, x, Wf, K3_WF32, in, rows);
+        dt = (now_s() - t0) / reps;
+        printf("matmul_tr f32  %4d x %-4d  %7.3f us/call\n", in, rows, dt * 1e6);
+        fnv("matmul_tr f32 ", y, in);
+        printf("             96 heads x 24 MLA layers -> %.3f s/token\n", dt * 96 * 24);
+        free(Wb); free(Wf); free(x); free(y);
+    }
+
     printf("\nmeasured compute budget at the floor is about 10 s/token; whichever line\n"
            "above dominates it is the one worth vectorising.\n");
     return 0;

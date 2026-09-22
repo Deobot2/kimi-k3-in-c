@@ -740,15 +740,49 @@ size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span)
  * need an accumulator array and a reduction whose order changes with the thread count.
  *
  * The stride is unfriendly -- consecutive rows are `in` elements apart -- but the whole
- * of W_UK[h] is 128 KB at the released dimensions and stays in L2 across the sweep. */
+ * of W_UK[h] is 128 KB at the released dimensions and stays in L2 across the sweep.
+ *
+ * The BF16 and F32 branches below have an AVX2 fast path: 8 CONSECUTIVE columns of one
+ * row are contiguous in memory (that is what "row-major" means), so it batches 8
+ * independent output columns into one vector's lanes rather than touching the unfriendly
+ * row stride at all. Each lane keeps its own running double sum over r in the same
+ * 0..rows-1 order the scalar loop uses, so this is data parallelism across independent
+ * outputs, not a reduction reorder -- the same reasoning k3_kda_step's AVX2 path relies
+ * on. Multiply and add stay separate instructions, matching -ffp-contract=off, so the
+ * vector and scalar-remainder columns are bit-identical. */
 void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int rows)
 {
     if (wdt == K3_WBF16) {
         const uint16_t *w16 = (const uint16_t *)W;
+#if defined(__AVX2__)
+        const int in8 = in & ~7;
 #ifdef _OPENMP
-#       pragma omp parallel for schedule(static) if (in > 64)
+#       pragma omp parallel for schedule(static) if (in8 > 64)
 #endif
-        for (int j = 0; j < in; j++) {
+        for (int j = 0; j < in8; j += 8) {
+            __m256d acc0 = _mm256_setzero_pd(), acc1 = _mm256_setzero_pd();
+            for (int r = 0; r < rows; r++) {
+                const __m128i h = _mm_loadu_si128((const __m128i *)(w16 + (size_t)r * in + j));
+                const __m256 f = _mm256_castsi256_ps(
+                    _mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
+                const __m256d xr = _mm256_set1_pd((double)x[r]);
+                acc0 = _mm256_add_pd(acc0,
+                    _mm256_mul_pd(xr, _mm256_cvtps_pd(_mm256_castps256_ps128(f))));
+                acc1 = _mm256_add_pd(acc1,
+                    _mm256_mul_pd(xr, _mm256_cvtps_pd(_mm256_extractf128_ps(f, 1))));
+            }
+            double out[8];
+            _mm256_storeu_pd(out, acc0);
+            _mm256_storeu_pd(out + 4, acc1);
+            for (int l = 0; l < 8; l++) y[j + l] = (float)out[l];
+        }
+#else
+        const int in8 = 0;
+#endif
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static) if (in - in8 > 64)
+#endif
+        for (int j = in8; j < in; j++) {
             double acc = 0.0;
             for (int r = 0; r < rows; r++)
                 acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
@@ -804,10 +838,33 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
         }
     } else {
         const float *wf = (const float *)W;
+#if defined(__AVX2__)
+        const int in8 = in & ~7;
 #ifdef _OPENMP
-#       pragma omp parallel for schedule(static) if (in > 64)
+#       pragma omp parallel for schedule(static) if (in8 > 64)
 #endif
-        for (int j = 0; j < in; j++) {
+        for (int j = 0; j < in8; j += 8) {
+            __m256d acc0 = _mm256_setzero_pd(), acc1 = _mm256_setzero_pd();
+            for (int r = 0; r < rows; r++) {
+                const __m256 f = _mm256_loadu_ps(wf + (size_t)r * in + j);
+                const __m256d xr = _mm256_set1_pd((double)x[r]);
+                acc0 = _mm256_add_pd(acc0,
+                    _mm256_mul_pd(xr, _mm256_cvtps_pd(_mm256_castps256_ps128(f))));
+                acc1 = _mm256_add_pd(acc1,
+                    _mm256_mul_pd(xr, _mm256_cvtps_pd(_mm256_extractf128_ps(f, 1))));
+            }
+            double out[8];
+            _mm256_storeu_pd(out, acc0);
+            _mm256_storeu_pd(out + 4, acc1);
+            for (int l = 0; l < 8; l++) y[j + l] = (float)out[l];
+        }
+#else
+        const int in8 = 0;
+#endif
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static) if (in - in8 > 64)
+#endif
+        for (int j = in8; j < in; j++) {
             double acc = 0.0;
             for (int r = 0; r < rows; r++)
                 acc += (double)x[r] * (double)wf[(size_t)r * in + j];
