@@ -128,6 +128,44 @@ int main(void)
         free(pk); free(sc); free(x); free(y);
     }
 
+    /* ---------- KDA recurrence: d_k = d_v = 128, 96 heads x 69 KDA layers/token ---- */
+    {
+        const int dk = 128, dv = 128;
+        float *S = (float *)malloc((size_t)dk * dv * sizeof(float));
+        float *o = (float *)malloc((size_t)dv * sizeof(float));
+        float *q = (float *)malloc((size_t)dk * sizeof(float));
+        float *k = (float *)malloc((size_t)dk * sizeof(float));
+        float *v = (float *)malloc((size_t)dv * sizeof(float));
+        float *alpha = (float *)malloc((size_t)dk * sizeof(float));
+        if (!S || !o || !q || !k || !v || !alpha) { printf("alloc failed\n"); return 1; }
+        fillf(S, (size_t)dk * dv, 555u);
+        fillf(q, dk, 111u); fillf(k, dk, 222u); fillf(v, dv, 333u);
+        /* alpha is a per-channel decay in (0, 1]; fillf's range is +-0.05, so remap it
+         * into (0.5, 0.9) rather than benchmark a value range k3_kda_decay never
+         * produces. */
+        fillf(alpha, dk, 444u);
+        for (int i = 0; i < dk; i++) alpha[i] = 0.7f + alpha[i] * 4.0f;
+        const float beta = 0.7f;
+
+        k3_kda_step(S, o, q, k, v, alpha, beta, dk, dv);        /* warm */
+        const int reps = 2000;
+        const double t0 = now_s();
+        for (int r = 0; r < reps; r++) k3_kda_step(S, o, q, k, v, alpha, beta, dk, dv);
+        const double dt = (now_s() - t0) / reps;
+        printf("\nKDA recurrence %4d x %-4d  %8.3f us/call\n", dk, dv, dt * 1e6);
+
+        /* Same purpose as the FNV lines above: build once with AVX2 and once without
+         * (`make CFLAGS="... -mno-avx2 ..."` or drop -march=native) and diff these
+         * hashes. They must match exactly -- the vector path batches independent output
+         * channels, it does not reassociate the per-channel reduction, so there is no
+         * excuse for the hashes to differ. */
+        fnv("kda_step S", S, dk * dv);
+        fnv("kda_step o", o, dv);
+        const double per_tok = dt * 96 * 69;
+        printf("             96 heads x 69 KDA layers -> %.3f s/token\n", per_tok);
+        free(S); free(o); free(q); free(k); free(v); free(alpha);
+    }
+
     printf("\nmeasured compute budget at the floor is about 10 s/token; whichever line\n"
            "above dominates it is the one worth vectorising.\n");
     return 0;

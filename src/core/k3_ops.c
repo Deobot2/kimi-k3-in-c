@@ -31,6 +31,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
  * scratch without changing a published signature. They are hundreds of bytes to a few
@@ -279,6 +283,18 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 }
 
 /* -------------------------------------------------------- KDA recurrence ---- */
+/* Every inner loop below runs over j (0..dv) and, for a FIXED j, accumulates strictly
+ * in i order (0..dk-1). The AVX2 path batches 8 independent j's into one vector lane
+ * apiece and leaves that per-j accumulation order untouched -- lane L's running sum is
+ * the exact same sequence of IEEE-754 operations as scalar j=L, just computed alongside
+ * seven others, so this is data parallelism across independent outputs, not a reduction
+ * reordering the way the matmul kernels' accumulator split is. Multiply and add are
+ * issued as separate instructions (_mm256_mul_ps then _mm256_add_ps, never
+ * _mm256_fmadd_ps) to match plain float arithmetic under -ffp-contract=off, so the
+ * scalar remainder and the vector body produce bit-identical results and a portable
+ * (non-AVX2) build agrees with this one exactly. At the real model's width (d_k = d_v =
+ * 128) every element goes through the vector path; only test fixtures with dv < 8 fall
+ * back to pure scalar. */
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
@@ -287,7 +303,13 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     for (int i = 0; i < dk; i++) {
         float *row = S + (size_t)i * dv;
         const float a = alpha[i];
-        for (int j = 0; j < dv; j++) row[j] *= a;
+        int j = 0;
+#if defined(__AVX2__)
+        const __m256 av = _mm256_set1_ps(a);
+        for (; j + 7 < dv; j += 8)
+            _mm256_storeu_ps(row + j, _mm256_mul_ps(_mm256_loadu_ps(row + j), av));
+#endif
+        for (; j < dv; j++) row[j] *= a;
     }
 
     /* 2. read the state along k:  u = S^T k */
@@ -300,7 +322,15 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float ki = k[i];
         if (ki == 0.0f) continue;
         const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) u[j] += ki * row[j];
+        int j = 0;
+#if defined(__AVX2__)
+        const __m256 kv = _mm256_set1_ps(ki);
+        for (; j + 7 < dv; j += 8) {
+            const __m256 prod = _mm256_mul_ps(kv, _mm256_loadu_ps(row + j));
+            _mm256_storeu_ps(u + j, _mm256_add_ps(_mm256_loadu_ps(u + j), prod));
+        }
+#endif
+        for (; j < dv; j++) u[j] += ki * row[j];
     }
 
     /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
@@ -309,7 +339,17 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float ki = k[i];
         if (ki == 0.0f) continue;
         float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
+        const float kib = ki * beta;   /* `*` is left-associative: matches ki*beta*(...) */
+        int j = 0;
+#if defined(__AVX2__)
+        const __m256 kibv = _mm256_set1_ps(kib);
+        for (; j + 7 < dv; j += 8) {
+            const __m256 diff = _mm256_sub_ps(_mm256_loadu_ps(v + j), _mm256_loadu_ps(u + j));
+            const __m256 term = _mm256_mul_ps(kibv, diff);
+            _mm256_storeu_ps(row + j, _mm256_add_ps(_mm256_loadu_ps(row + j), term));
+        }
+#endif
+        for (; j < dv; j++) row[j] += kib * (v[j] - u[j]);
     }
 
     /* 4. output from the ALREADY UPDATED state: o = S^T q */
@@ -318,7 +358,15 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float qi = q[i];
         if (qi == 0.0f) continue;
         const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) o[j] += qi * row[j];
+        int j = 0;
+#if defined(__AVX2__)
+        const __m256 qv = _mm256_set1_ps(qi);
+        for (; j + 7 < dv; j += 8) {
+            const __m256 prod = _mm256_mul_ps(qv, _mm256_loadu_ps(row + j));
+            _mm256_storeu_ps(o + j, _mm256_add_ps(_mm256_loadu_ps(o + j), prod));
+        }
+#endif
+        for (; j < dv; j++) o[j] += qi * row[j];
     }
     free(u);
 }
@@ -1457,10 +1505,6 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
 /* ---------------------------------------------------------------- MXFP4 ---- */
 /* K3_E2M1 lives near the top of this file: k3_matmul_tr needs it too, for the
  * transposed sweep over a quantised trunk, and that is defined well before here. */
-
-#if defined(__AVX2__)
-#include <immintrin.h>
-#endif
 
 /* y[out] = W[out][in] . x[in], with W stored as bf16 and widened on read.
  *
