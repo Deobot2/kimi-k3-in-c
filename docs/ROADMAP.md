@@ -57,17 +57,23 @@ Two background threads now exist as well — the trunk reader and the expert-cac
 speculator — so the sweep should cover their interaction with the OpenMP pool rather
 than assuming the pool has the machine to itself.
 
-## 4. SIMD in the KDA recurrence
+## 4. SIMD in the KDA recurrence — done
 
-The bf16 trunk matmul and the MXFP4 expert matmul already have hand-written AVX2 paths
-(`src/core/k3_ops.c`), each written to reproduce the scalar reduction order exactly. The
-KDA recurrence does not: it is still plain scalar C, and it is the largest remaining
-un-vectorised kernel on the non-I/O path.
+Both `k3_kda_step` and `k3_matmul_tr` now have AVX2 paths, verified bit-identical against
+the scalar build with the FNV1a-hash technique `benchmarks/bench_kernels.c` already used
+for the matmul kernels (build with and without AVX2, diff the hashes) rather than trusted
+on tolerance alone. Neither is a reduction reorder: both batch independent output
+channels — 8 KDA state columns, or 8 columns of one `k3_matmul_tr` row — into one
+vector's lanes, so each lane's accumulation order over the contraction dimension is
+untouched and there is no arithmetic difference from the scalar path to justify, unlike
+the matmul kernels' deliberate accumulator-partition reorder.
 
-`k3_matmul_tr`, added for the latent KV cache's query absorption, is the second: it is a
-strided column sweep with a double accumulator per output and no vector path at all. It
-runs 96 times per MLA layer per token, so it is small next to the recurrence but it is
-new and it is scalar.
+Measured, not assumed: KDA recurrence 1.72x (5.73 vs 9.84 us/call), `k3_matmul_tr` BF16
+2.84x and F32 3.51x. Projected across a full token that's roughly 0.03s and 0.03s
+respectively — real, but the matmuls still own the ~10s/token compute floor by two orders
+of magnitude, so this closes the item without moving the ceiling much. What would move it
+is whatever narrows the 8.5s/13 GFLOP·s⁻¹ gap between the bf16 matmul's measured rate and
+a modern core's AVX2+FMA ceiling; nothing here investigated that gap.
 
 ## 5. Sampling
 

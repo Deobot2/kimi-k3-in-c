@@ -71,6 +71,13 @@ not needing the bytes at all.
 
 ### Changed
 
+- **AVX2 paths for `k3_kda_step` and `k3_matmul_tr`**, closing roadmap item 4. Both
+  kernels batch 8 independent output columns per vector instead of reassociating a
+  reduction, so each is verified bit-identical against a scalar build via the same
+  FNV1a-hash technique `benchmarks/bench_kernels.c` already used for the matmul kernels.
+  Measured: the KDA recurrence 1.72x (5.73 vs 9.84 us/call), `k3_matmul_tr` 2.84x (BF16)
+  and 3.51x (F32). Real but modest against the ~10s/token compute floor the matmuls own
+  by two orders of magnitude — see `docs/ROADMAP.md` #4 for the numbers in full.
 - **Expert cache replacement is S3-FIFO, not LRU.** The project's own simulator put 25.5
   points between LRU and Belady at 64 GB, and its own conclusion was that the lever is the
   policy rather than the size. Small FIFO, main FIFO, ghost queue; uniform object size

@@ -3546,8 +3546,6 @@ Raw data: [`docs/data/trunk-quantisation.txt`](docs/data/trunk-quantisation.txt)
 - **No vision.** MoonViT-V2 is fully specified in `config.json` at 27 layers, and has zero
   code here. That absent encoder is 0.057 percent of the checkpoint and downloadable on its
   own, which makes implementing it a 0.9 GB job rather than a 1.56 TB one.
-- **No SIMD in the KDA recurrence.** The matmuls have AVX2 paths; the recurrence is still
-  scalar C.
 - **No quality benchmark.** No perplexity, no task eval. At 11 seconds per token that is
   days of compute, and it would measure Kimi K3 rather than this engine.
 
