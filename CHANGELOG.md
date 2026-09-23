@@ -92,6 +92,15 @@ not needing the bytes at all.
 - Saved state records the KV layout and window geometry and refuses a mismatch: the two
   caches hold different tensors of the same float count, so restoring one as the other
   would be fluent and wrong. State version 1 → 2.
+- **`k3_kda_step` no longer calls `calloc`/`free`.** It ran T*H times per KDA layer,
+  in parallel across heads, and allocated and freed a d_v-wide scratch row on every
+  single call. It now uses a fixed-size stack buffer, bounded by the new
+  `K3_MAX_KDA_DIM` and checked against `kda_head_dim` at config-load time the same way
+  `K3_MAX_TOPK` bounds top-k. Measured on this machine (4 cores) the wall-clock
+  difference was noise — glibc's tcache already makes same-size malloc/free nearly
+  free — so this is filed as a robustness and clarity cleanup (one fewer allocation
+  failure path in the hottest non-matmul loop), not a proven speedup; a machine with
+  more cores or a different allocator may see a real one.
 
 ### Fixed
 

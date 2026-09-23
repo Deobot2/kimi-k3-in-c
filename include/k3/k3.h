@@ -751,6 +751,12 @@ void   k3_decoder_layer_kv(float *h, float *block_residual, int *n_blocks,
  * at load time rather than a corrupted stack mid-decode. */
 #define K3_MAX_TOPK 64
 
+/* Upper bound on kda_head_dim (d_k == d_v for KDA, released at 128). k3_kda_step runs
+ * T*H times per KDA layer and needs one d_v-wide scratch row per call; this bounds a
+ * fixed-size stack buffer there instead of a heap allocation on every call.
+ * k3_cfg.h validates kda_head_dim against this at load time. */
+#define K3_MAX_KDA_DIM 256
+
 void k3_mxfp4_dequant(float *out, const unsigned char *packed,
                       const unsigned char *scales, int rows, int pcols, int group);
 

@@ -282,6 +282,15 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
+    /* This runs T*H times per KDA layer, serially within each head (see the caller's
+     * comment on why it cannot be parallelised further). u used to be calloc/free per
+     * call, which meant a heap allocation and lock contention, per call, on the hot
+     * path -- across H threads at once, since the caller parallelises over heads. A
+     * fixed-size stack buffer removes both; dv is checked against the same bound
+     * k3_cfg.h enforces on kda_head_dim at load time, so this can only fire if a
+     * caller outside the config-validated path passes an oversized dv. */
+    if (dv > K3_MAX_KDA_DIM) k3_fatal_bound("KDA head_dim (d_v)", dv, K3_MAX_KDA_DIM);
+
     /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
      *    channel, not a scalar, which is what "channel-wise forget gate" means. */
     for (int i = 0; i < dk; i++) {
@@ -291,11 +300,8 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     }
 
     /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
-     * would leave the recurrent state permanently scaled but never updated -- silent,
-     * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    float u[K3_MAX_KDA_DIM];
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -320,7 +326,6 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
 }
 
 /* ---------------------------------------------------------------- matmul ---- */

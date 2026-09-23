@@ -229,6 +229,13 @@ static inline int k3_cfg_load(K3Cfg *c, int *fa, int fa_max, jval *root, const c
                 whence, c->topk, c->n_experts);
         return 0;
     }
+    if (c->kda_head_dim > K3_MAX_KDA_DIM) {
+        fprintf(stderr, "k3_cfg: %s has kda_head_dim %d, but this build supports at "
+                        "most %d\n  (K3_MAX_KDA_DIM in k3.h bounds k3_kda_step's stack "
+                        "scratch buffer)\n",
+                whence, c->kda_head_dim, K3_MAX_KDA_DIM);
+        return 0;
+    }
     if (c->attn_res_block <= 0) {
         fprintf(stderr, "k3_cfg: %s has attn_res_block_size %d; layer_idx %% 0 would "
                         "divide by zero\n", whence, c->attn_res_block);
