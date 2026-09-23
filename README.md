@@ -423,6 +423,11 @@ shorthand. Order matters if you mix them: a later flag wins, so
 | `--mla-latent` | none | off | cache the 576-float MLA latent instead of expanded per-head k and v: **55.3 KB per position instead of 2.37 MB**. Needs `--incremental` |
 | `--kv-window` | `N` | 0 | cap the latent cache at N positions. **This is local attention and it changes the output.** Needs `--mla-latent` |
 | `--kv-sinks` | `S` | 4 | of the window, keep the first S positions permanently |
+| `--spec` | `N` | 0 | speculative decode: draft up to N tokens by n-gram lookup and verify them in one batched sweep. Output is identical to serial decode by construction. Needs `--incremental` |
+| `--draft-trunk` | `DIR` | off | hybrid decode: a second packed trunk (typically a quantised derivation, see `tools/qdq_trunk.py`) DRAFTS tokens which the exact model verifies in batched sweeps. Output remains exactly the exact model's greedy decode. Needs `--incremental`; implies `--spec 4` |
+| `--draft-trunk-gb` | `X` | 6 | trunk budget for the draft model |
+| `--save-state` | `PATH` | off | write the carried state after the run, so the next turn of a conversation resumes instead of re-reading the whole prompt |
+| `--load-state` | `PATH` | off | resume from a saved state; the prompt given now is treated as the continuation of the saved sequence. Needs `--incremental` |
 | `--tok` | `DIR` | none | directory holding `tiktoken.model` and `tokenizer_config.json` |
 
 **Pass `--incremental` for any generation of length.** Without it every step re-runs the
@@ -448,6 +453,9 @@ to be identical (oracle GATE 4); the float vectors are gated to a stated toleran
 | `--dump-cache-trace` | `DIR` | writes `expert_hist.json` and `expert_trace.bin`, which `tools/sim_cache.py` replays |
 | `--tf-check` | none | teacher-forced agreement over the `--ids` sequence in one sweep |
 | `--ppl` | none | perplexity over the `--ids` sequence in one sweep. This is the gate for a quantised trunk, which cannot be byte-compared against anything |
+| `--ppl-file` | `PATH` | score a whole evaluation suite in one process: one document per line, `name<TAB>id,id,...`. Reports per document and in total; implies `--ppl` |
+| `--ppl-dump` | `PATH` | write one 20-byte record per scored position (target id, top-1 id, both log-probabilities, entropy). Diffed position-for-position between two runs, this gives the top-1 agreement rate against a baseline model |
+| `--calib-dump` | `PATH` | collect per-input-channel activation statistics over the suite, for activation-aware quantisation; feed the result to `tools/awq_trunk.py`. Implies `--ppl`. Run against the BF16 trunk, never an already-quantised one |
 
 Two environment switches exist so a decision can be A/B'd on **one binary**, which is the
 only way to attribute a timing difference to the decision rather than to the compiler, the
@@ -456,7 +464,7 @@ layout, or the weather:
 | | |
 |---|---|
 | `K3_CACHE_POLICY=lru` | expert cache uses LRU instead of S3-FIFO |
-| `K3_SPEC=1` | speculative expert prefetch ON. Off by default: measured, it read 25.8 GB/token to avoid 30% of it |
+| `K3_SPEC=1` | speculative **expert-cache prefetch** ON — not the `--spec` flag above, which is n-gram speculative *decode*; the two are unrelated mechanisms that happen to share a name. Off by default: measured, it read 25.8 GB/token to avoid 30% of it |
 | `K3_NOPREFETCH=1` | no batch expert prefetch either |
 | `K3_PIN_PREFIX=1` | pin trunk layers as a prefix instead of largest-first |
 | `K3_NOURING=1` | trunk reads use `pread` instead of io_uring |
