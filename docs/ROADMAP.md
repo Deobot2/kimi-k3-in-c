@@ -57,22 +57,35 @@ Two background threads now exist as well — the trunk reader and the expert-cac
 speculator — so the sweep should cover their interaction with the OpenMP pool rather
 than assuming the pool has the machine to itself.
 
-## 4. SIMD in `k3_matmul_tr`
+## 4. SIMD in the remaining kernels — mostly done
 
-The bf16 trunk matmul, the MXFP4 expert matmul, and now `k3_kda_step` (the KDA
-recurrence) have hand-written AVX2 paths in `src/core/k3_ops.c`. The recurrence's
-reduction is per output column rather than per row, so vectorising it needed no
-accumulator reshuffle — each of eight SIMD lanes is one column's serial sum in the
-scalar order, checked bit-identical against the scalar path via `bench_kernels`'
-FNV1a hash. Measured on that benchmark's real dimensions it is a real but small win
-(70.25 ms → 56.26 ms for 69 layers' worth of recurrence, one token), because the
-recurrence itself is under 1% of the measured 10 s/token compute budget — worth
-having, not worth overstating.
+The bf16 trunk matmul, the MXFP4 expert matmul, `k3_kda_step` (the KDA recurrence),
+and now the `K3_WBF16` branch of `k3_matmul_tr` have hand-written AVX2 paths in
+`src/core/k3_ops.c`. Both of the newer two vectorise across OUTPUT COLUMNS rather
+than along the reduction — the opposite axis from the trunk/expert matmuls — because
+each is a strided sweep where four or eight columns are independent scalar sums, so
+that many SIMD lanes need no accumulator reshuffle at all: lane j is column j's serial
+sum in the scalar order. Both checked bit-identical against the scalar path: the KDA
+recurrence via `bench_kernels`' FNV1a hash and a standalone AVX2-vs-scalar comparison
+across `dv` 1..20; `k3_matmul_tr` via a standalone comparison across seventeen `in`
+values (1..512) and eight `rows` values, generating real finite bf16 weights rather
+than raw random bytes (`bench_kernels`' own random-byte fill occasionally lands on a
+bf16 NaN/Inf pattern, where FMA and separately-rounded multiply-add are legitimately
+allowed to differ — that is a property of the test data, not of the kernel, and it is
+why `bench_kernels`' FNV1a hash for `k3_matmul_tr` does not match between the two
+builds while the standalone check, on finite weights, is exact).
 
-`k3_matmul_tr`, added for the latent KV cache's query absorption, is what remains
-unvectorised: a strided column sweep with a double accumulator per output and no
-vector path at all. It runs 96 times per MLA layer per token, so it is smaller than
-the recurrence was, and only exercised under `--mla-latent`.
+Measured on `bench_kernels`' real dimensions, one token's worth: KDA's 69 layers
+70.25 ms → 56.26 ms, `k3_matmul_tr`'s 96 heads × 24 MLA layers 52.30 ms → 15.85 ms.
+Worth stating plainly: the recurrence is under 1% and `k3_matmul_tr` under 0.2% of the
+measured 10 s/token compute budget (and `k3_matmul_tr` only runs at all under
+`--mla-latent`), so these are real wins, not the trunk- or expert-matmul scale of
+change.
+
+What is left scalar: the `K3_WMX4` and `K3_WI8` branches of `k3_matmul_tr`, for a
+quantised trunk under `--mla-latent`. Lower priority again — narrower still, and the
+nibble-unpack-plus-per-group-scale shape (see the MXFP4 branch's own comment) makes an
+equally rigorous AVX2 path more work for less.
 
 ## 5. Sampling
 

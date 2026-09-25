@@ -103,6 +103,22 @@ not needing the bytes at all.
   → 56.26 ms for one token's worth of KDA recurrence, 69 layers. Worth stating plainly:
   the recurrence is under 1% of the measured 10 s/token compute budget, so this is a real
   but small win, not the trunk- or expert-matmul scale of change.
+- **The `K3_WBF16` branch of `k3_matmul_tr` has an AVX2 path too**, vectorised across
+  four output columns rather than along the reduction for the same reason as
+  `k3_kda_step`: for a fixed row, four consecutive columns are contiguous, so each of
+  four double lanes is one column's serial sum over rows, bit-identical to the scalar
+  loop by the same argument `k3_matmul_bf16`'s FMA already relies on (an exactly-widened
+  bf16 times an exactly-widened `x[r]` always fits a double's mantissa, so fused and
+  separately-rounded multiply-add agree). Checked with a standalone harness across
+  seventeen `in` values and eight `rows` values, generating real finite bf16 weights —
+  `bench_kernels`' own raw-random-byte fill occasionally lands on a bf16 NaN or Inf,
+  where FMA is legitimately allowed to differ from separately-rounded multiply-add, so
+  its FNV1a hash for this kernel does not match between builds; that is a property of
+  the random bytes, not of the kernel, and the standalone check on finite weights is
+  exact. Measured on `bench_kernels`' real dimensions (one head, 512×128): 52.30 ms →
+  15.85 ms for one token's 96 heads × 24 MLA layers, itself under 0.2% of the measured
+  10 s/token budget and only exercised under `--mla-latent`. The `K3_WMX4` and `K3_WI8`
+  branches remain scalar; see docs/ROADMAP.md.
 
 ### Fixed
 

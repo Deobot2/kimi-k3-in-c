@@ -169,6 +169,33 @@ int main(void)
         free(S); free(q); free(k); free(v); free(al); free(o);
     }
 
+    /* ---------- transposed bf16 matmul: absorbed query, kv_lora 512 x qk_nope 128 --- */
+    {
+        const int in = 512, rows = 128;                /* one head's W_UK */
+        uint16_t *W = (uint16_t *)malloc((size_t)rows * in * sizeof(uint16_t));
+        float *x = (float *)malloc((size_t)rows * sizeof(float));
+        float *y = (float *)malloc((size_t)in * sizeof(float));
+        if (!W || !x || !y) { printf("alloc failed\n"); return 1; }
+        fillb((unsigned char *)W, (size_t)rows * in * 2, 5678u);
+        fillf(x, rows, 8765u);
+
+        k3_matmul_tr(y, x, W, K3_WBF16, in, rows);      /* warm */
+        const int reps = 20;
+        const double t0 = now_s();
+        for (int r = 0; r < reps; r++) k3_matmul_tr(y, x, W, K3_WBF16, in, rows);
+        const double dt = (now_s() - t0) / reps;
+        const double gflop = 2.0 * in * rows / 1e9;
+        printf("\nmatmul_tr    %5d x %-5d  %7.2f ms  %8.1f GFLOP/s\n",
+               in, rows, dt * 1e3, gflop / dt);
+
+        fnv("tr   ", y, in);
+        /* one head, 96 heads x 24 MLA layers per token. */
+        const double per_tok = dt * 96 * 24;
+        printf("             96 heads x 24 MLA layers -> %.2f ms/token (%.2f%% of a 10 s budget)\n",
+               per_tok * 1e3, 100.0 * per_tok / 10.0);
+        free(W); free(x); free(y);
+    }
+
     printf("\nmeasured compute budget at the floor is about 10 s/token; whichever line\n"
            "above dominates it is the one worth vectorising.\n");
     return 0;

@@ -746,15 +746,47 @@ size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span)
  * need an accumulator array and a reduction whose order changes with the thread count.
  *
  * The stride is unfriendly -- consecutive rows are `in` elements apart -- but the whole
- * of W_UK[h] is 128 KB at the released dimensions and stays in L2 across the sweep. */
+ * of W_UK[h] is 128 KB at the released dimensions and stays in L2 across the sweep.
+ *
+ * THE BF16 BRANCH HAS AN AVX2 PATH; MXFP4 and I8 remain scalar (see docs/ROADMAP.md).
+ * It vectorises across FOUR OUTPUT COLUMNS rather than along the reduction, which is
+ * the opposite axis from every other kernel in this file: for a fixed row r, four
+ * consecutive columns w16[r*in+j0 .. r*in+j0+3] ARE contiguous, so each of the four
+ * double lanes accumulates one column's sum over r, in the same order the scalar loop
+ * uses. Bit-identical for the reason k3_matmul_bf16's FMA is: the product of an
+ * exactly-widened bf16 and an exactly-widened x[r] always fits a double's 53-bit
+ * mantissa, so fused and separately-rounded multiply-add agree exactly -- a proof
+ * about the inputs, reused rather than re-argued. The remaining `in % 4` columns fall
+ * through to the scalar loop unchanged. */
 void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int rows)
 {
     if (wdt == K3_WBF16) {
         const uint16_t *w16 = (const uint16_t *)W;
+        int j0 = 0;
+#if defined(__AVX2__)
+        const int in4 = in - in % 4;
 #ifdef _OPENMP
-#       pragma omp parallel for schedule(static) if (in > 64)
+#       pragma omp parallel for schedule(static) if (in4 > 64)
 #endif
-        for (int j = 0; j < in; j++) {
+        for (int j = 0; j < in4; j += 4) {
+            __m256d acc = _mm256_setzero_pd();
+            for (int r = 0; r < rows; r++) {
+                const __m128i h = _mm_loadl_epi64((const __m128i *)(w16 + (size_t)r * in + j));
+                const __m256d wv = _mm256_cvtps_pd(_mm_castsi128_ps(
+                    _mm_slli_epi32(_mm_cvtepu16_epi32(h), 16)));
+                acc = _mm256_fmadd_pd(_mm256_set1_pd((double)x[r]), wv, acc);
+            }
+            double out[4];
+            _mm256_storeu_pd(out, acc);
+            y[j] = (float)out[0]; y[j + 1] = (float)out[1];
+            y[j + 2] = (float)out[2]; y[j + 3] = (float)out[3];
+        }
+        j0 = in4;
+#endif
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static) if (in - j0 > 64)
+#endif
+        for (int j = j0; j < in; j++) {
             double acc = 0.0;
             for (int r = 0; r < rows; r++)
                 acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
