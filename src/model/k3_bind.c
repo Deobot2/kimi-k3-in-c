@@ -146,10 +146,19 @@ static int plan_load(Plan *p, const K3St *s, unsigned char *blob)
             }
         } else {
             /* A prefix: read the whole tensor into scratch, keep the front. Only A_log
-             * needs this, and it is 128 floats. */
+             * needs this, and it is 128 floats. Both failures below used to return -1
+             * silently, unlike the two branches above: a bind failure with no message
+             * looks like the engine hung rather than told you why it stopped. */
             float *tmp = (float *)malloc((size_t)have * sizeof(float));
-            if (!tmp) return -1;
-            if (k3_st_read_f32(s, q->t, tmp) != have) { free(tmp); return -1; }
+            if (!tmp) {
+                fprintf(stderr, "k3_bind: out of memory reading %s\n", q->name);
+                return -1;
+            }
+            if (k3_st_read_f32(s, q->t, tmp) != have) {
+                fprintf(stderr, "k3_bind: short read of %s\n", q->name);
+                free(tmp);
+                return -1;
+            }
             memcpy(dst, tmp, (size_t)q->take * sizeof(float));
             free(tmp);
         }
