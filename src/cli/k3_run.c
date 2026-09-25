@@ -44,6 +44,7 @@
 #define _DARWIN_C_SOURCE
 #endif
 
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1027,8 +1028,15 @@ int main(int argc, char **argv)
      * id path keeps working on a box that has no tokenizer files at all. */
     /* Heap, not stack. This was `int prompt[4096]` and it was the reason the engine
      * refused prompts longer than 4096 ids -- a stack-array size, not a model or memory
-     * limit. */
-    int *prompt = (int *)malloc((size_t)K3_MAX_PROMPT * sizeof(int));
+     * limit.
+     *
+     * Sized ONE PAST the ceiling, deliberately. Every parser below stops filling at
+     * K3_MAX_PROMPT + 1 rather than K3_MAX_PROMPT, so an over-long prompt leaves np at
+     * K3_MAX_PROMPT + 1 and the refusal further down actually fires. Capping every
+     * parser AT the ceiling (the previous behaviour) made np > K3_MAX_PROMPT
+     * unreachable, so that refusal was dead code that silently clamped instead of
+     * refusing -- exactly the "wrong but fluent" failure this engine exists to avoid. */
+    int *prompt = (int *)malloc((size_t)(K3_MAX_PROMPT + 1) * sizeof(int));
     if (!prompt) { fprintf(stderr, "OOM allocating prompt buffer\n"); return 2; }
     int np = 0;
     Tok tok; int have_tok = 0;
@@ -1076,12 +1084,33 @@ int main(int argc, char **argv)
             if (!ptext) { fprintf(stderr, "OOM on prompt\n"); return 2; }
             memcpy(ptext, prompt_text, (size_t)plen + 1);
         }
-        np = tok_encode(&tok, ptext, (int)plen, prompt, K3_MAX_PROMPT);
+        /* max is K3_MAX_PROMPT + 1, matching the buffer: see the ceiling-plus-one note
+         * on the allocation above. */
+        np = tok_encode(&tok, ptext, (int)plen, prompt, K3_MAX_PROMPT + 1);
         free(ptext);
         printf("  tokenized: %ld bytes -> %d ids\n", plen, np);
     } else {
-        for (const char *p = ids_s; *p && np < K3_MAX_PROMPT; ) {
-            prompt[np++] = (int)strtol(p, (char **)&p, 10);
+        /* strtol leaves endptr == p when it finds no digits to parse; unlike the loop's
+         * own advance-by-separator step, THAT case does not move p, so a stray
+         * non-numeric byte (a typo, a stray letter, a semicolon instead of a comma)
+         * used to spin forever re-parsing the same byte as 0 and appending it, all the
+         * way to the ceiling -- a silent 32768-token prompt of mostly zeros instead of
+         * the error a mistyped --ids should produce. Refuse instead. Also range-check
+         * before the cast to int: strtol returns long, and an id that overflows int
+         * would otherwise wrap to some other, possibly in-vocabulary, id. */
+        for (const char *p = ids_s; *p && np <= K3_MAX_PROMPT; ) {
+            char *end = NULL;
+            const long v = strtol(p, &end, 10);
+            if (end == p) {
+                fprintf(stderr, "--ids has a non-numeric token at \"%.20s\"\n", p);
+                return 2;
+            }
+            if (v < INT_MIN || v > INT_MAX) {
+                fprintf(stderr, "--ids value %ld does not fit in a 32-bit token id\n", v);
+                return 2;
+            }
+            prompt[np++] = (int)v;
+            p = end;
             while (*p == ',' || *p == ' ') p++;
         }
     }

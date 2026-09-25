@@ -122,6 +122,23 @@ not needing the bytes at all.
 
 ### Fixed
 
+- **`--ids` spun to a 32,768-token prompt of mostly zeros on a typo instead of refusing.**
+  `strtol` leaves its endptr unmoved when it finds no digits, and the parsing loop did not
+  check for that — a stray letter, a semicolon instead of a comma, or a trailing space
+  variant it didn't already skip re-parsed the same byte as `0` forever, up to the
+  K3_MAX_PROMPT ceiling. Token id 0 is in-vocabulary, so this passed validation and ran
+  for real. Also range-checked before the `long`-to-`int` cast, so an id that overflows
+  `int` (e.g. 4294967297) is refused rather than silently wrapping to some other,
+  possibly in-vocabulary, id.
+- **The "refuse rather than clamp" prompt-length check was dead code.** Both prompt
+  parsers (`--ids` and `tok_encode` for `--prompt`/`--prompt-file`) stopped writing
+  exactly at `K3_MAX_PROMPT`, so `np` could never exceed it and the refusal a few lines
+  below — whose own comment says a caller who asks for more should be told, not quietly
+  handed fewer — could never fire; an over-long prompt was silently truncated instead.
+  The prompt buffer and both parsers' capacity are now `K3_MAX_PROMPT + 1`, so an
+  over-long prompt is detected and refused rather than clamped. `make test` gained a CLI
+  argument validation step covering all three cases (no weights needed: prompt parsing
+  and validation both run before any checkpoint is touched).
 - The trunk reader's `hits`/`misses` are classified once per bind rather than incremented
   by whichever thread performed the read, so they sum to the bind count instead of double
   counting every prefetched layer.

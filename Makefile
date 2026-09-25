@@ -173,7 +173,7 @@ $(BIN)/bench_kernels: benchmarks/bench_kernels.c $(BUILD)/src/core/k3_ops.o | $(
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 ## test: everything that needs no model weights
-test: $(TEST_BINS)
+test: $(TEST_BINS) $(CLI_BIN)
 	@echo "== op kernels ==";        ./$(BIN)/test_ops $(FIXTURES)/ops
 	@echo "== streaming cache ==";   ./$(BIN)/test_cache $(FIXTURES)/cache
 	@echo "== streaming trunk =="; mkdir -p $(BUILD)/trunkfix; \
@@ -185,6 +185,18 @@ test: $(TEST_BINS)
 	  for f in no_layermap bad_layer_index bad_topk; do \
 	      ./$(BIN)/test_cfg reject $(FIXTURES)/cfg/$$f.json || exit 1; \
 	  done
+	@echo "== CLI argument validation =="; \
+	  mkdir -p $(BUILD)/cli_argtest; \
+	  ./$(CLI_BIN) $(BUILD)/cli_argtest --ids "1,x" 2>&1 | grep -q "non-numeric" \
+	      && echo "  ok    --ids refuses a non-numeric token" \
+	      || { echo "  FAIL  --ids should refuse a non-numeric token"; exit 1; }; \
+	  ./$(CLI_BIN) $(BUILD)/cli_argtest --ids "1,4294967297" 2>&1 | grep -q "does not fit" \
+	      && echo "  ok    --ids refuses an id that overflows int" \
+	      || { echo "  FAIL  --ids should refuse an id overflowing int"; exit 1; }; \
+	  ./$(CLI_BIN) $(BUILD)/cli_argtest --ids "$$(yes 1 | head -n 32769 | tr '\n' ',')" 2>&1 \
+	      | grep -q "exceeds the" \
+	      && echo "  ok    --ids refuses a prompt over the K3_MAX_PROMPT ceiling" \
+	      || { echo "  FAIL  --ids should refuse an over-ceiling prompt"; exit 1; }
 	@echo "== tokenizer =="; \
 	  if [ -f "$(TOK_FILES)/tiktoken.model" ]; then \
 	      ./$(BIN)/test_tok $(TOK_FILES) roundtrip src/core/k3_ops.c; \
