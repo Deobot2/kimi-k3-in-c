@@ -9,6 +9,9 @@
  *          <dir>          directory of .safetensors shards
  *          index.json     where to write the full index (default st_index.json)
  *          tensor_name    zero or more tensors to read and dump values for
+ *        test_st reject <scratch-dir>
+ *          writes a handful of hand-crafted malformed headers under scratch-dir and
+ *          asserts k3_st_open refuses every one of them (see run_reject_suite)
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -16,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #include "k3_st.h"
@@ -58,8 +62,92 @@ static void put_json_str(FILE *f, const char *s)
     fputc('"', f);
 }
 
+/* ------------------------------------------------------------------ reject suite ----
+ * SECURITY.md puts crafted headers in scope: this engine treats safetensors files as
+ * untrusted input, downloaded from third-party mirrors, and must bound or refuse
+ * implausible values rather than trust them. Each case below hand-writes the smallest
+ * possible header that isolates one specific refusal path in k3_st.c -- no numpy, no
+ * tensor data, because header validation runs (and must fail) before any data is ever
+ * read. */
+static int write_shard_raw(const char *dir, const char *json_body)
+{
+    char path[560];
+    snprintf(path, sizeof path, "%s/bad.safetensors", dir);
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    const uint64_t hlen = (uint64_t)strlen(json_body);
+    unsigned char lenbuf[8];
+    for (int i = 0; i < 8; i++) lenbuf[i] = (unsigned char)(hlen >> (8 * i));
+    int ok = fwrite(lenbuf, 1, 8, f) == 8 && fwrite(json_body, 1, hlen, f) == hlen;
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
+static int reject_case(const char *scratch, const char *label, const char *json_body)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/%s", scratch, label);
+    mkdir(dir, 0755);                       /* ignoring EEXIST: a rerun reuses it */
+    if (write_shard_raw(dir, json_body) != 0) {
+        printf("  FAIL  %-16s could not write the fixture\n", label);
+        return 1;
+    }
+    K3St s;
+    if (k3_st_open(&s, dir) != 0) {
+        printf("  ok    %-16s correctly rejected\n", label);
+        return 0;
+    }
+    printf("  FAIL  %-16s opened with %d tensor(s); should have been rejected\n",
+           label, s.nt);
+    k3_st_close(&s);
+    return 1;
+}
+
+static int run_reject_suite(const char *scratch)
+{
+    int bad = 0;
+    /* i64_'s digit accumulator must refuse rather than silently overflow. */
+    bad += reject_case(scratch, "overflow_digits",
+        "{\"t\":{\"dtype\":\"F32\",\"shape\":[1],"
+        "\"data_offsets\":[0,999999999999999999999999999999]}}");
+    /* TWO negative dims, so their product (and so k3_st_numel(t)*elemsize) is
+     * POSITIVE and equal to data_offsets' own span -- the pre-existing byte-span
+     * consistency check alone does not catch this, only an explicit "no dimension is
+     * negative" check does. (-1)*(-4) = 4 elements, 16 bytes as F32. */
+    bad += reject_case(scratch, "negative_dim",
+        "{\"t\":{\"dtype\":\"F32\",\"shape\":[-1,-4],\"data_offsets\":[0,16]}}");
+    /* data_offsets[0] negative, but [1]-[0] still equals the correct 4-byte span for
+     * a 1-element F32 tensor, and base+data_offsets[1] still lands inside the file --
+     * so this also passes the byte-span consistency check. Unfixed, this resolves to
+     * a tensor whose absolute offset is 8 bytes before the header even starts. */
+    bad += reject_case(scratch, "negative_offset",
+        "{\"t\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[-8,-4]}}");
+    /* data_offsets[1] < data_offsets[0]: a negative span. Unlike the two cases above
+     * this one IS still caught by the pre-existing consistency check on its own
+     * (a negative nbytes cannot equal a non-negative want without also using a
+     * negative dimension), but the explicit o1 >= o0 check makes that a stated
+     * invariant rather than an accident of what else happens to be checked. */
+    bad += reject_case(scratch, "backwards_offset",
+        "{\"t\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[10,2]}}");
+    /* 3037000500 is just past floor(sqrt(INT64_MAX)); squaring it overflows a signed
+     * 64-bit product. Like overflow_digits, the pre-fix behaviour here is undefined
+     * rather than reliably wrong, which is the argument for the explicit check, not
+     * a counter-argument: relying on whatever one compiler's UB happens to do is
+     * never a substitute for refusing the input outright. */
+    bad += reject_case(scratch, "numel_overflow",
+        "{\"t\":{\"dtype\":\"F32\",\"shape\":[3037000500,3037000500],"
+        "\"data_offsets\":[0,4]}}");
+    return bad;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc >= 2 && !strcmp(argv[1], "reject")) {
+        if (argc < 3) { fprintf(stderr, "usage: test_st reject <scratch-dir>\n"); return 2; }
+        int bad = run_reject_suite(argv[2]);
+        if (bad) { fprintf(stderr, "%d case(s) were NOT rejected\n", bad); return 1; }
+        return 0;
+    }
     if (argc < 2) { fprintf(stderr, "usage: test_st <dir> [index.json] [tensor ...]\n"); return 2; }
     const char *dir = argv[1];
     const char *out = argc > 2 ? argv[2] : "st_index.json";

@@ -180,6 +180,8 @@ test: $(TEST_BINS) $(CLI_BIN)
 	    ./$(BIN)/test_trunk $(BUILD)/trunkfix
 	@echo "== safetensors ==";       ./$(BIN)/test_st $(FIXTURES)/st $(BUILD)/st_index.json \
 	    plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
+	@echo "== safetensors refusals =="; mkdir -p $(BUILD)/st_reject; \
+	    ./$(BIN)/test_st reject $(BUILD)/st_reject
 	@echo "== config reader ==";     ./$(BIN)/test_cfg fixture $(FIXTURES)/ref_k3.json
 	@echo "== config refusals =="; \
 	  for f in no_layermap bad_layer_index bad_topk; do \

@@ -122,6 +122,27 @@ not needing the bytes at all.
 
 ### Fixed
 
+- **The safetensors header parser accepted several implausible values SECURITY.md says
+  it must refuse.** All three found by construction, not just by reasoning: a hand-built
+  header with `data_offsets: [-8, -4]` (a negative start, valid-looking span) opened as a
+  real 1-element tensor on the *unfixed* parser — proven by running the exact same
+  regression test against the pre-fix code, not merely argued. Fixed:
+  - `i64_`, the header's own integer scanner, accumulated digits with no length limit,
+    signed-overflow UB in C on a long enough digit string. Now checked before it happens.
+  - Shape dimensions could be negative and reached `k3_st_numel` unchecked. Two negative
+    dims multiply to a positive count, so this isn't caught by the existing byte-span
+    check on its own — `(-1)*(-4)` elements at 4 bytes each is indistinguishable from 4
+    honest elements unless the dimensions themselves are checked.
+  - `data_offsets` could be negative or backwards (`[1] < [0]`); the only existing bound
+    (`base + data_offsets[1] > fsize`) checks the end, never the start, so a negative
+    start survived it — the confirmed case above.
+  - `k3_st_numel`'s element-count product (and its multiply by element size) had no
+    overflow check, contradicting SECURITY.md's claim that tensor element counts are
+    bounded; both are checked now, in the one place a hostile shape's product first gets
+    multiplied out.
+  `test_st reject` (new) hand-writes each malformed header directly — no checkpoint, no
+  numpy — and `make test` runs it. Legitimate files are unaffected; the existing
+  `test_st`/`tools/verify_st.py` round trip and the full-model oracle are unchanged.
 - **`--ids` spun to a 32,768-token prompt of mostly zeros on a typo instead of refusing.**
   `strtol` leaves its endptr unmoved when it finds no digits, and the parsing loop did not
   check for that — a stray letter, a semicolon instead of a comma, or a trailing space

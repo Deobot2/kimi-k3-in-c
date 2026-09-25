@@ -118,6 +118,10 @@ static int str_(Scan *s, char *out, size_t cap, size_t *len)
     return 1;
 }
 
+/* The header is untrusted (SECURITY.md): a digit string with no length limit would
+ * overflow `a * 10 + digit` in a signed integer, which is undefined behaviour in C, not
+ * just a wrong answer. Checked before it happens rather than after, the standard
+ * overflow-safe-accumulate idiom. */
 static int i64_(Scan *s, int64_t *v)
 {
     ws(s);
@@ -125,7 +129,11 @@ static int i64_(Scan *s, int64_t *v)
     if (s->p < s->end && (*s->p == '-' || *s->p == '+')) neg = (*s->p++ == '-');
     if (s->p >= s->end || *s->p < '0' || *s->p > '9') return 0;
     int64_t a = 0;
-    while (s->p < s->end && *s->p >= '0' && *s->p <= '9') a = a * 10 + (*s->p++ - '0');
+    while (s->p < s->end && *s->p >= '0' && *s->p <= '9') {
+        int d = *s->p++ - '0';
+        if (a > (INT64_MAX - d) / 10) return 0;     /* would overflow */
+        a = a * 10 + d;
+    }
     *v = neg ? -a : a;
     return 1;
 }
@@ -288,6 +296,11 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
                 else for (;;) {
                     int64_t d;
                     if (!i64_(&sc, &d)) goto bad;
+                    if (d < 0) {
+                        fprintf(stderr, "k3_st: %s: %s has a negative dimension %lld\n",
+                                path, name, (long long)d);
+                        goto bad;
+                    }
                     if (t.ndim < 4) t.shape[t.ndim] = d;
                     else { fprintf(stderr, "k3_st: %s has rank > 4\n", name); goto bad; }
                     t.ndim++;
@@ -313,12 +326,47 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
             goto bad;
         }
 
+        /* A negative or backwards span is never valid safetensors, and letting either
+         * through would send t.off negative (a read before the header, past what the
+         * EOF check below catches, which only bounds o1) or make t.nbytes negative (a
+         * read loop that never runs, silently "succeeding" with zero bytes read). Bound
+         * o1 against the file size HERE, in terms of o1 alone, before it is added to
+         * base: base + o1 cannot overflow once o1 already fits inside a real file, but
+         * the reverse order (add first, compare after) can, for an o1 crafted to be
+         * enormous. */
+        if (o0 < 0 || o1 < o0 || o1 > fsize) {
+            fprintf(stderr, "k3_st: %s: %s has invalid data_offsets [%lld, %lld]\n",
+                    path, name, (long long)o0, (long long)o1);
+            goto bad;
+        }
+
         /* Consistency: the byte span must equal elements times element size. A mismatch
          * means the shape and the data disagree, and every later read of this tensor
-         * would be silently misaligned. Refuse rather than load it. */
+         * would be silently misaligned. Refuse rather than load it.
+         *
+         * numel and the multiply by element size are computed here with an explicit
+         * overflow check rather than through k3_st_numel(), which every other caller
+         * trusts to have already been validated: this is the one place a hostile
+         * shape's product first gets multiplied out, so it is the one place that
+         * multiplication must not be allowed to overflow a signed integer. */
         t.off    = base + o0;
         t.nbytes = o1 - o0;
-        const int64_t want = k3_st_numel(&t) * k3_st_elemsize(t.dtype);
+        int64_t numel = 1;
+        for (int i = 0; i < t.ndim; i++) {
+            const int64_t d = t.shape[i];
+            if (d != 0 && numel > INT64_MAX / d) {
+                fprintf(stderr, "k3_st: %s: %s shape overflows a 64-bit element count\n",
+                        path, name);
+                goto bad;
+            }
+            numel *= d;
+        }
+        const int esz = k3_st_elemsize(t.dtype);
+        if (numel > INT64_MAX / (esz > 0 ? esz : 1)) {
+            fprintf(stderr, "k3_st: %s: %s shape x dtype overflows a byte count\n", path, name);
+            goto bad;
+        }
+        const int64_t want = numel * esz;
         if (t.nbytes != want) {
             fprintf(stderr, "k3_st: %s: %s spans %lld bytes but shape implies %lld\n",
                     path, name, (long long)t.nbytes, (long long)want);
