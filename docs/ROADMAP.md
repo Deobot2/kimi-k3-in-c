@@ -57,17 +57,22 @@ Two background threads now exist as well — the trunk reader and the expert-cac
 speculator — so the sweep should cover their interaction with the OpenMP pool rather
 than assuming the pool has the machine to itself.
 
-## 4. SIMD in the KDA recurrence
+## 4. SIMD in `k3_matmul_tr`
 
-The bf16 trunk matmul and the MXFP4 expert matmul already have hand-written AVX2 paths
-(`src/core/k3_ops.c`), each written to reproduce the scalar reduction order exactly. The
-KDA recurrence does not: it is still plain scalar C, and it is the largest remaining
-un-vectorised kernel on the non-I/O path.
+The bf16 trunk matmul, the MXFP4 expert matmul, and now `k3_kda_step` (the KDA
+recurrence) have hand-written AVX2 paths in `src/core/k3_ops.c`. The recurrence's
+reduction is per output column rather than per row, so vectorising it needed no
+accumulator reshuffle — each of eight SIMD lanes is one column's serial sum in the
+scalar order, checked bit-identical against the scalar path via `bench_kernels`'
+FNV1a hash. Measured on that benchmark's real dimensions it is a real but small win
+(70.25 ms → 56.26 ms for 69 layers' worth of recurrence, one token), because the
+recurrence itself is under 1% of the measured 10 s/token compute budget — worth
+having, not worth overstating.
 
-`k3_matmul_tr`, added for the latent KV cache's query absorption, is the second: it is a
-strided column sweep with a double accumulator per output and no vector path at all. It
-runs 96 times per MLA layer per token, so it is small next to the recurrence but it is
-new and it is scalar.
+`k3_matmul_tr`, added for the latent KV cache's query absorption, is what remains
+unvectorised: a strided column sweep with a double accumulator per output and no
+vector path at all. It runs 96 times per MLA layer per token, so it is smaller than
+the recurrence was, and only exercised under `--mla-latent`.
 
 ## 5. Sampling
 

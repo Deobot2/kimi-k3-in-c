@@ -92,6 +92,17 @@ not needing the bytes at all.
 - Saved state records the KV layout and window geometry and refuses a mismatch: the two
   caches hold different tensors of the same float count, so restoring one as the other
   would be fluent and wrong. State version 1 → 2.
+- **`k3_kda_step` has an AVX2 path**, the recurrence ROADMAP.md named as the largest
+  remaining un-vectorised kernel on the non-I/O path. Every reduction in it sums over the
+  row index for one output column at a time, so vectorising across eight columns needs no
+  accumulator reshuffle the way `k3_matmul`'s row reduction does — each SIMD lane is just
+  one column's scalar sum, run in the same order, so the vector and scalar paths are
+  **bit-identical** (checked directly: same FNV1a hash from `bench_kernels`, and a
+  standalone AVX2-vs-scalar comparison across `dv` 1..20 including the exact-zero `k[i]`
+  skip). Measured on `bench_kernels`' real dimensions (96 heads, 128×128 state): 70.25 ms
+  → 56.26 ms for one token's worth of KDA recurrence, 69 layers. Worth stating plainly:
+  the recurrence is under 1% of the measured 10 s/token compute budget, so this is a real
+  but small win, not the trunk- or expert-matmul scale of change.
 
 ### Fixed
 
