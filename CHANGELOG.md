@@ -122,6 +122,11 @@ not needing the bytes at all.
 
 ### Fixed
 
+- `k3_st_open`'s directory scan used two unchecked allocations (the `realloc` growing
+  the shard file list, and the `malloc` for each path string) on a machine this engine
+  already expects to be near its memory budget. A failure of either turned an
+  out-of-memory condition into a NULL-pointer write on the very next line instead of the
+  clean `return -1` this function gives everywhere else it can fail.
 - **The safetensors header parser accepted several implausible values SECURITY.md says
   it must refuse.** All three found by construction, not just by reasoning: a hand-built
   header with `data_offsets: [-8, -4]` (a negative start, valid-looking span) opened as a

@@ -416,19 +416,35 @@ int k3_st_open(K3St *s, const char *dir)
     DIR *d = opendir(dir);
     if (!d) { fprintf(stderr, "k3_st: cannot open directory %s\n", dir); return -1; }
 
-    char **files = NULL; int nf = 0, cf = 0;
+    /* Every allocation below is checked: unchecked, a realloc failure here overwrites
+     * `files` with NULL and the very next line dereferences it, turning an out-of-
+     * memory condition into a crash instead of the clean failure this function returns
+     * everywhere else. */
+    char **files = NULL; int nf = 0, cf = 0, oom = 0;
     struct dirent *e;
     while ((e = readdir(d))) {
         size_t n = strlen(e->d_name);
         if (n < 12 || strcmp(e->d_name + n - 12, ".safetensors")) continue;
-        if (nf == cf) { cf = cf ? cf * 2 : 32; files = (char **)realloc(files, cf * sizeof *files); }
+        if (nf == cf) {
+            int nc = cf ? cf * 2 : 32;
+            char **nfiles = (char **)realloc(files, (size_t)nc * sizeof *files);
+            if (!nfiles) { oom = 1; break; }
+            files = nfiles; cf = nc;
+        }
         size_t len = strlen(dir) + 1 + n + 1;
         files[nf] = (char *)malloc(len);
+        if (!files[nf]) { oom = 1; break; }
         snprintf(files[nf], len, "%s/%s", dir, e->d_name);
         nf++;
     }
     closedir(d);
 
+    if (oom) {
+        fprintf(stderr, "k3_st: out of memory scanning %s\n", dir);
+        for (int i = 0; i < nf; i++) free(files[i]);
+        free(files);
+        return -1;
+    }
     if (nf == 0) { fprintf(stderr, "k3_st: no .safetensors files in %s\n", dir); free(files); return -1; }
     /* Sort so shard indices are stable across runs and machines; readdir order is not. */
     qsort(files, nf, sizeof *files, cmp_str);
