@@ -122,6 +122,13 @@ not needing the bytes at all.
 
 ### Fixed
 
+- **The CLI's numeric flags silently became 0 on a typo.** `atoi`/`atof` both return 0
+  on input they cannot parse, so `--gen abc` quietly ran `--gen 0` and `--kv-window 3.5`
+  quietly ran `--kv-window 3` rather than either refusing the mistyped value. Same bug,
+  same fix, as the `--ids` case: full-string `strtol`/`strtod` with an endptr check via
+  two small helpers, applied to all nine numeric flags (`--gen`, `--cache-gb`,
+  `--layers`, `--spec`, `--draft-trunk-gb`, `--trunk-gb`, `--trunk-ring`, `--kv-window`,
+  `--kv-sinks`). `make test`'s CLI argument validation step gained three of these cases.
 - `k3_st_open`'s directory scan used two unchecked allocations (the `realloc` growing
   the shard file list, and the `malloc` for each path string) on a machine this engine
   already expects to be near its memory budget. A failure of either turned an

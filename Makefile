@@ -198,7 +198,16 @@ test: $(TEST_BINS) $(CLI_BIN)
 	  ./$(CLI_BIN) $(BUILD)/cli_argtest --ids "$$(yes 1 | head -n 32769 | tr '\n' ',')" 2>&1 \
 	      | grep -q "exceeds the" \
 	      && echo "  ok    --ids refuses a prompt over the K3_MAX_PROMPT ceiling" \
-	      || { echo "  FAIL  --ids should refuse an over-ceiling prompt"; exit 1; }
+	      || { echo "  FAIL  --ids should refuse an over-ceiling prompt"; exit 1; }; \
+	  ./$(CLI_BIN) $(BUILD)/cli_argtest --ids "1,2,3" --gen abc 2>&1 | grep -q "not a valid integer" \
+	      && echo "  ok    --gen refuses a non-numeric value" \
+	      || { echo "  FAIL  --gen should refuse a non-numeric value"; exit 1; }; \
+	  ./$(CLI_BIN) $(BUILD)/cli_argtest --ids "1,2,3" --kv-window 3.5 2>&1 | grep -q "not a valid integer" \
+	      && echo "  ok    --kv-window refuses a non-integer value" \
+	      || { echo "  FAIL  --kv-window should refuse a non-integer value"; exit 1; }; \
+	  ./$(CLI_BIN) $(BUILD)/cli_argtest --ids "1,2,3" --cache-gb notanumber 2>&1 | grep -q "not a valid number" \
+	      && echo "  ok    --cache-gb refuses a non-numeric value" \
+	      || { echo "  FAIL  --cache-gb should refuse a non-numeric value"; exit 1; }
 	@echo "== tokenizer =="; \
 	  if [ -f "$(TOK_FILES)/tiktoken.model" ]; then \
 	      ./$(BIN)/test_tok $(TOK_FILES) roundtrip src/core/k3_ops.c; \
