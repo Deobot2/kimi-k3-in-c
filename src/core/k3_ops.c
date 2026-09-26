@@ -291,11 +291,15 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     }
 
     /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
-     * would leave the recurrent state permanently scaled but never updated -- silent,
-     * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    /* Stack, not heap: this runs once per (token, head) under an OpenMP parallel-for
+     * over heads, so a calloc/free here means every thread hits the allocator on every
+     * recurrence step. k3_cfg.h rejects any checkpoint with kda_head_dim above the
+     * bound before this ever runs, so the bound check below is a belt-and-braces abort
+     * rather than the primary guard. */
+    if (dv > K3_MAX_KDA_HEAD_DIM)
+        k3_fatal_bound("KDA recurrence head_dim", (long)dv, (long)K3_MAX_KDA_HEAD_DIM);
+    float u[K3_MAX_KDA_HEAD_DIM];
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -320,7 +324,6 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
 }
 
 /* ---------------------------------------------------------------- matmul ---- */

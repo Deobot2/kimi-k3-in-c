@@ -751,6 +751,16 @@ void   k3_decoder_layer_kv(float *h, float *block_residual, int *n_blocks,
  * at load time rather than a corrupted stack mid-decode. */
 #define K3_MAX_TOPK 64
 
+/* Upper bound on kda_head_dim, and therefore on the stack-allocated recurrence
+ * temporary inside k3_kda_step. K3 ships 128.
+ *
+ * k3_kda_step runs once per (token, head) inside an OpenMP parallel-for over heads --
+ * up to 96 threads calling it every recurrence step -- so its temporary is a fixed
+ * stack array rather than a heap allocation the allocator would serialise across
+ * threads. k3_cfg.h validates kda_head_dim against this so an oversized checkpoint
+ * fails at load time with a clear message instead of overrunning the array mid-decode. */
+#define K3_MAX_KDA_HEAD_DIM 512
+
 void k3_mxfp4_dequant(float *out, const unsigned char *packed,
                       const unsigned char *scales, int rows, int pcols, int group);
 
