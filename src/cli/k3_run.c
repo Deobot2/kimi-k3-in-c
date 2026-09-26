@@ -210,7 +210,10 @@ static K3PplDoc *ppl_load_suite(const char *path, int *ndoc, int *maxlen, int vo
         const size_t room = (size_t)(ln - (tab - line)) + 1;
         d[nd].name = strdup(line);
         d[nd].ids  = (int *)malloc(room * sizeof(int));
-        if (!d[nd].name || !d[nd].ids) { bad = 1; break; }
+        /* Any bad=1 from here on leaves d[nd].name/.ids allocated but nd not yet
+         * incremented, which the cleanup loop below (bounded by nd) would not reach --
+         * so each such exit frees this record itself before breaking. */
+        if (!d[nd].name || !d[nd].ids) { free(d[nd].name); free(d[nd].ids); bad = 1; break; }
         int n = 0;
         for (const char *p = tab + 1; *p; ) {
             char *end = NULL;
@@ -219,6 +222,7 @@ static K3PplDoc *ppl_load_suite(const char *path, int *ndoc, int *maxlen, int vo
             if (v < 0 || v >= vocab) {
                 fprintf(stderr, "k3: %s:%d (%s) has id %ld outside the vocabulary of %d\n",
                         path, lineno, d[nd].name, v, vocab);
+                free(d[nd].name); free(d[nd].ids);
                 bad = 1; break;
             }
             d[nd].ids[n++] = (int)v;
@@ -232,6 +236,7 @@ static K3PplDoc *ppl_load_suite(const char *path, int *ndoc, int *maxlen, int vo
         if (n < 2) {
             fprintf(stderr, "k3: %s:%d (%s) has %d id(s); a document needs at least 2\n",
                     path, lineno, d[nd].name, n);
+            free(d[nd].name); free(d[nd].ids);
             bad = 1; break;
         }
         d[nd].n = n;
