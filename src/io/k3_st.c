@@ -386,13 +386,21 @@ int k3_st_open(K3St *s, const char *dir)
     qsort(files, nf, sizeof *files, cmp_str);
 
     s->path = files; s->nshard = nf;
-    s->fd  = (int *)malloc(nf * sizeof(int));
-    s->dfd = (int *)malloc(nf * sizeof(int));
     /* k3_st_close, not free(files): s->path was aliased to `files` two lines above, so
      * freeing it here leaves s->path dangling and k3_st_close would free it a second
-     * time. Let the one function that owns the teardown do all of it. */
-    if (!s->fd || !s->dfd) { k3_st_close(s); return -1; }
-    for (int i = 0; i < nf; i++) { s->fd[i] = -1; s->dfd[i] = -1; }
+     * time. Let the one function that owns the teardown do all of it.
+     *
+     * Each array is filled with -1 right after ITS OWN successful malloc, before the
+     * next one runs. k3_st_close treats any fd[i]/dfd[i] >= 0 as open and closes it, so
+     * if the second malloc failed while the first left its array uninitialised,
+     * k3_st_close would read garbage and could close an unrelated fd elsewhere in the
+     * process. */
+    s->fd  = (int *)malloc(nf * sizeof(int));
+    if (!s->fd) { k3_st_close(s); return -1; }
+    for (int i = 0; i < nf; i++) s->fd[i] = -1;
+    s->dfd = (int *)malloc(nf * sizeof(int));
+    if (!s->dfd) { k3_st_close(s); return -1; }
+    for (int i = 0; i < nf; i++) s->dfd[i] = -1;
 
     Build b; memset(&b, 0, sizeof b);
     for (int i = 0; i < nf; i++) {
