@@ -568,15 +568,19 @@ static int cache_get(K3ExpertSrc *self, int layer, int expert, K3ExpertQ *out)
 
     /* Record the request before serving it. The trace must reflect what the MODEL
      * asked for, independent of what the cache happened to hold, or replaying it at a
-     * different capacity would be meaningless. */
-    if (c->ntrace + 2 > c->captrace) {
-        int64_t nc = c->captrace ? c->captrace * 2 : (1 << 16);
-        int32_t *nt = (int32_t *)realloc(c->trace, (size_t)nc * sizeof(int32_t));
-        if (nt) { c->trace = nt; c->captrace = nc; }
-    }
-    if (c->ntrace + 2 <= c->captrace) {
-        c->trace[c->ntrace++] = layer;
-        c->trace[c->ntrace++] = expert;
+     * different capacity would be meaningless. Only when someone asked for it,
+     * though: every cache_get lands here, so an unconditional append would grow this
+     * buffer for the life of the process on every ordinary run. */
+    if (c->trace_on) {
+        if (c->ntrace + 2 > c->captrace) {
+            int64_t nc = c->captrace ? c->captrace * 2 : (1 << 16);
+            int32_t *nt = (int32_t *)realloc(c->trace, (size_t)nc * sizeof(int32_t));
+            if (nt) { c->trace = nt; c->captrace = nc; }
+        }
+        if (c->ntrace + 2 <= c->captrace) {
+            c->trace[c->ntrace++] = layer;
+            c->trace[c->ntrace++] = expert;
+        }
     }
     pthread_mutex_unlock(&c->mu);
 
@@ -664,11 +668,6 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
 #if defined(MADV_HUGEPAGE)
         if (huge) madvise(c->arena, want, MADV_HUGEPAGE);
 #endif
-    }
-    if (0) {
-        fprintf(stderr, "k3_cache: cannot allocate %.2f GB arena\n",
-                (double)c->nslot * c->slot_bytes / 1e9);
-        return -1;
     }
 
     const size_t nkey = (size_t)c->n_layers * c->n_experts;
@@ -788,6 +787,11 @@ void k3_cache_free(K3Cache *c)
     free(c->ghost); free(c->ghost_mark); free(c->last_topk); free(c->last_n);
     free(c->trace);
     memset(c, 0, sizeof *c);
+}
+
+void k3_cache_set_trace(K3Cache *c, int on)
+{
+    c->trace_on = on;
 }
 
 int k3_cache_dump_trace(const K3Cache *c, const char *path)
