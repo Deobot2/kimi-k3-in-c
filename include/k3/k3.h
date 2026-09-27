@@ -205,9 +205,17 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
  *    2. read    u = S^T k
  *    3. write   S += k (beta*(v-u))^T
  *    4. output  o = S^T q          from the ALREADY UPDATED state
- * q must arrive pre-scaled by d_k^-0.5. */
+ * q must arrive pre-scaled by d_k^-0.5.
+ *
+ * `u` is caller-owned scratch of dv floats, one head's worth. This runs once per head
+ * per token per KDA layer -- H*T*69 times a generation step, 96*69 = 6,624 times for a
+ * single incremental token at the released dimensions -- so it takes scratch rather
+ * than allocating its own: a malloc/free pair that small is cheap once, not thousands
+ * of times a token. The caller must supply a distinct buffer per concurrently running
+ * head (k3_kda_layer's per-thread slice of `wr`-sized scratch does this). */
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
-                 const float *v, const float *alpha, float beta, int dk, int dv);
+                 const float *v, const float *alpha, float beta, int dk, int dv,
+                 float *u);
 
 /* y[out] = W[out][in] . x[in].  W is row-major, no bias anywhere in this model. */
 void k3_matmul(float *y, const float *x, const float *W, int in, int out);
