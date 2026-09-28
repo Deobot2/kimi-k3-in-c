@@ -469,6 +469,21 @@ const K3Tensor *k3_st_find(const K3St *s, const char *name)
 
 /* ------------------------------------------------------------------ reading */
 
+/* Read exactly n bytes from fd at off, retrying only because the kernel is free to
+ * return short of a full request. Stops and returns whatever it has so far on a short
+ * read (r <= 0): at EOF that is expected, and every caller below already knows how to
+ * turn "less than requested" into its own error or its own padding arithmetic. */
+static int64_t pread_retry(int fd, void *buf, int64_t n, int64_t off)
+{
+    int64_t got = 0;
+    while (got < n) {
+        ssize_t r = pread(fd, (char *)buf + got, (size_t)(n - got), (off_t)(off + got));
+        if (r <= 0) break;
+        got += r;
+    }
+    return got;
+}
+
 int64_t k3_st_read_aligned(const K3St *s, int shard, int64_t off, int64_t nbytes,
                            void *buf, int64_t bufcap, int64_t *payload_off)
 {
@@ -478,14 +493,7 @@ int64_t k3_st_read_aligned(const K3St *s, int shard, int64_t off, int64_t nbytes
     if (dfd < 0) {                      /* no O_DIRECT: plain buffered read */
         if (payload_off) *payload_off = 0;
         if (bufcap < nbytes) return 0;
-        int64_t got = 0;
-        while (got < nbytes) {
-            ssize_t r = pread(s->fd[shard], (char *)buf + got,
-                              (size_t)(nbytes - got), (off_t)(off + got));
-            if (r <= 0) return got;
-            got += r;
-        }
-        return got;
+        return pread_retry(s->fd[shard], buf, nbytes, off);
     }
 
     /* Widen outward to the enclosing aligned window. */
@@ -496,33 +504,19 @@ int64_t k3_st_read_aligned(const K3St *s, int shard, int64_t off, int64_t nbytes
     if (len > bufcap) return 0;
     if (payload_off) *payload_off = pad;
 
-    int64_t got = 0;
-    while (got < len) {
-        ssize_t r = pread(dfd, (char *)buf + got, (size_t)(len - got), (off_t)(lo + got));
-        if (r <= 0) {
-            /* The final window of a shard can extend past EOF, which is a short read
-             * rather than an error. Accept it once the payload itself is covered. */
-            break;
-        }
-        got += r;
-    }
+    /* The final window of a shard can extend past EOF, which is a short read rather
+     * than an error. Accept it once the payload itself is covered. */
+    const int64_t got = pread_retry(dfd, buf, len, lo);
     return got >= pad + nbytes ? nbytes : (got > pad ? got - pad : 0);
 }
 
 int64_t k3_st_read(const K3St *s, const K3Tensor *t, void *buf)
 {
-    /* One coalesced pread, looped only because the kernel may return short. This is the
-     * call the streaming tier will make per expert: a 17.55 MB contiguous span. */
-    int64_t got = 0;
-    while (got < t->nbytes) {
-        ssize_t r = pread(s->fd[t->shard], (char *)buf + got,
-                          (size_t)(t->nbytes - got), (off_t)(t->off + got));
-        if (r <= 0) {
-            fprintf(stderr, "k3_st: short read on %s at +%lld\n", t->name, (long long)got);
-            return got;
-        }
-        got += r;
-    }
+    /* One coalesced pread, retried only because the kernel may return short. This is
+     * the call the streaming tier will make per expert: a 17.55 MB contiguous span. */
+    const int64_t got = pread_retry(s->fd[t->shard], buf, t->nbytes, t->off);
+    if (got < t->nbytes)
+        fprintf(stderr, "k3_st: short read on %s at +%lld\n", t->name, (long long)got);
     return got;
 }
 
