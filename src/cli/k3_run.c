@@ -714,6 +714,22 @@ static void k3_preset_list(FILE *f)
                "Run scripts/k3-doctor.sh to see which one this machine fits.\n");
 }
 
+/* Strict parse for a --*-gb budget flag. Unlike atof, a value that is not a plain
+ * non-negative number -- a typo, a stray letter, an empty string -- is reported at the
+ * point it was typed rather than silently becoming 0.0, which reads as "use no budget"
+ * instead of "you made a typo" and would otherwise surface many minutes later as an
+ * unexplained refusal to admit even one expert. */
+static double parse_gb_arg(const char *flag, const char *s)
+{
+    char *end;
+    const double v = strtod(s, &end);
+    if (end == s || *end != '\0' || v < 0.0) {
+        fprintf(stderr, "%s %s: not a non-negative number of GB\n", flag, s);
+        exit(2);
+    }
+    return v;
+}
+
 /* PEAK resident set, in bytes. ru_maxrss is kilobytes on Linux and BYTES on Darwin, so
  * the scale factor differs by platform; applying the Linux one on macOS would overstate
  * the peak by 1024x.
@@ -931,7 +947,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) { gen = atoi(argv[++i]); gen_set = 1; }
-        else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = parse_gb_arg("--cache-gb", argv[++i]);
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) want_layers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
         else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
@@ -944,11 +960,11 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--load-state") && i + 1 < argc) load_state = argv[++i];
         else if (!strcmp(argv[i], "--save-state") && i + 1 < argc) save_state = argv[++i];
         else if (!strcmp(argv[i], "--draft-trunk") && i + 1 < argc) draft_dir = argv[++i];
-        else if (!strcmp(argv[i], "--draft-trunk-gb") && i + 1 < argc) draft_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--draft-trunk-gb") && i + 1 < argc) draft_gb = parse_gb_arg("--draft-trunk-gb", argv[++i]);
         else if (!strcmp(argv[i], "--trunk-gb") && i + 1 < argc) {
             const char *v = argv[++i];
             if (!strcmp(v, "auto")) budget_auto = 1;
-            else { trunk_gb = atof(v); budget_auto = 0; }
+            else { trunk_gb = parse_gb_arg("--trunk-gb", v); budget_auto = 0; }
         }
         else if (!strcmp(argv[i], "--trunk-ring") && i + 1 < argc) trunk_ring = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--incremental")) incremental = 1;
@@ -2137,7 +2153,8 @@ int main(int argc, char **argv)
     }
     free(spec_snap);
     printf("--------------------------------------------------------------------\n");
-    printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total, t_total / nout);
+    printf("%d tokens in %.1f s, %.2f s/token average\n",
+           nout, t_total, nout ? t_total / nout : 0.0);
 
     /* Decoded text, when a tokenizer is loaded. Printed as a distinct block rather than
      * streamed per token: a partially-decoded multi-byte sequence is not valid UTF-8, so
