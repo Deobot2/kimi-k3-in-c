@@ -368,19 +368,34 @@ int k3_st_open(K3St *s, const char *dir)
     DIR *d = opendir(dir);
     if (!d) { fprintf(stderr, "k3_st: cannot open directory %s\n", dir); return -1; }
 
-    char **files = NULL; int nf = 0, cf = 0;
+    char **files = NULL; int nf = 0, cf = 0, scan_bad = 0;
     struct dirent *e;
     while ((e = readdir(d))) {
         size_t n = strlen(e->d_name);
         if (n < 12 || strcmp(e->d_name + n - 12, ".safetensors")) continue;
-        if (nf == cf) { cf = cf ? cf * 2 : 32; files = (char **)realloc(files, cf * sizeof *files); }
+        if (nf == cf) {
+            const int ncf = cf ? cf * 2 : 32;
+            /* Into a temporary: on failure realloc returns NULL and leaves the original
+             * block untouched, so assigning straight into `files` would both lose the
+             * result and leak everything scanned so far. */
+            char **nfiles = (char **)realloc(files, (size_t)ncf * sizeof *files);
+            if (!nfiles) { scan_bad = 1; break; }
+            files = nfiles; cf = ncf;
+        }
         size_t len = strlen(dir) + 1 + n + 1;
         files[nf] = (char *)malloc(len);
+        if (!files[nf]) { scan_bad = 1; break; }
         snprintf(files[nf], len, "%s/%s", dir, e->d_name);
         nf++;
     }
     closedir(d);
 
+    if (scan_bad) {
+        fprintf(stderr, "k3_st: out of memory scanning %s\n", dir);
+        for (int i = 0; i < nf; i++) free(files[i]);
+        free(files);
+        return -1;
+    }
     if (nf == 0) { fprintf(stderr, "k3_st: no .safetensors files in %s\n", dir); free(files); return -1; }
     /* Sort so shard indices are stable across runs and machines; readdir order is not. */
     qsort(files, nf, sizeof *files, cmp_str);
