@@ -999,7 +999,29 @@ int main(int argc, char **argv)
             return 0;
         }
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
-        else { fprintf(stderr, "unknown option %s\n\n", argv[i]); usage(stderr); return 2; }
+        else {
+            /* A recognised flag that takes a value, given as the LAST argument, falls
+             * through every branch above (each is guarded by `&& i + 1 < argc`) and
+             * lands here indistinguishable from a typo -- "unknown option --gen" sends
+             * the user looking in the wrong place when the real problem is a missing
+             * value. Naming it separately costs one linear scan over a short, fixed
+             * list, once, on the error path only. */
+            static const char *needs_arg[] = {
+                "--ids", "--prompt", "--prompt-file", "--tok", "--config", "--gen",
+                "--cache-gb", "--layers", "--out", "--trunk", "--spec", "--ppl-file",
+                "--ppl-dump", "--calib-dump", "--load-state", "--save-state",
+                "--draft-trunk", "--draft-trunk-gb", "--trunk-gb", "--trunk-ring",
+                "--kv-window", "--kv-sinks", "--dump-logits", "--dump-cache-trace",
+                "--preset",
+            };
+            int known = 0;
+            for (size_t k = 0; k < sizeof needs_arg / sizeof *needs_arg; k++)
+                if (!strcmp(argv[i], needs_arg[k])) { known = 1; break; }
+            if (known) fprintf(stderr, "%s requires an argument\n\n", argv[i]);
+            else       fprintf(stderr, "unknown option %s\n\n", argv[i]);
+            usage(stderr);
+            return 2;
+        }
     }
     {
         int nsrc = (ids_s != NULL) + (prompt_text != NULL) + (prompt_file != NULL);
