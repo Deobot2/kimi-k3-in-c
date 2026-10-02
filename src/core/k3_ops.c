@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
@@ -1615,7 +1616,6 @@ void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
  * of masking, shifting and two separate lookups. 2 KB, built once, shared by all
  * threads after initialisation. */
 static float K3_E2M1_PAIR[256][2];
-static int   k3_pair_ready = 0;
 
 static void k3_pair_init(void)
 {
@@ -1623,19 +1623,26 @@ static void k3_pair_init(void)
         K3_E2M1_PAIR[b][0] = K3_E2M1[b & 0x0F];   /* low nibble  = EVEN element */
         K3_E2M1_PAIR[b][1] = K3_E2M1[b >> 4];     /* high nibble = ODD element  */
     }
-    k3_pair_ready = 1;
 }
 
 /* E8M0 byte to its power of two. 255 is NaN by spec and maps to zero. Precomputed
  * because ldexpf in the group loop is a function call the compiler will not inline
  * into a vectorised body. */
 static float K3_E8M0[256];
-static int   k3_e8m0_ready = 0;
 
 static void k3_e8m0_init(void)
 {
     for (int b = 0; b < 256; b++) K3_E8M0[b] = (b == 255) ? 0.0f : ldexpf(1.0f, b - 127);
-    k3_e8m0_ready = 1;
+}
+
+/* Both tables are built exactly once, race-free: a plain "ready" flag lets a second
+ * caller thread see the flag before the table stores, and read zeros. */
+static pthread_once_t k3_tables_once = PTHREAD_ONCE_INIT;
+
+static void k3_tables_init(void)
+{
+    k3_pair_init();
+    k3_e8m0_init();
 }
 
 /* y[rows] = W[rows][in] . x[in], with W read straight out of packed MXFP4 and never
@@ -1761,8 +1768,7 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
     const int pcols = in / 2;                     /* two elements per byte */
     const int ngrp  = (in + group - 1) / group;
 
-    if (!k3_pair_ready)  k3_pair_init();
-    if (!k3_e8m0_ready)  k3_e8m0_init();
+    pthread_once(&k3_tables_once, k3_tables_init);
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (rows > 64)
@@ -1782,8 +1788,7 @@ void k3_matmul_mx4(float *y, const float *x, const void *W, int in, int out)
     const size_t pn = (size_t)in / 2u;
     const unsigned char *base = (const unsigned char *)W;
 
-    if (!k3_pair_ready)  k3_pair_init();
-    if (!k3_e8m0_ready)  k3_e8m0_init();
+    pthread_once(&k3_tables_once, k3_tables_init);
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
