@@ -1699,7 +1699,35 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
              * a table lookup sits in the middle of the accumulation. */
             float wf[64];                         /* group is 32 for K3; 64 is headroom */
             const int half = n >> 1;
-            for (int j = 0; j < half; j++) {
+            int j0 = 0;
+#if defined(__AVX2__)
+            /* Same floats as the table below, by construction: E2M1 magnitudes are the
+             * 8 entries of one register permute, the sign nibble bit is OR-ed into the
+             * float sign. 16 packed bytes -> 32 floats with no memory lookups. */
+            if (group == 32 && n == 32) {
+                const __m256 mag = _mm256_setr_ps(0.0f, 0.5f, 1.0f, 1.5f,
+                                                  2.0f, 3.0f, 4.0f, 6.0f);
+                const __m128i raw = _mm_loadu_si128((const __m128i *)pb);
+                const __m128i m4  = _mm_set1_epi8(0x0F);
+                const __m128i lo  = _mm_and_si128(raw, m4);
+                const __m128i hi  = _mm_and_si128(_mm_srli_epi16(raw, 4), m4);
+                const __m128i nb[2] = { _mm_unpacklo_epi8(lo, hi),
+                                        _mm_unpackhi_epi8(lo, hi) };
+                for (int h = 0; h < 2; h++) {
+                    for (int q = 0; q < 2; q++) {
+                        const __m128i b8 = q ? _mm_srli_si128(nb[h], 8) : nb[h];
+                        const __m256i idx = _mm256_cvtepu8_epi32(b8);
+                        __m256 v = _mm256_permutevar8x32_ps(
+                            mag, _mm256_and_si256(idx, _mm256_set1_epi32(7)));
+                        v = _mm256_or_ps(v, _mm256_castsi256_ps(_mm256_slli_epi32(
+                            _mm256_and_si256(idx, _mm256_set1_epi32(8)), 28)));
+                        _mm256_storeu_ps(wf + h * 16 + q * 8, v);
+                    }
+                }
+                j0 = half;
+            }
+#endif
+            for (int j = j0; j < half; j++) {
                 const float *pv = K3_E2M1_PAIR[pb[j]];
                 wf[2 * j]     = pv[0];
                 wf[2 * j + 1] = pv[1];
@@ -1748,7 +1776,16 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
                 sub = (b0 + b1) + (b2 + b3);
             }
 #endif
+            /* wf[0..n) is always filled above; the AVX2 fast path fills it wholesale,
+             * which gcc cannot see through on this tail loop. */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
             for (; i < n; i++) sub = fma((double)wf[i], (double)xg[i], sub);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
             acc += sub * (double)K3_E8M0[sb];
         }
     }
