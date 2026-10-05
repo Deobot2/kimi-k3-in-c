@@ -1638,37 +1638,6 @@ static void k3_e8m0_init(void)
     k3_e8m0_ready = 1;
 }
 
-/* y[rows] = W[rows][in] . x[in], with W read straight out of packed MXFP4 and never
- * materialised as floats. This is not an optimisation; it is what makes streaming
- * experts possible at all.
- *
- * One routed expert is 33,030,144 parameters. Dequantised to fp32 that is 132 MB, so
- * the 1,472 experts a single token touches would be 194 GB of materialised weights. As
- * packed nibbles the same expert is 17.55 MB. A matrix-vector product is memory bound,
- * so reading 7.5x fewer bytes makes this kernel FASTER than dequantising first.
- *
- * The loop is structured around the 32-element group because the scale is constant
- * within one: it factors out of the inner sum and is applied once per group instead of
- * once per element. At group 32 each group is exactly 16 packed bytes.
- *
- * PRECONDITIONS, none of these are checked, and violating them corrupts memory:
- *   - group <= 64. The expanded group goes into a fixed wf[64] stack buffer.
- *   - `in` is even. The packed row stride is in/2 bytes, two elements per byte.
- *   - `packed` is rows x (in/2) bytes; `scales` is rows x ceil(in/group) bytes.
- *   - A scale byte of 255 is NaN by the OCP MX spec and zeroes its whole group.
- *
- * ACCURACY CONTRACT. This kernel is deliberately NOT bit-identical to
- * dequantise-then-k3_matmul, and no caller should assume it is. It sums each group of
- * 32 and applies that group's scale before accumulating; dequantise-then-matmul sums
- * every term of the row under one set of accumulators. The orders differ.
- *
- * The difference is bounded and tiny. Every individual product is EXACT in double, an
- * E2M1 value carries 3 mantissa bits and x carries 24, so the product needs 27 of the
- * 53 available, so only the additions round, and reassociating exact terms moves the
- * result by roughly 1 ULP of double, order 1e-16 relative. The required agreement is
- * 1e-6 against dequantise-then-matmul on real checkpoint weights, gated by
- * tests/unit/test_expert.c. The margin is nine orders of magnitude.
- */
 /* ONE row of an MXFP4 matrix, dotted with x.
  *
  * Factored out so the two callers -- the routed experts, whose packed nibbles and E8M0
@@ -1755,6 +1724,37 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
     return acc;
 }
 
+/* y[rows] = W[rows][in] . x[in], with W read straight out of packed MXFP4 and never
+ * materialised as floats. This is not an optimisation; it is what makes streaming
+ * experts possible at all.
+ *
+ * One routed expert is 33,030,144 parameters. Dequantised to fp32 that is 132 MB, so
+ * the 1,472 experts a single token touches would be 194 GB of materialised weights. As
+ * packed nibbles the same expert is 17.55 MB. A matrix-vector product is memory bound,
+ * so reading 7.5x fewer bytes makes this kernel FASTER than dequantising first.
+ *
+ * The loop is structured around the 32-element group because the scale is constant
+ * within one: it factors out of the inner sum and is applied once per group instead of
+ * once per element. At group 32 each group is exactly 16 packed bytes.
+ *
+ * PRECONDITIONS, none of these are checked, and violating them corrupts memory:
+ *   - group <= 64. The expanded group goes into a fixed wf[64] stack buffer.
+ *   - `in` is even. The packed row stride is in/2 bytes, two elements per byte.
+ *   - `packed` is rows x (in/2) bytes; `scales` is rows x ceil(in/group) bytes.
+ *   - A scale byte of 255 is NaN by the OCP MX spec and zeroes its whole group.
+ *
+ * ACCURACY CONTRACT. This kernel is deliberately NOT bit-identical to
+ * dequantise-then-k3_matmul, and no caller should assume it is. It sums each group of
+ * 32 and applies that group's scale before accumulating; dequantise-then-matmul sums
+ * every term of the row under one set of accumulators. The orders differ.
+ *
+ * The difference is bounded and tiny. Every individual product is EXACT in double, an
+ * E2M1 value carries 3 mantissa bits and x carries 24, so the product needs 27 of the
+ * 53 available, so only the additions round, and reassociating exact terms moves the
+ * result by roughly 1 ULP of double, order 1e-16 relative. The required agreement is
+ * 1e-6 against dequantise-then-matmul on real checkpoint weights, gated by
+ * tests/unit/test_expert.c. The margin is nine orders of magnitude.
+ */
 void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
                      const unsigned char *scales, int in, int rows, int group)
 {
