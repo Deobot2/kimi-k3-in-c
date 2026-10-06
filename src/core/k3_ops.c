@@ -700,11 +700,20 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++)
-                acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
-            y[j] = (float)acc;
+        for (int j0 = 0; j0 < in; j0 += 8) {
+            /* Eight columns per sweep: each row contributes eight adjacent bf16 values,
+             * so a cache line is used whole instead of one element per row. Every
+             * column still has its own double accumulator summed in row order, so the
+             * result is bit-identical to the one-column loop. */
+            const int n = in - j0 < 8 ? in - j0 : 8;
+            double acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            for (int r = 0; r < rows; r++) {
+                const uint16_t *wr = w16 + (size_t)r * in + j0;
+                const double xr = (double)x[r];
+                for (int k = 0; k < n; k++)
+                    acc[k] += xr * (double)k3_bf16f(wr[k]);
+            }
+            for (int k = 0; k < n; k++) y[j0 + k] = (float)acc[k];
         }
     } else if (wdt == K3_WMX4) {
         /* A quantised trunk. Column j of row r is the nibble at byte j/2 of that row,
