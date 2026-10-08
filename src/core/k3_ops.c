@@ -30,6 +30,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
@@ -700,11 +703,31 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++)
-                acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
-            y[j] = (float)acc;
+        for (int j0 = 0; j0 < in; j0 += 4) {
+#if defined(__AVX2__)
+            if (j0 + 4 <= in) {
+                /* Four adjacent columns per pass: one 8-byte load per row instead of
+                 * four strided 2-byte ones. Each lane is still its own double
+                 * accumulator summed over r in index order with a separate mul and add
+                 * (no FMA, -ffp-contract=off), so every lane equals the scalar result
+                 * to the bit. */
+                __m256d acc = _mm256_setzero_pd();
+                for (int r = 0; r < rows; r++) {
+                    __m128i h = _mm_loadl_epi64((const __m128i *)(w16 + (size_t)r * in + j0));
+                    __m128 f = _mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h), 16));
+                    acc = _mm256_add_pd(acc, _mm256_mul_pd(_mm256_set1_pd((double)x[r]),
+                                                           _mm256_cvtps_pd(f)));
+                }
+                _mm_storeu_ps(y + j0, _mm256_cvtpd_ps(acc));
+                continue;
+            }
+#endif
+            for (int j = j0; j < in && j < j0 + 4; j++) {
+                double acc = 0.0;
+                for (int r = 0; r < rows; r++)
+                    acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
+                y[j] = (float)acc;
+            }
         }
     } else if (wdt == K3_WMX4) {
         /* A quantised trunk. Column j of row r is the nibble at byte j/2 of that row,

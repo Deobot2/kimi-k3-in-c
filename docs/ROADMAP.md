@@ -65,7 +65,9 @@ KDA recurrence does not: it is still plain scalar C, and it is the largest remai
 un-vectorised kernel on the non-I/O path.
 
 `k3_matmul_tr`, added for the latent KV cache's query absorption, is the second: it is a
-strided column sweep with a double accumulator per output and no vector path at all. It
+strided column sweep with a double accumulator per output. Its bf16 path now has an AVX2
+route (four adjacent columns per pass, bit-identical to the scalar loop); the MXFP4 and
+int8 paths are still scalar. It
 runs 96 times per MLA layer per token, so it is small next to the recurrence but it is
 new and it is scalar.
 
