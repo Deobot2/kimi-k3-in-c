@@ -282,45 +282,50 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
-    /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
-     *    channel, not a scalar, which is what "channel-wise forget gate" means. */
+    /* Two sweeps over S rather than four. Every per-element operation below is the same
+     * one, in the same order, as the four-sweep form (decay; u = S^T k; delta write;
+     * o = S^T q), so results are bit-identical; only the number of times the dk*dv
+     * state is pulled through cache changes. The state is the kernel's whole working set
+     * and it is re-read per head per token, so halving the sweeps is the cost that matters.
+     *
+     * u is a stack buffer for the released head width; larger widths fall back to the heap. */
+    float ubuf[256];
+    float *u = ubuf;
+    if (dv > (int)(sizeof ubuf / sizeof ubuf[0])) {
+        u = (float *)malloc((size_t)dv * sizeof(float));
+        if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    }
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
+
+    /* Sweep 1: channel-wise decay (scale ROW i of S by alpha[i]; the gate is per key
+     * channel, not a scalar) fused with the read of the decayed state along k, u = S^T k.
+     * The decay is applied to every row; only the read skips zero k. */
     for (int i = 0; i < dk; i++) {
         float *row = S + (size_t)i * dv;
-        const float a = alpha[i];
-        for (int j = 0; j < dv; j++) row[j] *= a;
+        const float a = alpha[i], ki = k[i];
+        if (ki == 0.0f) {
+            for (int j = 0; j < dv; j++) row[j] *= a;
+        } else {
+            for (int j = 0; j < dv; j++) { row[j] *= a; u[j] += ki * row[j]; }
+        }
     }
 
-    /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
-     * would leave the recurrent state permanently scaled but never updated -- silent,
-     * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
-    for (int i = 0; i < dk; i++) {
-        const float ki = k[i];
-        if (ki == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) u[j] += ki * row[j];
-    }
-
-    /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
-     *    it a DELTA rule rather than plain accumulation. */
-    for (int i = 0; i < dk; i++) {
-        const float ki = k[i];
-        if (ki == 0.0f) continue;
-        float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
-    }
-
-    /* 4. output from the ALREADY UPDATED state: o = S^T q */
+    /* Sweep 2: rank-one delta write, fused with the output read from the ALREADY UPDATED
+     * state, o = S^T q. (v - u) is the prediction error, which is what makes this a DELTA
+     * rule rather than plain accumulation. Row i is final once its own update is done, so
+     * it can feed o immediately. */
     for (int j = 0; j < dv; j++) o[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
-        const float qi = q[i];
-        if (qi == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) o[j] += qi * row[j];
+        float *row = S + (size_t)i * dv;
+        const float ki = k[i], qi = q[i];
+        if (ki != 0.0f) {
+            const float kb = ki * beta;
+            for (int j = 0; j < dv; j++) row[j] += kb * (v[j] - u[j]);
+        }
+        if (qi != 0.0f)
+            for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
+    if (u != ubuf) free(u);
 }
 
 /* ---------------------------------------------------------------- matmul ---- */
