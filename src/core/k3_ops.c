@@ -31,6 +31,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
  * scratch without changing a published signature. They are hundreds of bytes to a few
@@ -702,10 +706,30 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 {
     if (wdt == K3_WBF16) {
         const uint16_t *w16 = (const uint16_t *)W;
+        int j0 = 0;
+#if defined(__AVX2__)
+        /* Four adjacent columns per iteration, one double lane each. Each lane is still
+         * one column's accumulator summed over r in index order, so the arithmetic is
+         * the scalar loop's, lane for lane. The float*float product is exact in double
+         * (8+24 significant bits), so the fused multiply-add rounds exactly as the
+         * scalar mul-then-add does -- the result is bit-identical, not merely close. */
+        const int nb = in & ~3;
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
-        for (int j = 0; j < in; j++) {
+        for (int j = 0; j < nb; j += 4) {
+            __m256d acc = _mm256_setzero_pd();
+            for (int r = 0; r < rows; r++) {
+                const __m128i h = _mm_loadl_epi64((const __m128i *)(w16 + (size_t)r * in + j));
+                const __m256d w = _mm256_cvtps_pd(
+                    _mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h), 16)));
+                acc = _mm256_fmadd_pd(_mm256_set1_pd((double)x[r]), w, acc);
+            }
+            _mm_storeu_ps(y + j, _mm256_cvtpd_ps(acc));
+        }
+        j0 = nb;
+#endif
+        for (int j = j0; j < in; j++) {
             double acc = 0.0;
             for (int r = 0; r < rows; r++)
                 acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
@@ -1463,9 +1487,6 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
 /* K3_E2M1 lives near the top of this file: k3_matmul_tr needs it too, for the
  * transposed sweep over a quantised trunk, and that is defined well before here. */
 
-#if defined(__AVX2__)
-#include <immintrin.h>
-#endif
 
 /* y[out] = W[out][in] . x[in], with W stored as bf16 and widened on read.
  *
