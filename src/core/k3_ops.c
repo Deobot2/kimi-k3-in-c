@@ -742,7 +742,12 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
                 const unsigned char sb = row[pn + grp];
                 if (sb == 255) continue;              /* NaN scale: contributes nothing */
                 const unsigned char nib = odd ? (row[byte] >> 4) : (row[byte] & 0x0F);
-                acc += (double)x[r] * (double)K3_E2M1[nib] * (double)ldexpf(1.0f, (int)sb - 127);
+                /* 2^(sb-127) built from the exponent field: exact for 1..254, which is every
+                 * scale a real checkpoint holds. 0 would be a denormal, so it keeps ldexpf. */
+                float sc;
+                if (sb) { const uint32_t bits = (uint32_t)sb << 23; memcpy(&sc, &bits, sizeof sc); }
+                else    sc = ldexpf(1.0f, -127);
+                acc += (double)x[r] * (double)K3_E2M1[nib] * (double)sc;
             }
             y[j] = (float)acc;
         }
