@@ -31,6 +31,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
  * scratch without changing a published signature. They are hundreds of bytes to a few
@@ -700,11 +704,37 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++)
-                acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
-            y[j] = (float)acc;
+        for (int jb = 0; jb < in; jb += 8) {
+            const int n = in - jb < 8 ? in - jb : 8;
+            int done = 0;
+#if defined(__AVX2__)
+            if (n == 8) {
+                /* Eight adjacent columns at once: row r's eight bf16 are contiguous, so
+                 * this also turns the strided column walk into a forward one. Each lane
+                 * is still its own double accumulator summed over r in order, and
+                 * float*float is exact in double, so the bits match the scalar loop. */
+                __m256d lo = _mm256_setzero_pd(), hi = _mm256_setzero_pd();
+                for (int r = 0; r < rows; r++) {
+                    const __m128i raw = _mm_loadu_si128((const __m128i *)(w16 + (size_t)r * in + jb));
+                    const __m256 wf = _mm256_castsi256_ps(
+                        _mm256_slli_epi32(_mm256_cvtepu16_epi32(raw), 16));
+                    const __m256d xv = _mm256_set1_pd((double)x[r]);
+                    lo = _mm256_add_pd(lo, _mm256_mul_pd(xv, _mm256_cvtps_pd(_mm256_castps256_ps128(wf))));
+                    hi = _mm256_add_pd(hi, _mm256_mul_pd(xv, _mm256_cvtps_pd(_mm256_extractf128_ps(wf, 1))));
+                }
+                _mm_storeu_ps(y + jb, _mm256_cvtpd_ps(lo));
+                _mm_storeu_ps(y + jb + 4, _mm256_cvtpd_ps(hi));
+                done = 1;
+            }
+#endif
+            if (!done) {
+                for (int j = jb; j < jb + n; j++) {
+                    double acc = 0.0;
+                    for (int r = 0; r < rows; r++)
+                        acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
+                    y[j] = (float)acc;
+                }
+            }
         }
     } else if (wdt == K3_WMX4) {
         /* A quantised trunk. Column j of row r is the nibble at byte j/2 of that row,
@@ -1457,10 +1487,6 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
 /* ---------------------------------------------------------------- MXFP4 ---- */
 /* K3_E2M1 lives near the top of this file: k3_matmul_tr needs it too, for the
  * transposed sweep over a quantised trunk, and that is defined well before here. */
-
-#if defined(__AVX2__)
-#include <immintrin.h>
-#endif
 
 /* y[out] = W[out][in] . x[in], with W stored as bf16 and widened on read.
  *
