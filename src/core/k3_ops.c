@@ -294,8 +294,16 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     /* Allocated AFTER the decay above has already modified S. Returning early here
      * would leave the recurrent state permanently scaled but never updated -- silent,
      * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    /* Called once per head per token, so the usual dv (128) lives on the stack: a heap
+     * round trip per call bought nothing. Larger dv falls back to the heap. */
+    float ubuf[256];
+    float *u = ubuf;
+    if (dv > 256) {
+        u = (float *)calloc((size_t)dv, sizeof(float));
+        if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    } else {
+        memset(ubuf, 0, (size_t)dv * sizeof(float));
+    }
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -309,7 +317,8 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float ki = k[i];
         if (ki == 0.0f) continue;
         float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
+        const float kb = ki * beta;               /* same left-to-right product as before */
+        for (int j = 0; j < dv; j++) row[j] += kb * (v[j] - u[j]);
     }
 
     /* 4. output from the ALREADY UPDATED state: o = S^T q */
@@ -320,7 +329,7 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
+    if (u != ubuf) free(u);
 }
 
 /* ---------------------------------------------------------------- matmul ---- */
