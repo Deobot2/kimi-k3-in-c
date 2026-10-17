@@ -693,6 +693,11 @@ size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span)
  *
  * The stride is unfriendly -- consecutive rows are `in` elements apart -- but the whole
  * of W_UK[h] is 128 KB at the released dimensions and stays in L2 across the sweep. */
+/* Columns handled together in the bf16 and fp32 sweeps: each row then contributes a
+ * contiguous run of W instead of one strided element. Every column still has its own
+ * double accumulator summed over r in index order, so the bits do not change. */
+#define K3_TR_BLOCK 16
+
 void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int rows)
 {
     if (wdt == K3_WBF16) {
@@ -700,11 +705,15 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++)
-                acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
-            y[j] = (float)acc;
+        for (int j0 = 0; j0 < in; j0 += K3_TR_BLOCK) {
+            const int nb = in - j0 < K3_TR_BLOCK ? in - j0 : K3_TR_BLOCK;
+            double acc[K3_TR_BLOCK] = {0};
+            for (int r = 0; r < rows; r++) {
+                const uint16_t *wr = w16 + (size_t)r * in + j0;
+                const double xr = (double)x[r];
+                for (int b = 0; b < nb; b++) acc[b] += xr * (double)k3_bf16f(wr[b]);
+            }
+            for (int b = 0; b < nb; b++) y[j0 + b] = (float)acc[b];
         }
     } else if (wdt == K3_WMX4) {
         /* A quantised trunk. Column j of row r is the nibble at byte j/2 of that row,
@@ -759,11 +768,15 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++)
-                acc += (double)x[r] * (double)wf[(size_t)r * in + j];
-            y[j] = (float)acc;
+        for (int j0 = 0; j0 < in; j0 += K3_TR_BLOCK) {
+            const int nb = in - j0 < K3_TR_BLOCK ? in - j0 : K3_TR_BLOCK;
+            double acc[K3_TR_BLOCK] = {0};
+            for (int r = 0; r < rows; r++) {
+                const float *wr = wf + (size_t)r * in + j0;
+                const double xr = (double)x[r];
+                for (int b = 0; b < nb; b++) acc[b] += xr * (double)wr[b];
+            }
+            for (int b = 0; b < nb; b++) y[j0 + b] = (float)acc[b];
         }
     }
 }
