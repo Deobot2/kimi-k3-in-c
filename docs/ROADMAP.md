@@ -57,7 +57,7 @@ Two background threads now exist as well — the trunk reader and the expert-cac
 speculator — so the sweep should cover their interaction with the OpenMP pool rather
 than assuming the pool has the machine to itself.
 
-## 4. SIMD in the KDA recurrence
+## 4. SIMD in the KDA recurrence (partly done: sweeps fused, matmul_tr blocked)
 
 The bf16 trunk matmul and the MXFP4 expert matmul already have hand-written AVX2 paths
 (`src/core/k3_ops.c`), each written to reproduce the scalar reduction order exactly. The
