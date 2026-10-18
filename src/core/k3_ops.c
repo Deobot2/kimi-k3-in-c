@@ -297,8 +297,12 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     /* Allocated AFTER the decay above has already modified S. Returning early here
      * would leave the recurrent state permanently scaled but never updated -- silent,
      * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
+    /* dv is the value head dim (128 at the released size): a stack buffer covers it and
+     * saves a calloc/free per head per token. Larger dv falls back to the heap. */
+    float ubuf[256];
+    float *u = dv <= 256 ? ubuf : (float *)malloc((size_t)dv * sizeof(float));
     if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -307,12 +311,15 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     }
 
     /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
-     *    it a DELTA rule rather than plain accumulation. */
+     *    it a DELTA rule rather than plain accumulation. ki*beta is hoisted out of the
+     *    j loop; it was already the left-hand product in (ki * beta) * (v - u), so the
+     *    arithmetic is unchanged. */
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
+        const float kb = ki * beta;
         float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
+        for (int j = 0; j < dv; j++) row[j] += kb * (v[j] - u[j]);
     }
 
     /* 4. output from the ALREADY UPDATED state: o = S^T q */
@@ -323,7 +330,7 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
+    if (u != ubuf) free(u);
 }
 
 /* ---------------------------------------------------------------- matmul ---- */
