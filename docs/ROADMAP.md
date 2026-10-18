@@ -64,10 +64,9 @@ The bf16 trunk matmul and the MXFP4 expert matmul already have hand-written AVX2
 KDA recurrence does not: it is still plain scalar C, and it is the largest remaining
 un-vectorised kernel on the non-I/O path.
 
-`k3_matmul_tr`, added for the latent KV cache's query absorption, is the second: it is a
-strided column sweep with a double accumulator per output and no vector path at all. It
-runs 96 times per MLA layer per token, so it is small next to the recurrence but it is
-new and it is scalar.
+`k3_matmul_tr`'s bf16 path now has an AVX2 kernel (four columns per step, one double
+accumulator per column, summed in row order, so it is bit-identical to the scalar loop).
+Its MXFP4 and int8 paths are still scalar.
 
 ## 5. Sampling
 
