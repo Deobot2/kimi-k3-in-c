@@ -1698,8 +1698,35 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
              * split exists so the second loop can vectorise, which it cannot do while
              * a table lookup sits in the middle of the accumulation. */
             float wf[64];                         /* group is 32 for K3; 64 is headroom */
-            const int half = n >> 1;
-            for (int j = 0; j < half; j++) {
+            int half = n >> 1;
+            int j = 0;
+#if defined(__AVX2__)
+            /* Sixteen packed bytes (32 elements) per step with no table loads: split
+             * the nibbles, interleave them back into element order (low = even), look
+             * the magnitude up in a 16-byte pshufb table of 2x the E2M1 values (all
+             * small integers), apply the sign bit, widen to float and halve. Every
+             * step is exact, so wf is bit-identical to the K3_E2M1_PAIR expansion. */
+            {
+                const __m128i tab = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12,
+                                                  0, -1, -2, -3, -4, -6, -8, -12);
+                const __m256 half_ = _mm256_set1_ps(0.5f);
+                for (; j + 15 < half; j += 16) {
+                    __m128i b  = _mm_loadu_si128((const __m128i *)(pb + j));
+                    __m128i lo = _mm_and_si128(b, _mm_set1_epi8(0x0F));
+                    __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), _mm_set1_epi8(0x0F));
+                    __m128i i0 = _mm_unpacklo_epi8(lo, hi);   /* elements 0..15  */
+                    __m128i i1 = _mm_unpackhi_epi8(lo, hi);   /* elements 16..31 */
+                    __m128i v0 = _mm_shuffle_epi8(tab, i0);
+                    __m128i v1 = _mm_shuffle_epi8(tab, i1);
+                    float *o = wf + 2 * j;
+                    _mm256_storeu_ps(o,      _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v0)), half_));
+                    _mm256_storeu_ps(o + 8,  _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(v0, 8))), half_));
+                    _mm256_storeu_ps(o + 16, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v1)), half_));
+                    _mm256_storeu_ps(o + 24, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(v1, 8))), half_));
+                }
+            }
+#endif
+            for (; j < half; j++) {
                 const float *pv = K3_E2M1_PAIR[pb[j]];
                 wf[2 * j]     = pv[0];
                 wf[2 * j + 1] = pv[1];
