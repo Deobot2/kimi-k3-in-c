@@ -1694,6 +1694,39 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
             int n = in - g * group;
             if (n > group) n = group;
 
+#if defined(__AVX2__)
+            if (n == 32) {
+                /* Full 32-element group: expand the nibbles in registers instead of through
+                 * K3_E2M1_PAIR and a stack buffer. Nibble k of a little-endian 32-bit word
+                 * is element k of its 8-group (low nibble = even element, as in the table).
+                 * The magnitude is a vpermps lookup on the low 3 bits (it ignores the
+                 * rest); the sign is bit 3 shifted to bit 31. Every value is the exact
+                 * float K3_E2M1 holds, -0.0 included, so the dot below is unchanged
+                 * bit for bit, only the expansion is cheaper. */
+                const __m256 tbl = _mm256_setr_ps(0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f);
+                const __m256i sh_r = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
+                const __m256i sh_l = _mm256_setr_epi32(28, 24, 20, 16, 12, 8, 4, 0);
+                const __m256i sgn = _mm256_set1_epi32((int)0x80000000u);
+                __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
+                for (int q = 0; q < 4; q++) {
+                    uint32_t word;
+                    memcpy(&word, pb + 4 * q, 4);
+                    const __m256i w = _mm256_set1_epi32((int)word);
+                    const __m256 mag = _mm256_permutevar8x32_ps(tbl, _mm256_srlv_epi32(w, sh_r));
+                    const __m256i sg = _mm256_and_si256(_mm256_sllv_epi32(w, sh_l), sgn);
+                    const __m256 wv = _mm256_xor_ps(mag, _mm256_castsi256_ps(sg));
+                    v0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_castps256_ps128(wv)),
+                                         _mm256_cvtps_pd(_mm_loadu_ps(xg + 8 * q)), v0);
+                    v1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(wv, 1)),
+                                         _mm256_cvtps_pd(_mm_loadu_ps(xg + 8 * q + 4)), v1);
+                }
+                double a[4];
+                _mm256_storeu_pd(a, _mm256_add_pd(v0, v1));
+                acc += ((a[0] + a[1]) + (a[2] + a[3])) * (double)K3_E8M0[sb];
+                continue;
+            }
+#endif
+
             /* Expand the group to floats first, then take a plain dot product. The
              * split exists so the second loop can vectorise, which it cannot do while
              * a table lookup sits in the middle of the accumulation. */
