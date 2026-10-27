@@ -294,8 +294,13 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     /* Allocated AFTER the decay above has already modified S. Returning early here
      * would leave the recurrent state permanently scaled but never updated -- silent,
      * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
+    /* This runs once per head per token per KDA layer, so a heap round trip here is
+     * thousands of malloc/free pairs per token. dv is 128 in every shipped config; the
+     * stack buffer covers it and the heap path remains for anything wider. */
+    float ubuf[256];
+    float *u = dv <= 256 ? ubuf : (float *)malloc((size_t)dv * sizeof(float));
     if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -320,7 +325,7 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
+    if (u != ubuf) free(u);
 }
 
 /* ---------------------------------------------------------------- matmul ---- */
