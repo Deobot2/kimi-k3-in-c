@@ -1698,13 +1698,47 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
              * split exists so the second loop can vectorise, which it cannot do while
              * a table lookup sits in the middle of the accumulation. */
             float wf[64];                         /* group is 32 for K3; 64 is headroom */
-            const int half = n >> 1;
-            for (int j = 0; j < half; j++) {
-                const float *pv = K3_E2M1_PAIR[pb[j]];
-                wf[2 * j]     = pv[0];
-                wf[2 * j + 1] = pv[1];
+#if defined(__AVX2__)
+            if (n == 32) {
+                /* Whole-group expansion with no table walk: a byte shuffle maps the
+                 * magnitude bits to twice the E2M1 value (0,1,2,3,4,6,8,12, all exact
+                 * in int8), the sign bit is OR-ed back in, and the 0.5 scale is exact,
+                 * so wf is bit-identical to the pair-table result, -0.0 included. */
+                const __m128i lut = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12,
+                                                  0, 0, 0, 0, 0, 0, 0, 0);
+                const __m128i m0f = _mm_set1_epi8(0x0F), m07 = _mm_set1_epi8(0x07);
+                const __m128i m08 = _mm_set1_epi8(0x08);
+                const __m128i raw = _mm_loadu_si128((const __m128i *)pb);
+                const __m128i lo  = _mm_and_si128(raw, m0f);
+                const __m128i hi  = _mm_and_si128(_mm_srli_epi16(raw, 4), m0f);
+                /* interleave so element 2j is the low nibble of byte j, 2j+1 the high */
+                const __m128i nib[2] = { _mm_unpacklo_epi8(lo, hi),   /* elements 0..15  */
+                                         _mm_unpackhi_epi8(lo, hi) }; /* elements 16..31 */
+                const __m256 half_ = _mm256_set1_ps(0.5f);
+                for (int h = 0; h < 2; h++) {
+                    const __m128i mag = _mm_shuffle_epi8(lut, _mm_and_si128(nib[h], m07));
+                    const __m128i sg  = _mm_and_si128(nib[h], m08);
+                    for (int q = 0; q < 2; q++) {
+                        const __m128i mq = q ? _mm_srli_si128(mag, 8) : mag;
+                        const __m128i sq = q ? _mm_srli_si128(sg, 8) : sg;
+                        __m256 f = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(mq)),
+                                                 half_);
+                        const __m256i sb32 = _mm256_slli_epi32(_mm256_cvtepu8_epi32(sq), 28);
+                        f = _mm256_castsi256_ps(_mm256_or_si256(_mm256_castps_si256(f), sb32));
+                        _mm256_storeu_ps(wf + h * 16 + q * 8, f);
+                    }
+                }
+            } else
+#endif
+            {
+                const int half = n >> 1;
+                for (int j = 0; j < half; j++) {
+                    const float *pv = K3_E2M1_PAIR[pb[j]];
+                    wf[2 * j]     = pv[0];
+                    wf[2 * j + 1] = pv[1];
+                }
+                if (n & 1) wf[n - 1] = K3_E2M1_PAIR[pb[half]][0];
             }
-            if (n & 1) wf[n - 1] = K3_E2M1_PAIR[pb[half]][0];
 
             /* Four double lanes partitioned by i%4, reduced as (s0+s1)+(s2+s3), in BOTH
              * the scalar and the AVX2 path so the two agree bit for bit on every
