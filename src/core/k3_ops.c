@@ -290,12 +290,20 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         for (int j = 0; j < dv; j++) row[j] *= a;
     }
 
-    /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
-     * would leave the recurrent state permanently scaled but never updated -- silent,
-     * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    /* 2. read the state along k:  u = S^T k.
+     * Scratch lives on the stack for any realistic head dim (K3 uses 128), so the hot
+     * per-token, per-head path does no heap traffic. The heap fallback is only for
+     * oversized dv. It is taken AFTER the decay above has already modified S; failing
+     * early here would leave the state permanently scaled but never updated, which is
+     * silent, unrecoverable corruption of every subsequent token, hence the fatal OOM. */
+    enum { KDA_STACK_DV = 512 };
+    float stack_u[KDA_STACK_DV];
+    float *u = stack_u;
+    if (dv > KDA_STACK_DV) {
+        u = (float *)malloc((size_t)dv * sizeof(float));
+        if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    }
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -304,12 +312,16 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     }
 
     /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
-     *    it a DELTA rule rather than plain accumulation. */
+     *    it a DELTA rule rather than plain accumulation. The error is formed once
+     *    (u is no longer needed) instead of dk times, and ki*beta is hoisted; both are
+     *    the same left-associated products as before, so results are bit-identical. */
+    for (int j = 0; j < dv; j++) u[j] = v[j] - u[j];
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
+        const float kb = ki * beta;
         float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
+        for (int j = 0; j < dv; j++) row[j] += kb * u[j];
     }
 
     /* 4. output from the ALREADY UPDATED state: o = S^T q */
@@ -320,7 +332,7 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
+    if (u != stack_u) free(u);
 }
 
 /* ---------------------------------------------------------------- matmul ---- */
