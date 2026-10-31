@@ -279,6 +279,10 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 }
 
 /* -------------------------------------------------------- KDA recurrence ---- */
+/* Head dims up to this use a stack temporary: this runs per head, per layer, per token,
+ * and a malloc/free pair on that path is pure overhead. Larger dims fall back to the heap. */
+#define K3_KDA_STACK_DV 512
+
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
@@ -294,8 +298,14 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     /* Allocated AFTER the decay above has already modified S. Returning early here
      * would leave the recurrent state permanently scaled but never updated -- silent,
      * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    float ubuf[K3_KDA_STACK_DV];
+    float *u = ubuf;
+    if (dv > K3_KDA_STACK_DV) {
+        u = (float *)calloc((size_t)dv, sizeof(float));
+        if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    } else {
+        memset(ubuf, 0, (size_t)dv * sizeof(float));
+    }
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -320,7 +330,7 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
+    if (u != ubuf) free(u);
 }
 
 /* ---------------------------------------------------------------- matmul ---- */
