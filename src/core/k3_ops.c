@@ -697,14 +697,26 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 {
     if (wdt == K3_WBF16) {
         const uint16_t *w16 = (const uint16_t *)W;
+        /* Columns in blocks of 16: the inner loop is unit-stride across a block so it
+         * vectorises and each fetched cache line is used whole, where the one-column
+         * form strode `in` elements per step. Each column still sums rows in index
+         * order from 0.0 into its own double, so every result is bit-identical. */
+        enum { JB = 16 };
+        const int nblk = (in + JB - 1) / JB;
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++)
-                acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
-            y[j] = (float)acc;
+        for (int b = 0; b < nblk; b++) {
+            const int j0 = b * JB;
+            const int jn = (in - j0 < JB) ? in - j0 : JB;
+            double acc[JB] = {0};
+            for (int r = 0; r < rows; r++) {
+                const uint16_t *wr = w16 + (size_t)r * in + j0;
+                const double xr = (double)x[r];
+                for (int l = 0; l < jn; l++)
+                    acc[l] += xr * (double)k3_bf16f(wr[l]);
+            }
+            for (int l = 0; l < jn; l++) y[j0 + l] = (float)acc[l];
         }
     } else if (wdt == K3_WMX4) {
         /* A quantised trunk. Column j of row r is the nibble at byte j/2 of that row,
@@ -756,14 +768,22 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
         }
     } else {
         const float *wf = (const float *)W;
+        enum { JB = 16 };                         /* see the bf16 case */
+        const int nblk = (in + JB - 1) / JB;
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++)
-                acc += (double)x[r] * (double)wf[(size_t)r * in + j];
-            y[j] = (float)acc;
+        for (int b = 0; b < nblk; b++) {
+            const int j0 = b * JB;
+            const int jn = (in - j0 < JB) ? in - j0 : JB;
+            double acc[JB] = {0};
+            for (int r = 0; r < rows; r++) {
+                const float *wr = wf + (size_t)r * in + j0;
+                const double xr = (double)x[r];
+                for (int l = 0; l < jn; l++)
+                    acc[l] += xr * (double)wr[l];
+            }
+            for (int l = 0; l < jn; l++) y[j0 + l] = (float)acc[l];
         }
     }
 }
