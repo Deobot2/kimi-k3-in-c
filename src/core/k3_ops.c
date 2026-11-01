@@ -1697,6 +1697,43 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
             /* Expand the group to floats first, then take a plain dot product. The
              * split exists so the second loop can vectorise, which it cannot do while
              * a table lookup sits in the middle of the accumulation. */
+#if defined(__AVX2__)
+            if (n == 32) {
+                /* Full K3 group, expanded in registers. The table path below writes wf
+                 * as scalar stores and then reads it back as 16-byte loads, which
+                 * defeats store-to-load forwarding; this path never touches memory.
+                 * Each E2M1 value times two is a small integer, so a 16-entry byte
+                 * shuffle gives it exactly, and the final *0.5 is exact too: the
+                 * floats fed to the FMAs are bit-identical to the table's. */
+                const __m128i lut = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12,
+                                                  0, -1, -2, -3, -4, -6, -8, -12);
+                const __m128i b   = _mm_loadu_si128((const __m128i *)pb);
+                const __m128i lo  = _mm_shuffle_epi8(lut, _mm_and_si128(b, _mm_set1_epi8(0x0F)));
+                const __m128i hi  = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(b, 4),
+                                                                        _mm_set1_epi8(0x0F)));
+                const __m128i e0  = _mm_unpacklo_epi8(lo, hi);   /* elements 0..15  */
+                const __m128i e1  = _mm_unpackhi_epi8(lo, hi);   /* elements 16..31 */
+                const __m256 half = _mm256_set1_ps(0.5f);
+                __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
+                __m256 w;
+#define K3_MX_STEP(E, SH, OFF)                                                         \
+                w = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(             \
+                        (SH) ? _mm_srli_si128((E), 8) : (E))), half);                  \
+                v0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_castps256_ps128(w)),       \
+                                     _mm256_cvtps_pd(_mm_loadu_ps(xg + (OFF))), v0);   \
+                v1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(w, 1)),     \
+                                     _mm256_cvtps_pd(_mm_loadu_ps(xg + (OFF) + 4)), v1)
+                K3_MX_STEP(e0, 0, 0);
+                K3_MX_STEP(e0, 1, 8);
+                K3_MX_STEP(e1, 0, 16);
+                K3_MX_STEP(e1, 1, 24);
+#undef K3_MX_STEP
+                double a[4];
+                _mm256_storeu_pd(a, _mm256_add_pd(v0, v1));
+                acc += ((a[0] + a[1]) + (a[2] + a[3])) * (double)K3_E8M0[sb];
+                continue;
+            }
+#endif
             float wf[64];                         /* group is 32 for K3; 64 is headroom */
             const int half = n >> 1;
             for (int j = 0; j < half; j++) {
