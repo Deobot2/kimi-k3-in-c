@@ -693,18 +693,31 @@ size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span)
  *
  * The stride is unfriendly -- consecutive rows are `in` elements apart -- but the whole
  * of W_UK[h] is 128 KB at the released dimensions and stays in L2 across the sweep. */
+#define K3_TR_BLK 16
+
 void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int rows)
 {
     if (wdt == K3_WBF16) {
         const uint16_t *w16 = (const uint16_t *)W;
+        /* Blocks of K3_TR_BLK adjacent columns, rows outermost within the block: the
+         * inner loop now reads contiguous elements of a row instead of striding `in`
+         * apart. Every column still sums its rows in index order into its own double,
+         * so the result is bit-identical to the column-at-a-time form. */
+        const int nb = (in + K3_TR_BLK - 1) / K3_TR_BLK;
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++)
-                acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
-            y[j] = (float)acc;
+        for (int b = 0; b < nb; b++) {
+            const int j0 = b * K3_TR_BLK;
+            const int n  = in - j0 < K3_TR_BLK ? in - j0 : K3_TR_BLK;
+            double acc[K3_TR_BLK] = {0};
+            for (int r = 0; r < rows; r++) {
+                const uint16_t *row = w16 + (size_t)r * in + j0;
+                const double xr = (double)x[r];
+                for (int k = 0; k < n; k++)
+                    acc[k] += xr * (double)k3_bf16f(row[k]);
+            }
+            for (int k = 0; k < n; k++) y[j0 + k] = (float)acc[k];
         }
     } else if (wdt == K3_WMX4) {
         /* A quantised trunk. Column j of row r is the nibble at byte j/2 of that row,
@@ -720,6 +733,9 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
         const size_t stride = k3_row_bytes(K3_WMX4, in);
         const size_t pn = (size_t)in / 2u;
         const unsigned char *base = (const unsigned char *)W;
+        /* E8M0 exponent -> float, built once per call instead of one ldexpf per element. */
+        float scale[255];
+        for (int e = 0; e < 255; e++) scale[e] = ldexpf(1.0f, e - 127);
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
@@ -733,7 +749,7 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
                 const unsigned char sb = row[pn + grp];
                 if (sb == 255) continue;              /* NaN scale: contributes nothing */
                 const unsigned char nib = odd ? (row[byte] >> 4) : (row[byte] & 0x0F);
-                acc += (double)x[r] * (double)K3_E2M1[nib] * (double)ldexpf(1.0f, (int)sb - 127);
+                acc += (double)x[r] * (double)K3_E2M1[nib] * (double)scale[sb];
             }
             y[j] = (float)acc;
         }
@@ -756,14 +772,21 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
         }
     } else {
         const float *wf = (const float *)W;
+        const int nb = (in + K3_TR_BLK - 1) / K3_TR_BLK;
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++)
-                acc += (double)x[r] * (double)wf[(size_t)r * in + j];
-            y[j] = (float)acc;
+        for (int b = 0; b < nb; b++) {
+            const int j0 = b * K3_TR_BLK;
+            const int n  = in - j0 < K3_TR_BLK ? in - j0 : K3_TR_BLK;
+            double acc[K3_TR_BLK] = {0};
+            for (int r = 0; r < rows; r++) {
+                const float *row = wf + (size_t)r * in + j0;
+                const double xr = (double)x[r];
+                for (int k = 0; k < n; k++)
+                    acc[k] += xr * (double)row[k];
+            }
+            for (int k = 0; k < n; k++) y[j0 + k] = (float)acc[k];
         }
     }
 }
