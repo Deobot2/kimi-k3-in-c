@@ -282,43 +282,38 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
-    /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
-     *    channel, not a scalar, which is what "channel-wise forget gate" means. */
-    for (int i = 0; i < dk; i++) {
-        float *row = S + (size_t)i * dv;
-        const float a = alpha[i];
-        for (int j = 0; j < dv; j++) row[j] *= a;
-    }
+    /* Two sweeps over S rather than four. Every element still sees the same operations
+     * in the same order (decay, then its contribution to u; delta write, then its
+     * contribution to o), and u[j] / o[j] still accumulate over i in index order, so the
+     * result is bit-identical to the unfused form -- the state just crosses the cache
+     * hierarchy twice instead of four times. */
 
-    /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
-     * would leave the recurrent state permanently scaled but never updated -- silent,
-     * unrecoverable corruption of every subsequent token. */
+    /* Allocated before the first sweep touches S: if this failed after the decay, S would
+     * be left scaled but never updated. (k3_fatal_oom does not return in any case.) */
     float *u = (float *)calloc((size_t)dv, sizeof(float));
     if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
-    for (int i = 0; i < dk; i++) {
-        const float ki = k[i];
-        if (ki == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) u[j] += ki * row[j];
-    }
 
-    /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
-     *    it a DELTA rule rather than plain accumulation. */
+    /* 1+2. channel-wise decay (scale ROW i of S by alpha[i]; the gate is per key channel,
+     *      not a scalar) fused with the read of the state along k:  u = S^T k */
     for (int i = 0; i < dk; i++) {
-        const float ki = k[i];
-        if (ki == 0.0f) continue;
         float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
+        const float a = alpha[i], ki = k[i];
+        if (ki == 0.0f) { for (int j = 0; j < dv; j++) row[j] *= a; continue; }
+        for (int j = 0; j < dv; j++) { row[j] *= a; u[j] += ki * row[j]; }
     }
 
-    /* 4. output from the ALREADY UPDATED state: o = S^T q */
+    /* 3+4. rank-one delta write, (v - u) being the prediction error that makes this a
+     *      DELTA rule, fused with the output from the ALREADY UPDATED state: o = S^T q.
+     *      The delta write for row i completes before row i is read for o, and rows
+     *      after i do not affect it, so o sees exactly the updated state. */
     for (int j = 0; j < dv; j++) o[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
-        const float qi = q[i];
-        if (qi == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) o[j] += qi * row[j];
+        float *row = S + (size_t)i * dv;
+        const float ki = k[i], qi = q[i];
+        if (ki != 0.0f)
+            for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
+        if (qi != 0.0f)
+            for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
     free(u);
 }
