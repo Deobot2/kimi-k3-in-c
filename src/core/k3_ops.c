@@ -1699,7 +1699,35 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
              * a table lookup sits in the middle of the accumulation. */
             float wf[64];                         /* group is 32 for K3; 64 is headroom */
             const int half = n >> 1;
-            for (int j = 0; j < half; j++) {
+            int j = 0;
+#if defined(__AVX2__)
+            /* 16 bytes -> 32 floats with no scalar table walk: split nibbles, interleave
+             * them back into element order, and look the 16 E2M1 values up in two
+             * registers with a lane permute. Same values as the table, so the result is
+             * bit-identical. */
+            {
+                const __m256 lo8 = _mm256_loadu_ps(K3_E2M1);
+                const __m256 hi8 = _mm256_loadu_ps(K3_E2M1 + 8);
+                const __m128i m0f = _mm_set1_epi8(0x0F);
+                for (; j + 15 < half; j += 16) {
+                    __m128i b  = _mm_loadu_si128((const __m128i *)(pb + j));
+                    __m128i lo = _mm_and_si128(b, m0f);
+                    __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), m0f);
+                    __m128i q[2] = { _mm_unpacklo_epi8(lo, hi), _mm_unpackhi_epi8(lo, hi) };
+                    for (int h = 0; h < 2; h++)
+                        for (int k = 0; k < 2; k++) {
+                            __m256i ix = _mm256_cvtepu8_epi32(k ? _mm_srli_si128(q[h], 8) : q[h]);
+                            __m256 a = _mm256_permutevar8x32_ps(lo8, ix);
+                            __m256 c = _mm256_permutevar8x32_ps(hi8, ix);
+                            __m256 sel = _mm256_castsi256_ps(_mm256_slli_epi32(ix, 28));
+                            /* bit 3 of the index picks the upper table */
+                            _mm256_storeu_ps(wf + 2 * j + 16 * h + 8 * k,
+                                             _mm256_blendv_ps(a, c, sel));
+                        }
+                }
+            }
+#endif
+            for (; j < half; j++) {
                 const float *pv = K3_E2M1_PAIR[pb[j]];
                 wf[2 * j]     = pv[0];
                 wf[2 * j + 1] = pv[1];
