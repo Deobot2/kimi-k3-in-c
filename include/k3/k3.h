@@ -237,11 +237,12 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out);
  *
  * scratch must hold at least
  *     T*H*(qk_nope+qk_rope)      q
- *   + T*H*(qk_nope+v_head)       kv
  *   + T*(kv_lora+qk_rope)        compressed latent plus the shared rope slot
- *   + q_lora                     transient
- *   + 2*H*v_head                 attention accumulator and gate buffer
+ *   + T*q_lora                   query latent
+ *   + 2*min(T,16)*H*v_head       attention output and gate, one 16-token block
  *   + n_heads*T                  scores, one row per head
+ *   + T*H*(qk_nope+v_head)       expanded keys and values
+ *   + T*qk_rope                  rope slots
  * floats. Use k3_mla_scratch() rather than recomputing this.
  */
 typedef struct {
