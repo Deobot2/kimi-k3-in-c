@@ -1012,6 +1012,124 @@ static void t_matmul_bf16(void)
     free(Wb); free(Wf); free(x); free(ya); free(yb);
 }
 
+/* k3_matmul_tr must equal the obvious column-outer sweep EXACTLY, for every weight type.
+ *
+ * The kernel is blocked and row-outer for cache reasons, which is only legitimate because
+ * each column still accumulates its terms in row order with the same mul-then-add. The
+ * reference below is that obvious form, written independently: a column at a time, all
+ * rows in turn. Any change to a column's term order, a mis-indexed block tail, a nibble
+ * read from the wrong half of a byte, or a scale taken from the wrong group shows up here
+ * as a bit difference rather than as something a tolerance would absorb.
+ *
+ * `in` is never a multiple of the 64-column block, so every type exercises a short final
+ * block. MXFP4 rows must be whole 32-element groups (k3_row_bytes assumes it), so its
+ * width is 7 groups; its scales include 0 (the subnormal 2^-127) and 255 (NaN, which
+ * is skipped). */
+static double tr_ref_elem(const unsigned char *row, int wdt, int in, int j)
+{
+    if (wdt == K3_WBF16) return (double)k3_bf16f(((const uint16_t *)row)[j]);
+    if (wdt == K3_WI8)   return (double)((const int8_t *)(row + 4))[j];
+    return (double)((const float *)row)[j];
+}
+
+static void t_matmul_tr(void)
+{
+    static const int wdts[4] = { K3_WF32, K3_WBF16, K3_WI8, K3_WMX4 };
+    static const char *names[4] = { "f32", "bf16", "i8", "mx4" };
+    static const float E2M1[16] = {
+         0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+    };
+    const int rows = 37;
+    for (int d = 0; d < 4; d++) {
+        const int wdt = wdts[d];
+        const int in = (wdt == K3_WMX4) ? 7 * K3_MXFP4_GROUP : 226;
+        const size_t rb = k3_row_bytes(wdt, in);
+        unsigned char *W = (unsigned char *)malloc(rb * rows);
+        float *x = (float *)malloc((size_t)rows * sizeof(float));
+        float *ya = (float *)malloc((size_t)in * sizeof(float));
+        float *yb = (float *)malloc((size_t)in * sizeof(float));
+        if (!W || !x || !ya || !yb) {
+            printf("  FAIL  matmul_tr (alloc)\n");
+            g_fail++;
+            free(W); free(x); free(ya); free(yb);
+            return;
+        }
+
+        unsigned s = 0xBADC0DEu + (unsigned)d;
+        for (size_t i = 0; i < rb * rows; i++) {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            W[i] = (unsigned char)(s >> 11);
+        }
+        for (int r = 0; r < rows; r++) {
+            unsigned char *row = W + (size_t)r * rb;
+            if (wdt == K3_WF32 || wdt == K3_WI8) {
+                /* finite, varied magnitudes: random bytes would be mostly huge or NaN */
+                const int nf = (wdt == K3_WF32) ? in : 1;
+                for (int j = 0; j < nf; j++) {
+                    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                    const float v = ((float)(s >> 8) / 8388608.0f - 1.0f) *
+                                    ldexpf(1.0f, (int)(s & 15) - 8);
+                    memcpy(row + (size_t)j * 4, &v, 4);
+                }
+            } else if (wdt == K3_WBF16) {
+                for (int j = 0; j < in; j++) {
+                    uint16_t h; memcpy(&h, row + 2 * j, 2);
+                    if (((h >> 7) & 0xFF) == 0xFF) h &= 0x7F7Fu;
+                    memcpy(row + 2 * j, &h, 2);
+                }
+            } else {
+                unsigned char *sc = row + in / 2;
+                const int ng = (in + K3_MXFP4_GROUP - 1) / K3_MXFP4_GROUP;
+                for (int g = 0; g < ng; g++) sc[g] = (unsigned char)(110 + (sc[g] % 30));
+                if (r == 3)  sc[1] = 255;     /* NaN scale: the group is skipped */
+                if (r == 5)  sc[2] = 0;       /* 2^-127: a subnormal multiplier  */
+                if (r == 11) sc[ng - 1] = 255; /* in the short final block       */
+            }
+        }
+        for (int r = 0; r < rows; r++) {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            x[r] = (float)(s >> 8) / 8388608.0f - 1.0f;
+        }
+
+        /* the reference: one column at a time, every row in order */
+        for (int j = 0; j < in; j++) {
+            double acc = 0.0;
+            for (int r = 0; r < rows; r++) {
+                const unsigned char *row = W + (size_t)r * rb;
+                if (wdt == K3_WMX4) {
+                    const unsigned char sb = row[in / 2 + j / K3_MXFP4_GROUP];
+                    if (sb == 255) continue;
+                    const unsigned char by = row[j >> 1];
+                    const unsigned char nib = (j & 1) ? (by >> 4) : (by & 0x0F);
+                    acc += (double)x[r] * (double)E2M1[nib] *
+                           (double)ldexpf(1.0f, (int)sb - 127);
+                } else if (wdt == K3_WI8) {
+                    float sc; memcpy(&sc, row, 4);
+                    acc += (double)x[r] * (double)sc * tr_ref_elem(row, wdt, in, j);
+                } else {
+                    acc += (double)x[r] * tr_ref_elem(row, wdt, in, j);
+                }
+            }
+            ya[j] = (float)acc;
+        }
+        k3_matmul_tr(yb, x, W, wdt, in, rows);
+
+        int bad = 0;
+        for (int j = 0; j < in; j++) if (memcmp(&ya[j], &yb[j], sizeof(float))) bad++;
+        if (bad) {
+            printf("  FAIL  matmul_tr %-4s %d/%d columns differ from the column-outer "
+                   "sweep\n", names[d], bad, in);
+            g_fail++;
+        } else {
+            printf("  PASS  matmul_tr %-4s n=%d    bit-identical to the column-outer "
+                   "sweep\n", names[d], in);
+            g_pass++;
+        }
+        free(W); free(x); free(ya); free(yb);
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -1049,6 +1167,7 @@ int main(int argc, char **argv)
     t_moe(dir);
     t_mxfp4(dir);
     t_matmul_bf16();
+    t_matmul_tr();
     t_kda_layer(dir, "kda_layer1");
     t_kda_layer(dir, "kda_layer8");
     t_layer(dir, "layer_kda");
