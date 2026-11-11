@@ -1248,6 +1248,77 @@ static void t_moe_prefill(void)
     free(sh1); free(sh3); free(sh2); free(x); free(ya); free(yb); free(scr);
 }
 
+/* k3_mmw_rows must equal T calls of k3_mmw EXACTLY, for every weight type. It exists
+ * only to change loop order (and, for bf16 and MXFP4, to share weight widening across
+ * inputs), so any bit of difference is a bug. T is odd so the two-token bf16 tile
+ * leaves a remainder, and above 16 so the MXFP4 tile does too; `in` is not a multiple
+ * of 16 except for MXFP4, whose rows are whole groups by construction. */
+static void t_mmw_rows(void)
+{
+    static const int wdts[4] = { K3_WF32, K3_WBF16, K3_WI8, K3_WMX4 };
+    static const char *names[4] = { "f32", "bf16", "i8", "mx4" };
+    const int T = 19, out = 70;
+    for (int d = 0; d < 4; d++) {
+        const int wdt = wdts[d];
+        const int in = (wdt == K3_WMX4) ? 5 * K3_MXFP4_GROUP : 203;
+        const size_t rb = k3_row_bytes(wdt, in);
+        unsigned char *W = (unsigned char *)malloc(rb * out);
+        float *x  = (float *)malloc((size_t)T * in * sizeof(float));
+        float *ya = (float *)malloc((size_t)T * out * sizeof(float));
+        float *yb = (float *)malloc((size_t)T * out * sizeof(float));
+        if (!W || !x || !ya || !yb) {
+            printf("  FAIL  mmw_rows (alloc)\n");
+            g_fail++;
+            free(W); free(x); free(ya); free(yb);
+            return;
+        }
+        unsigned s = 0xFACADEu + (unsigned)d;
+        for (int r = 0; r < out; r++) {
+            unsigned char *row = W + (size_t)r * rb;
+            for (size_t i = 0; i < rb; i++) {
+                tmoe_rnd(&s);
+                row[i] = (unsigned char)(s >> 9);
+            }
+            if (wdt == K3_WF32)
+                for (int j = 0; j < in; j++) {
+                    const float v = tmoe_rnd(&s);
+                    memcpy(row + (size_t)j * 4, &v, 4);
+                }
+            else if (wdt == K3_WBF16)
+                for (int j = 0; j < in; j++) {
+                    const float v = tmoe_rnd(&s);
+                    uint32_t u; memcpy(&u, &v, 4);
+                    const uint16_t h = (uint16_t)(u >> 16);
+                    memcpy(row + (size_t)j * 2, &h, 2);
+                }
+            else if (wdt == K3_WI8) {
+                const float sc = 0.01f;
+                memcpy(row, &sc, 4);
+            } else
+                for (int g = 0; g < in / K3_MXFP4_GROUP; g++)
+                    row[in / 2 + g] = (unsigned char)(120 + (r + g) % 9);
+        }
+        for (int i = 0; i < T * in; i++) x[i] = tmoe_rnd(&s);
+
+        for (int t = 0; t < T; t++)
+            k3_mmw(ya + (size_t)t * out, x + (size_t)t * in, W, wdt, in, out);
+        k3_mmw_rows(yb, x, W, wdt, in, out, T);
+        int bad = 0;
+        for (int i = 0; i < T * out; i++)
+            if (memcmp(&ya[i], &yb[i], sizeof(float))) bad++;
+        if (bad) {
+            printf("  FAIL  mmw_rows %-4s %d/%d floats differ from per-token k3_mmw\n",
+                   names[d], bad, T * out);
+            g_fail++;
+        } else {
+            printf("  PASS  mmw_rows %-4s T=%d   bit-identical to per-token k3_mmw\n",
+                   names[d], T);
+            g_pass++;
+        }
+        free(W); free(x); free(ya); free(yb);
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -1287,6 +1358,7 @@ int main(int argc, char **argv)
     t_matmul_bf16();
     t_matmul_tr();
     t_moe_prefill();
+    t_mmw_rows();
     t_kda_layer(dir, "kda_layer1");
     t_kda_layer(dir, "kda_layer8");
     t_layer(dir, "layer_kda");

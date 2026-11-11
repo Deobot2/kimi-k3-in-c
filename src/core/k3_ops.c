@@ -1289,17 +1289,16 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
     float *o  = bt + (size_t)T * H;      float *gb = o + (size_t)T * P;
     float *wr = gb + P;                  float *fa = wr + P;
 
-    /* 1. projections */
-    for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
-        k3_mmw(q + (size_t)t * P, xt, w->q, w->wdt, E, P);
-        k3_mmw(k + (size_t)t * P, xt, w->k, w->wdt, E, P);
-        k3_mmw(v + (size_t)t * P, xt, w->v, w->wdt, E, P);
-        k3_mmw(bt + (size_t)t * H, xt, w->b, w->wdt, E, H);
-        /* ONE shared low-rank pair feeds every head: [E->D] then [D->H*D] */
-        k3_mmw(fa, xt, w->f_a, w->wdt, E, D);
-        k3_mmw(z + (size_t)t * P, fa, w->f_b, w->wdt, D, P);
-    }
+    /* 1. projections, each over all T tokens in one read of its weights. */
+    k3_mmw_rows(q,  x, w->q, w->wdt, E, P, T);
+    k3_mmw_rows(k,  x, w->k, w->wdt, E, P, T);
+    k3_mmw_rows(v,  x, w->v, w->wdt, E, P, T);
+    k3_mmw_rows(bt, x, w->b, w->wdt, E, H, T);
+    /* ONE shared low-rank pair feeds every head: [E->D] then [D->H*D]. The [T][D]
+     * intermediate borrows o, which nothing touches until the recurrence writes it. */
+    float *fa_t = (T == 1) ? fa : o;
+    k3_mmw_rows(fa_t, x, w->f_a, w->wdt, E, D, T);
+    k3_mmw_rows(z, fa_t, w->f_b, w->wdt, D, P, T);
 
     /* 2. ShortConv with fused SiLU, carrying state across calls */
     float *cs = state ? state + (size_t)H * D * D : NULL;
@@ -1353,16 +1352,18 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
         }
     }
 
-    /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection */
+    /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection. The [T][P]
+     * gate logits go into z, dead since the decay chain turned it into al. */
+    float *gt = (T == 1) ? gb : z;
+    k3_mmw_rows(gt, x, w->g, w->wdt, E, P, T);
     for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
         float *ot = o + (size_t)t * P;
+        const float *g = gt + (size_t)t * P;
         for (int h = 0; h < H; h++)
             k3_rmsnorm(ot + (size_t)h * D, ot + (size_t)h * D, w->o_norm, D, c->rms_eps);
-        k3_mmw(gb, xt, w->g, w->wdt, E, P);
-        for (int i = 0; i < P; i++) ot[i] *= sigmoidf_(gb[i]);
-        k3_mmw(out + (size_t)t * E, ot, w->o, w->wdt, P, E);
+        for (int i = 0; i < P; i++) ot[i] *= sigmoidf_(g[i]);
     }
+    k3_mmw_rows(out, o, w->o, w->wdt, P, E, T);
     free(Sown);
 }
 
@@ -1631,6 +1632,53 @@ static inline double k3_dot_bf16(const uint16_t *row, const float *x, int in)
         for (; i < in; i++) acc = fma((double)k3_bf16f(row[i]), (double)x[i], acc);
         return acc;
     }
+}
+
+/* k3_dot_bf16 for TWO inputs against one row: each weight vector is widened once and
+ * used twice. Every input keeps its own four accumulators, fed in the same order and
+ * reduced by the same tree as k3_dot_bf16, so each result is bit-identical to a
+ * k3_dot_bf16 call; only the redundant widening of the weights is shared. Eight
+ * accumulators plus four widened weights fit the sixteen AVX2 registers. */
+static inline void k3_dot_bf16_x2(const uint16_t *row, const float *x0, const float *x1,
+                                  int in, double *r0, double *r1)
+{
+#if defined(__AVX2__)
+    int i = 0;
+    __m256d a0 = _mm256_setzero_pd(), a1 = _mm256_setzero_pd();
+    __m256d a2 = _mm256_setzero_pd(), a3 = _mm256_setzero_pd();
+    __m256d b0 = _mm256_setzero_pd(), b1 = _mm256_setzero_pd();
+    __m256d b2 = _mm256_setzero_pd(), b3 = _mm256_setzero_pd();
+#define K3_BF16_W(off) _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32( \
+        _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(row + i + (off)))), 16)))
+    for (; i + 15 < in; i += 16) {
+        const __m256d w0 = K3_BF16_W(0), w1 = K3_BF16_W(4);
+        const __m256d w2 = K3_BF16_W(8), w3 = K3_BF16_W(12);
+        a0 = _mm256_fmadd_pd(w0, _mm256_cvtps_pd(_mm_loadu_ps(x0 + i)),      a0);
+        b0 = _mm256_fmadd_pd(w0, _mm256_cvtps_pd(_mm_loadu_ps(x1 + i)),      b0);
+        a1 = _mm256_fmadd_pd(w1, _mm256_cvtps_pd(_mm_loadu_ps(x0 + i + 4)),  a1);
+        b1 = _mm256_fmadd_pd(w1, _mm256_cvtps_pd(_mm_loadu_ps(x1 + i + 4)),  b1);
+        a2 = _mm256_fmadd_pd(w2, _mm256_cvtps_pd(_mm_loadu_ps(x0 + i + 8)),  a2);
+        b2 = _mm256_fmadd_pd(w2, _mm256_cvtps_pd(_mm_loadu_ps(x1 + i + 8)),  b2);
+        a3 = _mm256_fmadd_pd(w3, _mm256_cvtps_pd(_mm_loadu_ps(x0 + i + 12)), a3);
+        b3 = _mm256_fmadd_pd(w3, _mm256_cvtps_pd(_mm_loadu_ps(x1 + i + 12)), b3);
+    }
+#undef K3_BF16_W
+    double t[4];
+    _mm256_storeu_pd(t, _mm256_add_pd(_mm256_add_pd(a0, a1), _mm256_add_pd(a2, a3)));
+    double acc0 = (t[0] + t[1]) + (t[2] + t[3]);
+    _mm256_storeu_pd(t, _mm256_add_pd(_mm256_add_pd(b0, b1), _mm256_add_pd(b2, b3)));
+    double acc1 = (t[0] + t[1]) + (t[2] + t[3]);
+    for (; i < in; i++) {
+        const double wv = (double)k3_bf16f(row[i]);
+        acc0 = fma(wv, (double)x0[i], acc0);
+        acc1 = fma(wv, (double)x1[i], acc1);
+    }
+    *r0 = acc0;
+    *r1 = acc1;
+#else
+    *r0 = k3_dot_bf16(row, x0, in);
+    *r1 = k3_dot_bf16(row, x1, in);
+#endif
 }
 
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
@@ -1954,7 +2002,17 @@ void k3_mmw_rows(float *y, const float *x, const void *W, int wdt, int in, int o
             }
             continue;
         }
-        for (int t = 0; t < T; t++) {
+        int t = 0;
+        if (wdt == K3_WBF16) {                    /* two tokens per weight widening */
+            for (; t + 1 < T; t += 2) {
+                double r0, r1;
+                k3_dot_bf16_x2((const uint16_t *)row, x + (size_t)t * in,
+                               x + (size_t)(t + 1) * in, in, &r0, &r1);
+                y[(size_t)t * out + o]       = (float)r0;
+                y[(size_t)(t + 1) * out + o] = (float)r1;
+            }
+        }
+        for (; t < T; t++) {
             const float *xt = x + (size_t)t * in;
             float v;
             if (wdt == K3_WBF16)    v = (float)k3_dot_bf16((const uint16_t *)row, xt, in);
