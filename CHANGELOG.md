@@ -71,6 +71,21 @@ not needing the bytes at all.
 
 ### Changed
 
+- **Prefill reads each weight once per chunk, not once per token.** New `k3_mmw_rows`
+  (and `k3_matmul_mxfp4_rows`) multiply T inputs per weight-row fetch through the same
+  row kernels as the single-token path, so output is **bit-identical**. Used by the KDA
+  projections, the MLA projections (gate and `o_proj` in 16-token blocks) and the batched
+  MoE prefill, which now runs each fetched expert over all the tokens that chose it. MXFP4
+  groups are expanded once for up to 16 inputs, and bf16 weights are widened once for two:
+  MoE prefill 1.6x and bf16 KDA prefill 1.2x even where weights fit in cache.
+- **MLA attention heads run in parallel** in both cache layouts (per-head score rows).
+  This is the O(context) part of decode and was single-core: 2.4-2.6x on a 1024-token
+  decode at 4 threads, bit-identical.
+- **`k3_matmul_tr` is blocked row-outer** (absorbed `W_UK` on `--mla-latent`). The
+  per-column summation order is unchanged, so it is bit-identical; 3-9x faster by type.
+- New bit-exact gates in `test_ops`: `matmul_tr` (all four weight types), `mmw_rows`, and
+  `moe_prefill`, the first test of the batched MoE path against per-token `k3_moe`.
+
 - **Expert cache replacement is S3-FIFO, not LRU.** The project's own simulator put 25.5
   points between LRU and Belady at 64 GB, and its own conclusion was that the lever is the
   policy rather than the size. Small FIFO, main FIFO, ghost queue; uniform object size
@@ -95,6 +110,11 @@ not needing the bytes at all.
 
 ### Fixed
 
+- The MXFP4 lookup tables were filled behind unsynchronised ready flags, and
+  `k3_matmul_mx4` is first reached from inside the OpenMP head loop, so first use was a
+  data race. The E2M1 pair table is now built under `pthread_once`, and the E8M0 table is
+  gone: the scale is built from its bit pattern (`k3_e8m0f`), exactly the value `ldexpf`
+  gave.
 - The trunk reader's `hits`/`misses` are classified once per bind rather than incremented
   by whichever thread performed the read, so they sum to the bind count instead of double
   counting every prefetched layer.
