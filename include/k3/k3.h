@@ -460,6 +460,10 @@ static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
  * than once per token, which is what a prefill chunk wants. */
 void k3_mmw_rows(float *y, const float *x, const void *W, int wdt, int in, int out,
                  int T);
+/* The same with input row t at x + t*xs (xs >= in): for inputs that are the leading
+ * `in` floats of a wider row. */
+void k3_mmw_rows_xs(float *y, const float *x, size_t xs, const void *W, int wdt,
+                    int in, int out, int T);
 
 /* Byte stride of one row for a per-row int8 matrix: the f32 scale plus `in` int8 weights.
  * bf16 and fp32 are per-element and take the element form. */
