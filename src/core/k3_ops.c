@@ -439,9 +439,11 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     float *ql   = ct   + (size_t)kvw;               /* [q_lora]       */
     float *acc  = ql   + (size_t)c->q_lora;         /* [H][vh]        */
     float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate   */
-    float *sc   = gbuf + (size_t)H * vh;            /* [last+1] scores */
+    /* One score row PER HEAD, so the heads can run in parallel. [H][last+1]. */
+    const size_t scs = (size_t)(last + 1);
+    float *scb  = gbuf + (size_t)H * vh;            /* [H][last+1] scores */
     /* Without a cache the keys/values live in scratch and cover only this call. */
-    float *kvs  = sc   + (size_t)(last + 1);        /* [T][H][kvd]    */
+    float *kvs  = scb  + (size_t)H * scs;           /* [T][H][kvd]    */
     float *rps  = kvs  + (kvc ? 0 : (size_t)T * H * kvd);   /* [T][qr] */
 
     #define K3_KV_AT(p)   (kvc   ? kvc   + (size_t)(p) * H * kvd : kvs + (size_t)(p) * H * kvd)
@@ -465,11 +467,19 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         k3_mmw(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, H * kvd);
     }
 
-    /* ---- attention, per head, causal ---- */
+    /* ---- attention, per head, causal ----
+     * Heads are independent: each reads the shared cache and writes only its own score
+     * row and its own slice of acc, so they run in parallel with every head's
+     * arithmetic exactly what the serial loop did. This is the O(T) part of a decode
+     * step, and serial it was the one piece of the layer that used a single core. */
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static)
+#endif
         for (int h = 0; h < H; h++) {
             const float *qt = q + ((size_t)t * H + h) * qh;
+            float *sc = scb + (size_t)h * scs;
             float m = -INFINITY;
             for (int s = 0; s <= p; s++) {                 /* causal: s <= p */
                 const float *ks = K3_KV_AT(s) + (size_t)h * kvd;
@@ -550,10 +560,22 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     float *ct   = q    + (size_t)T * H * qh;        /* [kvw] transient */
     float *ql   = ct   + (size_t)kvw;               /* [q_lora]        */
     float *qa   = ql   + (size_t)c->q_lora;         /* [H][kl] absorbed queries */
-    float *al   = qa   + (size_t)H * kl;            /* [kl] latent attention sum */
-    float *acc  = al   + (size_t)kl;                /* [H][vh]         */
+    float *alb  = qa   + (size_t)H * kl;            /* [H][kl] latent attention sums */
+    float *acc  = alb  + (size_t)H * kl;            /* [H][vh]         */
     float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate    */
-    float *sc   = gbuf + (size_t)H * vh;            /* [span] scores   */
+    float *scb  = gbuf + (size_t)H * vh;            /* [H][scs] scores */
+
+    /* Per-head score row length: the most positions any token of this call attends,
+     * which is the LAST token's count, since that count never shrinks as p grows (it
+     * climbs to the window and stays there). The caller sized scratch for `span` of
+     * them; this is never more than the serial loop's single row already needed. */
+    size_t scs;
+    {
+        int ns = kv->window ? kv->sinks : 0;
+        if (ns > last + 1) ns = last + 1;
+        const int f = k3_kv_first(kv, last);
+        scs = (size_t)ns + (size_t)(last >= f ? last - f + 1 : 0);
+    }
 
     const size_t kvb_row = k3_row_bytes(w->wdt, kl);
 
@@ -602,7 +624,15 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         const int s0 = k3_kv_first(kv, p);
         int nsink = kv->window ? kv->sinks : 0;
         if (nsink > p + 1) nsink = p + 1;
+        /* Heads in parallel, as in k3_mla_cached: each owns its score row, its latent
+         * sum and its slice of acc. The W_UV product below then runs serially inside
+         * its thread, on the same rows in the same order. */
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static)
+#endif
         for (int h = 0; h < H; h++) {
+            float *sc = scb + (size_t)h * scs;
+            float *al = alb + (size_t)h * kl;
             const float *qah = qa + (size_t)h * kl;
             const float *qrh = qt + (size_t)h * qh + qn;   /* the unrotated rope slots */
             float m = -INFINITY;
@@ -694,9 +724,9 @@ size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span)
          + (size_t)(c->kv_lora + c->qk_rope)           /* ct transient        */
          + (size_t)c->q_lora
          + (size_t)H * c->kv_lora                      /* absorbed queries    */
-         + (size_t)c->kv_lora                          /* latent attn sum     */
+         + (size_t)H * c->kv_lora                      /* latent attn sums    */
          + (size_t)2 * H * vh                          /* acc, gbuf           */
-         + (size_t)(span > T ? span : T);              /* scores              */
+         + (size_t)H * (span > T ? span : T);          /* scores, per head    */
 }
 
 /* The transposed product, W row-major and never moved.
@@ -889,7 +919,7 @@ size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode)
              + (size_t)(c->kv_lora + c->qk_rope)       /* ct transient */
              + (size_t)c->q_lora
              + (size_t)2 * H * vh                      /* acc, gbuf    */
-             + (size_t)(cap > T ? cap : T);            /* scores       */
+             + (size_t)H * (cap > T ? cap : T);        /* scores, per head */
     if (!cached_mode) n += (size_t)T * H * kvd + (size_t)T * c->qk_rope;
     return n;
 }
