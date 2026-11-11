@@ -358,13 +358,11 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
  * to the arithmetic relative to a sequential sum. Keeping the accumulators in double
  * bounds the difference far below fp32 output precision; making them float would not.
  */
-void k3_matmul(float *y, const float *x, const float *W, int in, int out)
+/* One row of the fp32 product. Factored out so the single-token kernel and the
+ * multi-token one (k3_mmw_rows) share every arithmetic decision and so cannot drift. */
+static inline double k3_dot_f32(const float *row, const float *x, int in)
 {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
-#endif
-    for (int o = 0; o < out; o++) {
-        const float *row = W + (size_t)o * in;
+    {
         /* Sixteen accumulators, EXPLICITLY fused products. fma() in double is the
          * same IEEE operation as _mm256_fmadd_pd per lane, so the scalar and vector
          * paths stay bit-identical while the dependent-add latency chain that made
@@ -382,8 +380,17 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
         double b3 = (a[3] + a[7]) + (a[11] + a[15]);
         double acc = (b0 + b1) + (b2 + b3);
         for (; i < in; i++) acc = fma((double)row[i], (double)x[i], acc);
-        y[o] = (float)acc;
+        return acc;
     }
+}
+
+void k3_matmul(float *y, const float *x, const float *W, int in, int out)
+{
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out > 64)
+#endif
+    for (int o = 0; o < out; o++)
+        y[o] = (float)k3_dot_f32(W + (size_t)o * in, x, in);
 }
 
 /* ------------------------------------------------------------- Gated MLA ---- */
@@ -1148,18 +1155,30 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         float *wtt = rwt + (size_t)t * K;
         k3_router(it, wtt, xt, w->gate, w->bias, E, c->n_experts, K,
                   c->moe_renorm, c->routed_scale);
-        k3_mmw(zz + (size_t)t * Ll, xt, w->down, w->wdt, E, Ll);
         for (int j = 0; j < K; j++) {
             const int e = it[j];
             if (e >= 0 && e < c->n_experts && !seen[e]) { seen[e] = 1; uniq[nu++] = e; }
         }
     }
+    /* One read of the down projection for the whole chunk, not one per token. */
+    k3_mmw_rows(zz, x, w->down, w->wdt, E, Ll, T);
 
-    /* 2. expert-major: fetch each unique expert ONCE, apply it to every (token, slot)
-     * that selected it. gu/act/edn are reused per (expert, token). */
-    float *gu  = scratch;                 /* [2*I] */
-    float *act = gu + 2 * I;              /* [I]   */
-    float *edn = act + I;                 /* [Ll]  */
+    /* 2. expert-major: fetch each unique expert ONCE, and apply it to every token that
+     * selected it IN ONE PASS over its weights. A token's top-k is distinct, so at most
+     * T tokens select one expert; their latents are gathered into rows, pushed through
+     * w1/w3/w2 together, and scattered back to their (token, slot) contribution rows.
+     * Each row goes through the same per-row kernel as a single-token call, so the
+     * floats are unchanged; what changes is that a 17.55 MB expert chosen by n tokens
+     * is streamed from memory once instead of n times. */
+    float *gu   = scratch;                /* [2*I] one token's gate|up, as glu wants */
+    float *zin  = (float *)malloc((size_t)T * Ll * sizeof(float));   /* [n][Ll] */
+    float *g1   = (float *)malloc((size_t)T * I * sizeof(float));    /* [n][I]  */
+    float *g3   = (float *)malloc((size_t)T * I * sizeof(float));    /* [n][I]  */
+    float *actb = (float *)malloc((size_t)T * I * sizeof(float));    /* [n][I]  */
+    float *ednb = (float *)malloc((size_t)T * Ll * sizeof(float));   /* [n][Ll] */
+    int   *slot = (int *)malloc((size_t)T * sizeof(int));          /* t*K + j */
+    if (!zin || !g1 || !g3 || !actb || !ednb || !slot)
+        k3_fatal_oom("MoE prefill expert batch", (size_t)T * (2 * Ll + 3 * I) * 4);
     if (w->src->getmany) w->src->getmany(w->src, w->layer, uniq, nu);
     for (int u = 0; u < nu; u++) {
         const int e = uniq[u];
@@ -1170,25 +1189,42 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
                             "this chunk is CORRUPT\n", w->layer, e);
             continue;
         }
+        int n = 0;
         for (int t = 0; t < T; t++) {
-            const int   *it = ridx + (size_t)t * K;
-            const float *zt = zz  + (size_t)t * Ll;
+            const int *it = ridx + (size_t)t * K;
             for (int j = 0; j < K; j++) {
                 if (it[j] != e) continue;
-                k3_matmul_mxfp4(gu,     zt, q.p1, q.s1, Ll, I, K3_MXFP4_GROUP);
-                k3_matmul_mxfp4(gu + I, zt, q.p3, q.s3, Ll, I, K3_MXFP4_GROUP);
-                k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
-                k3_matmul_mxfp4(edn, act, q.p2, q.s2, I, Ll, K3_MXFP4_GROUP);
-                memcpy(contrib + ((size_t)t * K + j) * Ll, edn, (size_t)Ll * sizeof(float));
+                memcpy(zin + (size_t)n * Ll, zz + (size_t)t * Ll,
+                       (size_t)Ll * sizeof(float));
+                slot[n++] = t * K + j;
             }
         }
+        if (n == 0) continue;
+        k3_matmul_mxfp4_rows(g1, zin, q.p1, q.s1, Ll, I, K3_MXFP4_GROUP, n);
+        k3_matmul_mxfp4_rows(g3, zin, q.p3, q.s3, Ll, I, K3_MXFP4_GROUP, n);
+        for (int r = 0; r < n; r++) {
+            memcpy(gu,     g1 + (size_t)r * I, (size_t)I * sizeof(float));
+            memcpy(gu + I, g3 + (size_t)r * I, (size_t)I * sizeof(float));
+            k3_situ_glu(actb + (size_t)r * I, gu, I, c->situ_b1, c->situ_b2);
+        }
+        k3_matmul_mxfp4_rows(ednb, actb, q.p2, q.s2, I, Ll, K3_MXFP4_GROUP, n);
+        for (int r = 0; r < n; r++)
+            memcpy(contrib + (size_t)slot[r] * Ll, ednb + (size_t)r * Ll,
+                   (size_t)Ll * sizeof(float));
     }
+    free(zin); free(g1); free(g3); free(actb); free(ednb); free(slot);
 
     /* 3. per token, sum contributions in the ORIGINAL top-k order, then the tail of the
-     * MoE exactly as k3_moe does it, so every float matches the per-token path. */
+     * MoE exactly as k3_moe does it, so every float matches the per-token path. The
+     * up projection and the shared expert run as whole-chunk products. */
+    const size_t SIz = (size_t)SI;
+    float *s1 = (float *)malloc((size_t)T * SIz * sizeof(float));   /* [T][SI] */
+    float *s3 = (float *)malloc((size_t)T * SIz * sizeof(float));   /* [T][SI] */
+    float *sa = (float *)malloc((size_t)T * SIz * sizeof(float));   /* [T][SI] */
+    float *sd = (float *)malloc((size_t)T * E * sizeof(float));     /* [T][E]  */
+    if (!s1 || !s3 || !sa || !sd)
+        k3_fatal_oom("MoE prefill shared batch", (size_t)T * (3 * SIz + E) * 4);
     for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
-        float *ot = out + (size_t)t * E;
         const float *wtt = rwt + (size_t)t * K;
         /* Reuse this token's now-dead down-projection slot as the aggregate. */
         float *acc = zz + (size_t)t * Ll;
@@ -1200,17 +1236,20 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         }
         if (c->latent_norm) k3_rmsnorm(acc, acc, w->latent_norm, Ll, c->rms_eps);
         if (g_cal && c->latent_norm) k3_calib_observe(K3_CAL_LAT, acc, 1, Ll);
-        k3_mmw(ot, acc, w->up, w->wdt, Ll, E);
-
-        float *sgu  = gu;                 /* [2*SI] */
-        float *sact = sgu + 2 * SI;       /* [SI]   */
-        float *sdn  = sact + SI;          /* [E]    */
-        k3_mmw(sgu,      xt, w->sh1, w->wdt, E, SI);
-        k3_mmw(sgu + SI, xt, w->sh3, w->wdt, E, SI);
-        k3_situ_glu(sact, sgu, SI, c->situ_b1, c->situ_b2);
-        k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
-        for (int i = 0; i < E; i++) ot[i] += sdn[i];
     }
+    k3_mmw_rows(out, zz, w->up, w->wdt, Ll, E, T);
+
+    k3_mmw_rows(s1, x, w->sh1, w->wdt, E, SI, T);
+    k3_mmw_rows(s3, x, w->sh3, w->wdt, E, SI, T);
+    float *sgu = gu;      /* [2*SI]: k3_moe_scratch sizes the buffer for the shared MLP */
+    for (int t = 0; t < T; t++) {
+        memcpy(sgu,      s1 + (size_t)t * SIz, SIz * sizeof(float));
+        memcpy(sgu + SI, s3 + (size_t)t * SIz, SIz * sizeof(float));
+        k3_situ_glu(sa + (size_t)t * SIz, sgu, SI, c->situ_b1, c->situ_b2);
+    }
+    k3_mmw_rows(sd, sa, w->sh2, w->wdt, SI, E, T);
+    for (size_t i = 0; i < (size_t)T * E; i++) out[i] += sd[i];
+    free(s1); free(s3); free(sa); free(sd);
 
     free(ridx); free(rwt); free(zz); free(contrib); free(uniq); free(seen);
 }
@@ -1534,13 +1573,9 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
  *     but that is a proof about the inputs. Mul-then-add is a proof about the code.
  *   - The scalar tail loop is reused verbatim for the in % 4 remainder.
  */
-void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
+static inline double k3_dot_bf16(const uint16_t *row, const float *x, int in)
 {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
-#endif
-    for (int o = 0; o < out; o++) {
-        const uint16_t *row = W + (size_t)o * in;
+    {
         int i = 0;
         double acc;
 #if defined(__AVX2__)
@@ -1594,8 +1629,17 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
         }
 #endif
         for (; i < in; i++) acc = fma((double)k3_bf16f(row[i]), (double)x[i], acc);
-        y[o] = (float)acc;
+        return acc;
     }
+}
+
+void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
+{
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out > 64)
+#endif
+    for (int o = 0; o < out; o++)
+        y[o] = (float)k3_dot_bf16(W + (size_t)o * in, x, in);
 }
 
 /* Per-row int8 matmul for the draft model: each row is [f32 scale][int8 * in]. The int8
@@ -1604,15 +1648,9 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
  * determinism contract (K3_WI8 is draft-only, and the exact model decides every emitted
  * token), so it accumulates in float with fused products and the natural AVX2 reduction,
  * which is what makes it fast. */
-void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
+static inline float k3_dot_q8(const unsigned char *row, const float *x, int in)
 {
-    const unsigned char *base = (const unsigned char *)W;
-    const size_t rowb = (size_t)4 + (size_t)in;
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
-#endif
-    for (int o = 0; o < out; o++) {
-        const unsigned char *row = base + (size_t)o * rowb;
+    {
         float scale;
         memcpy(&scale, row, 4);
         const int8_t *w = (const int8_t *)(row + 4);
@@ -1649,8 +1687,19 @@ void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
         }
 #endif
         for (; i < in; i++) acc += (float)w[i] * x[i];
-        y[o] = acc * scale;
+        return acc * scale;
     }
+}
+
+void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
+{
+    const unsigned char *base = (const unsigned char *)W;
+    const size_t rowb = (size_t)4 + (size_t)in;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out > 64)
+#endif
+    for (int o = 0; o < out; o++)
+        y[o] = k3_dot_q8(base + (size_t)o * rowb, x, in);
 }
 
 /* A whole BYTE to its two E2M1 values, so the inner loop does one 8-byte load instead
@@ -1711,80 +1760,104 @@ static void k3_pair_init(void)
  * two byte pointers come from. Two copies of this loop would be two chances to get the
  * nibble order right in one and wrong in the other, which is the failure mode the
  * mxfp4 fixture exists for and which no statistic would reveal. */
-static double mxfp4_rowdot(const float *x, const unsigned char *pr,
-                           const unsigned char *sr, int in, int group)
+/* Expand n (<= 64) packed E2M1 values to floats. The split from the dot product exists
+ * so the dot can vectorise, which it cannot do while a table lookup sits in the middle
+ * of the accumulation. */
+static inline void mxfp4_expand(float *wf, const unsigned char *pb, int n)
+{
+    const int half = n >> 1;
+    for (int j = 0; j < half; j++) {
+        const float *pv = K3_E2M1_PAIR[pb[j]];
+        wf[2 * j]     = pv[0];
+        wf[2 * j + 1] = pv[1];
+    }
+    if (n & 1) wf[n - 1] = K3_E2M1_PAIR[pb[half]][0];
+}
+
+/* One group's unscaled dot product.
+ *
+ * Two fused vector accumulators over the group, element i to accumulator (i/4)%2,
+ * lanewise-summed then cross-lane paired; the scalar path is the identical partition
+ * with fma(), which is the same IEEE operation, so both paths stay bit-identical. Same
+ * reasoning as the fp32/bf16 kernels above; the group is short, so two accumulators
+ * suffice to break the add-latency chain. The split is written out rather than left to
+ * the compiler because a sequential floating-point reduction may not be reassociated
+ * without -ffast-math, which this build does not set.
+ *
+ * The lane split changes the summation order. See the accuracy contract above for why
+ * that is bounded at ~1e-16 relative. */
+static inline double mxfp4_groupdot(const float *wf, const float *xg, int n)
+{
+    double sub;
+    int i = 0;
+#if defined(__AVX2__)
+    {
+        __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
+        for (; i + 7 < n; i += 8) {
+            v0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(wf + i)),
+                                 _mm256_cvtps_pd(_mm_loadu_ps(xg + i)), v0);
+            v1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(wf + i + 4)),
+                                 _mm256_cvtps_pd(_mm_loadu_ps(xg + i + 4)), v1);
+        }
+        double a[4];
+        _mm256_storeu_pd(a, _mm256_add_pd(v0, v1));
+        sub = (a[0] + a[1]) + (a[2] + a[3]);
+    }
+#else
+    {
+        double s[8] = {0};
+        for (; i + 7 < n; i += 8)
+            for (int l = 0; l < 8; l++)
+                s[l] = fma((double)wf[i + l], (double)xg[i + l], s[l]);
+        double b0 = s[0] + s[4], b1 = s[1] + s[5];
+        double b2 = s[2] + s[6], b3 = s[3] + s[7];
+        sub = (b0 + b1) + (b2 + b3);
+    }
+#endif
+    for (; i < n; i++) sub = fma((double)wf[i], (double)xg[i], sub);
+    return sub;
+}
+
+/* ONE row of an MXFP4 matrix, dotted with nt inputs x + t*xs, into acc[t].
+ *
+ * Factored out so the two callers -- the routed experts, whose packed nibbles and E8M0
+ * scales live in separate contiguous planes, and a quantised trunk, whose rows carry
+ * their own scales inline -- share every arithmetic decision: nibble order, the NaN
+ * scale rule, the lane partition, the reduction order. They differ only in where the
+ * two byte pointers come from. Two copies of this loop would be two chances to get the
+ * nibble order right in one and wrong in the other, which is the failure mode the
+ * mxfp4 fixture exists for and which no statistic would reveal.
+ *
+ * Several inputs at once so a batch expands each group of nibbles ONCE and reuses it
+ * for every input. Each input's arithmetic is exactly the nt == 1 case: the same group
+ * order, the same group dot, the same scale-then-accumulate. */
+static void mxfp4_rowdot_n(double *acc, const float *x, size_t xs, int nt,
+                           const unsigned char *pr, const unsigned char *sr,
+                           int in, int group)
 {
     const int ngrp  = (in + group - 1) / group;
     const int gbyte = group / 2;
-    double acc = 0.0;
-    {
-        for (int g = 0; g < ngrp; g++) {
-            const unsigned char sb = sr[g];
-            if (sb == 255) continue;              /* NaN scale: contribute nothing */
-            const unsigned char *pb = pr + (size_t)g * gbyte;
-            const float *xg = x + (size_t)g * group;
-
-            int n = in - g * group;
-            if (n > group) n = group;
-
-            /* Expand the group to floats first, then take a plain dot product. The
-             * split exists so the second loop can vectorise, which it cannot do while
-             * a table lookup sits in the middle of the accumulation. */
-            float wf[64];                         /* group is 32 for K3; 64 is headroom */
-            const int half = n >> 1;
-            for (int j = 0; j < half; j++) {
-                const float *pv = K3_E2M1_PAIR[pb[j]];
-                wf[2 * j]     = pv[0];
-                wf[2 * j + 1] = pv[1];
-            }
-            if (n & 1) wf[n - 1] = K3_E2M1_PAIR[pb[half]][0];
-
-            /* Four double lanes partitioned by i%4, reduced as (s0+s1)+(s2+s3), in BOTH
-             * the scalar and the AVX2 path so the two agree bit for bit on every
-             * machine. The split is written out rather than left to the compiler
-             * because a sequential floating-point reduction may not be reassociated
-             * without -ffast-math, which this build does not set: expressed as one
-             * serial accumulator, the hottest loop in the engine compiles to scalar
-             * adds no matter what the surrounding code looks like.
-             *
-             * The lane split changes the summation order. See the accuracy contract on
-             * the function above for why that is bounded at ~1e-16 relative. */
-            /* Two fused vector accumulators over the 32-element group, element i to
-             * accumulator (i/4)%2, lanewise-summed then cross-lane paired; the scalar
-             * path is the identical partition with fma(), which is the same IEEE
-             * operation, so both paths stay bit-identical. Same reasoning as the
-             * fp32/bf16 kernels above; the group is short, so two accumulators
-             * suffice to break the add-latency chain. */
-            double sub;
-            int i = 0;
-#if defined(__AVX2__)
-            {
-                __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
-                for (; i + 7 < n; i += 8) {
-                    v0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(wf + i)),
-                                         _mm256_cvtps_pd(_mm_loadu_ps(xg + i)), v0);
-                    v1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(wf + i + 4)),
-                                         _mm256_cvtps_pd(_mm_loadu_ps(xg + i + 4)), v1);
-                }
-                double a[4];
-                _mm256_storeu_pd(a, _mm256_add_pd(v0, v1));
-                sub = (a[0] + a[1]) + (a[2] + a[3]);
-            }
-#else
-            {
-                double s[8] = {0};
-                for (; i + 7 < n; i += 8)
-                    for (int l = 0; l < 8; l++)
-                        s[l] = fma((double)wf[i + l], (double)xg[i + l], s[l]);
-                double b0 = s[0] + s[4], b1 = s[1] + s[5];
-                double b2 = s[2] + s[6], b3 = s[3] + s[7];
-                sub = (b0 + b1) + (b2 + b3);
-            }
-#endif
-            for (; i < n; i++) sub = fma((double)wf[i], (double)xg[i], sub);
-            acc += sub * (double)k3_e8m0f(sb);
-        }
+    for (int t = 0; t < nt; t++) acc[t] = 0.0;
+    for (int g = 0; g < ngrp; g++) {
+        const unsigned char sb = sr[g];
+        if (sb == 255) continue;                  /* NaN scale: contribute nothing */
+        int n = in - g * group;
+        if (n > group) n = group;
+        if (n <= 0) break;                        /* also tells GCC wf is written below */
+        float wf[64];                             /* group is 32 for K3; 64 is headroom */
+        mxfp4_expand(wf, pr + (size_t)g * gbyte, n);
+        const double sc = (double)k3_e8m0f(sb);
+        const float *xg = x + (size_t)g * group;
+        for (int t = 0; t < nt; t++)
+            acc[t] += mxfp4_groupdot(wf, xg + (size_t)t * xs, n) * sc;
     }
+}
+
+static inline double mxfp4_rowdot(const float *x, const unsigned char *pr,
+                                  const unsigned char *sr, int in, int group)
+{
+    double acc;
+    mxfp4_rowdot_n(&acc, x, 0, 1, pr, sr, in, group);
     return acc;
 }
 
@@ -1808,6 +1881,30 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
  * self-contained so one tagged pointer describes the matrix, exactly as K3_WI8 does.
  * The group is fixed at K3_MXFP4_GROUP because the packer writes it that way and the
  * row stride depends on it; a different group would need a different container. */
+/* k3_matmul_mxfp4 over T input rows: y is [T][rows], x is [T][in]. Same row kernel,
+ * so bit-identical to T separate calls; each weight row is read once for all T. */
+void k3_matmul_mxfp4_rows(float *y, const float *x, const unsigned char *packed,
+                          const unsigned char *scales, int in, int rows, int group,
+                          int T)
+{
+    const int pcols = in / 2;
+    const int ngrp  = (in + group - 1) / group;
+    pthread_once(&k3_pair_once, k3_pair_init);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (rows > 64)
+#endif
+    for (int r = 0; r < rows; r++) {
+        const unsigned char *pr = packed + (size_t)r * pcols;
+        const unsigned char *sr = scales + (size_t)r * ngrp;
+        for (int t0 = 0; t0 < T; t0 += 16) {
+            const int nt = (T - t0 < 16) ? T - t0 : 16;
+            double acc[16];
+            mxfp4_rowdot_n(acc, x + (size_t)t0 * in, (size_t)in, nt, pr, sr, in, group);
+            for (int t = 0; t < nt; t++) y[(size_t)(t0 + t) * rows + r] = (float)acc[t];
+        }
+    }
+}
+
 void k3_matmul_mx4(float *y, const float *x, const void *W, int in, int out)
 {
     const size_t rb = k3_row_bytes(K3_WMX4, in);
@@ -1822,6 +1919,49 @@ void k3_matmul_mx4(float *y, const float *x, const void *W, int in, int out)
     for (int r = 0; r < out; r++) {
         const unsigned char *row = base + (size_t)r * rb;
         y[r] = (float)mxfp4_rowdot(x, row, row + pn, in, K3_MXFP4_GROUP);
+    }
+}
+
+/* y[t][out] = W . x[t][in] for t < T: the same product k3_mmw computes, for T tokens
+ * at once. Every (t, o) element goes through the SAME row-dot function as the single
+ * token kernel, so the result is bit-identical to calling k3_mmw T times; the only
+ * change is the loop order. Row-outer, token-inner means each weight row is fetched
+ * from memory once and then stays in L1 for the remaining T - 1 dots, where the
+ * per-token form streamed the whole matrix again for every token. A decode step is a
+ * matrix-vector product and gains nothing here; a prefill chunk is T of them over the
+ * same weights, so its weight traffic drops by a factor of T. */
+void k3_mmw_rows(float *y, const float *x, const void *W, int wdt, int in, int out,
+                 int T)
+{
+    if (T == 1) { k3_mmw(y, x, W, wdt, in, out); return; }
+    const unsigned char *base = (const unsigned char *)W;
+    const size_t rb = k3_row_bytes(wdt, in);
+    if (wdt == K3_WMX4) pthread_once(&k3_pair_once, k3_pair_init);
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out > 64)
+#endif
+    for (int o = 0; o < out; o++) {
+        const unsigned char *row = base + (size_t)o * rb;
+        if (wdt == K3_WMX4) {                     /* expand each group once, see above */
+            for (int t0 = 0; t0 < T; t0 += 16) {
+                const int nt = (T - t0 < 16) ? T - t0 : 16;
+                double acc[16];
+                mxfp4_rowdot_n(acc, x + (size_t)t0 * in, (size_t)in, nt,
+                               row, row + (size_t)in / 2u, in, K3_MXFP4_GROUP);
+                for (int t = 0; t < nt; t++)
+                    y[(size_t)(t0 + t) * out + o] = (float)acc[t];
+            }
+            continue;
+        }
+        for (int t = 0; t < T; t++) {
+            const float *xt = x + (size_t)t * in;
+            float v;
+            if (wdt == K3_WBF16)    v = (float)k3_dot_bf16((const uint16_t *)row, xt, in);
+            else if (wdt == K3_WI8) v = k3_dot_q8(row, xt, in);
+            else                    v = (float)k3_dot_f32((const float *)row, xt, in);
+            y[(size_t)t * out + o] = v;
+        }
     }
 }
 

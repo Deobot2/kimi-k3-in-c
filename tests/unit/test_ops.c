@@ -1130,6 +1130,124 @@ static void t_matmul_tr(void)
     }
 }
 
+/* k3_moe_prefill must equal k3_moe run one token at a time, EXACTLY.
+ *
+ * The batched prefill reorders the work (expert-major instead of token-major, and many
+ * tokens per weight read) purely for I/O and memory traffic. Every float it emits is
+ * required to match the per-token path, so this compares bit patterns, not values.
+ *
+ * The source is an in-memory table of random MXFP4 experts. With 12 experts, top-3 and
+ * 9 tokens, several experts are chosen by several tokens and some by none, so both the
+ * "one expert, many tokens" batching and the scatter back into top-k order are
+ * exercised. The first token also runs through the T == 1 fallback. */
+typedef struct { unsigned char *p1, *s1, *p3, *s3, *p2, *s2; int fails; } TMoeBank;
+
+static int tmoe_get(K3ExpertSrc *self, int layer, int e, K3ExpertQ *q)
+{
+    TMoeBank *b = (TMoeBank *)self->ctx;
+    (void)layer;
+    q->p1 = b[e].p1; q->s1 = b[e].s1;
+    q->p3 = b[e].p3; q->s3 = b[e].s3;
+    q->p2 = b[e].p2; q->s2 = b[e].s2;
+    return 0;
+}
+
+static float tmoe_rnd(unsigned *s)
+{
+    *s ^= *s << 13; *s ^= *s >> 17; *s ^= *s << 5;
+    return (float)(*s >> 8) / 8388608.0f - 1.0f;
+}
+
+static void t_moe_prefill(void)
+{
+    K3Cfg c; memset(&c, 0, sizeof c);
+    c.hidden = 96; c.latent = 64; c.moe_inter = 32; c.n_shared = 2;
+    c.n_experts = 12; c.topk = 3; c.routed_scale = 2.5f; c.moe_renorm = 1;
+    c.latent_norm = 1; c.situ_b1 = 4.0f; c.situ_b2 = 25.0f; c.rms_eps = 1e-6f;
+    const int E = c.hidden, Ll = c.latent, I = c.moe_inter, SI = I * c.n_shared;
+    const int T = 9;
+
+    unsigned s = 0x7E57AB1Eu;
+    float *gate = (float *)malloc((size_t)c.n_experts * E * sizeof(float));
+    float *bias = (float *)malloc((size_t)c.n_experts * sizeof(float));
+    float *lnw  = (float *)malloc((size_t)Ll * sizeof(float));
+    float *down = (float *)malloc((size_t)Ll * E * sizeof(float));
+    float *up   = (float *)malloc((size_t)E * Ll * sizeof(float));
+    float *sh1  = (float *)malloc((size_t)SI * E * sizeof(float));
+    float *sh3  = (float *)malloc((size_t)SI * E * sizeof(float));
+    float *sh2  = (float *)malloc((size_t)E * SI * sizeof(float));
+    float *x    = (float *)malloc((size_t)T * E * sizeof(float));
+    float *ya   = (float *)malloc((size_t)T * E * sizeof(float));
+    float *yb   = (float *)malloc((size_t)T * E * sizeof(float));
+    float *scr  = (float *)malloc(k3_moe_scratch(&c) * sizeof(float));
+    TMoeBank *bank = (TMoeBank *)calloc((size_t)c.n_experts, sizeof *bank);
+    if (!gate || !bias || !lnw || !down || !up || !sh1 || !sh3 || !sh2 || !x || !ya ||
+        !yb || !scr || !bank) {
+        printf("  FAIL  moe_prefill (alloc)\n"); g_fail++; return;
+    }
+    for (int i = 0; i < c.n_experts * E; i++) gate[i] = tmoe_rnd(&s);
+    for (int i = 0; i < c.n_experts; i++)     bias[i] = 0.1f * tmoe_rnd(&s);
+    for (int i = 0; i < Ll; i++)              lnw[i]  = 1.0f + 0.2f * tmoe_rnd(&s);
+    for (int i = 0; i < Ll * E; i++)
+        { down[i] = 0.2f * tmoe_rnd(&s); up[i] = 0.2f * tmoe_rnd(&s); }
+    for (int i = 0; i < SI * E; i++) {
+        sh1[i] = 0.2f * tmoe_rnd(&s);
+        sh3[i] = 0.2f * tmoe_rnd(&s);
+        sh2[i] = 0.2f * tmoe_rnd(&s);
+    }
+    for (int i = 0; i < T * E; i++)           x[i] = tmoe_rnd(&s);
+
+    /* one expert: w1, w3 are [I][Ll], w2 is [Ll][I], as packed nibbles + E8M0 */
+    for (int e = 0; e < c.n_experts; e++) {
+        unsigned char **pp[3] = { &bank[e].p1, &bank[e].p3, &bank[e].p2 };
+        unsigned char **ss[3] = { &bank[e].s1, &bank[e].s3, &bank[e].s2 };
+        for (int m = 0; m < 3; m++) {
+            const int rows = (m == 2) ? Ll : I, in = (m == 2) ? I : Ll;
+            const size_t np = (size_t)rows * in / 2;
+            const size_t ns = (size_t)rows * in / K3_MXFP4_GROUP;
+            *pp[m] = (unsigned char *)malloc(np);
+            *ss[m] = (unsigned char *)malloc(ns);
+            for (size_t i = 0; i < np; i++) {
+                tmoe_rnd(&s);
+                (*pp[m])[i] = (unsigned char)(s >> 7);
+            }
+            for (size_t i = 0; i < ns; i++) {
+                tmoe_rnd(&s);
+                (*ss[m])[i] = (unsigned char)(122 + s % 6);
+            }
+        }
+    }
+
+    K3ExpertSrc src; memset(&src, 0, sizeof src);
+    src.get = tmoe_get; src.ctx = bank;
+    K3MoeW w; memset(&w, 0, sizeof w);
+    w.gate = gate; w.bias = bias; w.latent_norm = lnw;
+    w.down = down; w.up = up; w.sh1 = sh1; w.sh3 = sh3; w.sh2 = sh2;
+    w.src = &src;
+
+    int idx[K3_MAX_TOPK]; float wt[K3_MAX_TOPK];
+    for (int t = 0; t < T; t++)
+        k3_moe(ya + (size_t)t * E, x + (size_t)t * E, &w, &c, 1, idx, wt, scr);
+    k3_moe_prefill(yb, x, &w, &c, T, idx, wt, scr);
+
+    int bad = 0;
+    for (int i = 0; i < T * E; i++) if (memcmp(&ya[i], &yb[i], sizeof(float))) bad++;
+    if (bad) {
+        printf("  FAIL  moe_prefill   %d/%d floats differ from per-token k3_moe\n",
+               bad, T * E);
+        g_fail++;
+    } else {
+        printf("  PASS  moe_prefill   T=%d    bit-identical to per-token k3_moe\n", T);
+        g_pass++;
+    }
+    for (int e = 0; e < c.n_experts; e++) {
+        free(bank[e].p1); free(bank[e].s1); free(bank[e].p3);
+        free(bank[e].s3); free(bank[e].p2); free(bank[e].s2);
+    }
+    free(bank); free(gate); free(bias); free(lnw); free(down); free(up);
+    free(sh1); free(sh3); free(sh2); free(x); free(ya); free(yb); free(scr);
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -1168,6 +1286,7 @@ int main(int argc, char **argv)
     t_mxfp4(dir);
     t_matmul_bf16();
     t_matmul_tr();
+    t_moe_prefill();
     t_kda_layer(dir, "kda_layer1");
     t_kda_layer(dir, "kda_layer8");
     t_layer(dir, "layer_kda");

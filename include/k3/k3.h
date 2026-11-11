@@ -455,6 +455,12 @@ static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
     else                      k3_matmul(y, x, (const float *)W, in, out);
 }
 
+/* k3_mmw over T tokens: y is [T][out], x is [T][in]. Bit-identical to T calls of
+ * k3_mmw (it shares their row kernels), but reads each weight row once per call rather
+ * than once per token, which is what a prefill chunk wants. */
+void k3_mmw_rows(float *y, const float *x, const void *W, int wdt, int in, int out,
+                 int T);
+
 /* Byte stride of one row for a per-row int8 matrix: the f32 scale plus `in` int8 weights.
  * bf16 and fp32 are per-element and take the element form. */
 static inline size_t k3_wsz(int wdt) { return wdt == K3_WBF16 ? 2u : 4u; }
@@ -759,6 +765,10 @@ void k3_mxfp4_dequant(float *out, const unsigned char *packed,
  * becoming 132 MB. See the comment on the definition. */
 void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
                      const unsigned char *scales, int in, int rows, int group);
+/* The same over T inputs: y is [T][rows], x is [T][in]. Bit-identical to T calls. */
+void k3_matmul_mxfp4_rows(float *y, const float *x, const unsigned char *packed,
+                          const unsigned char *scales, int in, int rows, int group,
+                          int T);
 
 #ifdef __cplusplus
 }
