@@ -71,6 +71,19 @@ not needing the bytes at all.
 
 ### Changed
 
+- **MLA attention runs one head per thread**, in both the expanded and the latent path.
+  The per-head score/softmax/value loop was the only part of attention still on one
+  core, and it grows with context. Bit-identical at any thread count. One real-size
+  latent layer over 512 decode steps: 15.85 s → 11.43 s mean of three runs (4 threads).
+  The score rows move out of the scratch layouts; the scratch sizers' `cap`/`span`
+  arguments no longer change the size and stay only so the API does not change.
+- **`k3_matmul_tr` walks 64-column blocks row by row** instead of one strided column at
+  a time, and the MXFP4 branch reads the E8M0 table instead of calling `ldexpf` per
+  element. Same per-column summation order, so bit-identical. 3.7–5.3× faster at the
+  `W_UK[h]` shape (fp32 ~55 → ~12 µs, MXFP4 ~305 → ~71 µs).
+- `test_ops` now checks that MLA (both paths) and KDA (output and carried state) give
+  the same bytes at 1 and 4 threads. The KDA code comment claimed this was already
+  tested, but nothing ever changed the thread count.
 - **Expert cache replacement is S3-FIFO, not LRU.** The project's own simulator put 25.5
   points between LRU and Belady at 64 GB, and its own conclusion was that the lever is the
   policy rather than the size. Small FIFO, main FIFO, ghost queue; uniform object size
@@ -95,6 +108,12 @@ not needing the bytes at all.
 
 ### Fixed
 
+- The MXFP4 lookup tables were built behind a plain `ready` flag, so a thread could see
+  the flag set before it could see the tables, and multiply by zeros. Now built through
+  `pthread_once`. This became reachable once W_UV's matmul runs inside the per-head
+  parallel loop.
+- The latent attention's score count is clamped for a position still inside the sink
+  region, where the rolling pass is empty and the unclamped count goes negative.
 - The trunk reader's `hits`/`misses` are classified once per bind rather than incremented
   by whichever thread performed the read, so they sum to the bind count instead of double
   counting every prefetched layer.
