@@ -241,8 +241,8 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out);
  *   + T*(kv_lora+qk_rope)        compressed latent plus the shared rope slot
  *   + q_lora                     transient
  *   + 2*H*v_head                 attention accumulator and gate buffer
- *   + T                          scores
- * floats. Use k3_mla_scratch() rather than recomputing this.
+ * floats. Use k3_mla_scratch() rather than recomputing this. The attention score rows
+ * are not in it: attention runs one head per thread, and each thread allocates its own.
  */
 typedef struct {
     /* Tagged by wdt: fp32 when zero (every fixture), bf16 for the real checkpoint. */
@@ -254,7 +254,8 @@ typedef struct {
 } K3MlaW;
 
 size_t k3_mla_scratch(const K3Cfg *c, int T);
-/* Scratch when a KV cache supplies the keys and values. cap is the cache capacity. */
+/* Scratch when a KV cache supplies the keys and values. cap is the cache capacity; it
+ * no longer changes the size (score rows are per thread) and is kept for the API. */
 size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode);
 
 /* MLA with an optional KV cache. kvc is [cap][n_heads*(qk_nope+v_head)] and ropec is
@@ -354,6 +355,7 @@ int    k3_kv_slot(const K3KvCache *kv, int p);
 /* Lowest absolute position still resident in the rolling region at position p. */
 int    k3_kv_first(const K3KvCache *kv, int p);
 
+/* span no longer changes the size, for the same reason; kept for the API. */
 size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span);
 void   k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                      int T, float *scratch, const K3KvCache *kv);

@@ -27,6 +27,7 @@
 #include "k3.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,6 +57,34 @@ static const float K3_E2M1[16] = {
     0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
 };
+
+/* A whole BYTE to its two E2M1 values, so the inner loop does one 8-byte load instead
+ * of masking, shifting and two separate lookups. 2 KB, built once, shared by all
+ * threads after initialisation. */
+static float K3_E2M1_PAIR[256][2];
+
+/* E8M0 byte to its power of two. 255 is NaN by spec and maps to zero. Precomputed
+ * because ldexpf in the group loop is a function call the compiler will not inline
+ * into a vectorised body. */
+static float K3_E8M0[256];
+
+static void k3_mx_tables_build(void)
+{
+    for (int b = 0; b < 256; b++) {
+        K3_E2M1_PAIR[b][0] = K3_E2M1[b & 0x0F];   /* low nibble  = EVEN element */
+        K3_E2M1_PAIR[b][1] = K3_E2M1[b >> 4];     /* high nibble = ODD element  */
+        K3_E8M0[b] = (b == 255) ? 0.0f : ldexpf(1.0f, b - 127);
+    }
+}
+
+/* Built through pthread_once, NOT a plain "ready" flag. The MXFP4 kernels are called
+ * from inside OpenMP regions (W_UV in the latent attention loop, one call per head), and
+ * with a bare flag a second thread can observe ready == 1 before the first thread's
+ * table stores are visible to it -- and then multiply by zeros. Every value it produced
+ * would be finite and wrong. pthread_once carries the ordering guarantee a flag does
+ * not. */
+static pthread_once_t k3_mx_once = PTHREAD_ONCE_INIT;
+static void k3_mx_tables(void) { pthread_once(&k3_mx_once, k3_mx_tables_build); }
 
 static void k3_fatal_oom(const char *what, size_t bytes)
 {
@@ -424,9 +453,9 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     float *ql   = ct   + (size_t)kvw;               /* [q_lora]       */
     float *acc  = ql   + (size_t)c->q_lora;         /* [H][vh]        */
     float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate   */
-    float *sc   = gbuf + (size_t)H * vh;            /* [last+1] scores */
-    /* Without a cache the keys/values live in scratch and cover only this call. */
-    float *kvs  = sc   + (size_t)(last + 1);        /* [T][H][kvd]    */
+    /* Without a cache the keys/values live in scratch and cover only this call. The
+     * score rows are per thread and allocated by the attention loop, not here. */
+    float *kvs  = gbuf + (size_t)H * vh;            /* [T][H][kvd]    */
     float *rps  = kvs  + (kvc ? 0 : (size_t)T * H * kvd);   /* [T][qr] */
 
     #define K3_KV_AT(p)   (kvc   ? kvc   + (size_t)(p) * H * kvd : kvs + (size_t)(p) * H * kvd)
@@ -450,9 +479,24 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         k3_mmw(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, H * kvd);
     }
 
-    /* ---- attention, per head, causal ---- */
+    /* ---- attention, per head, causal ----
+     * PARALLEL over heads. Each head reads the shared cache and writes only its own
+     * acc[h] row, and its score row is private to the thread running it, so the
+     * arithmetic inside a head -- every sum, in its order -- is exactly what a serial
+     * loop does and the output does not depend on the thread count. This loop is
+     * O(H * p) per token and was the one piece of attention still on a single core,
+     * which at a few thousand positions makes it the largest compute term in a token. */
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
+#ifdef _OPENMP
+#       pragma omp parallel
+#endif
+        {
+        float *sc = (float *)malloc((size_t)(p + 1) * sizeof(float));
+        if (!sc) k3_fatal_oom("MLA attention scores", (size_t)(p + 1) * sizeof(float));
+#ifdef _OPENMP
+#       pragma omp for schedule(static)
+#endif
         for (int h = 0; h < H; h++) {
             const float *qt = q + ((size_t)t * H + h) * qh;
             float m = -INFINITY;
@@ -477,6 +521,8 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                 const float *vs = K3_KV_AT(s) + (size_t)h * kvd + qn;
                 for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
             }
+        }
+        free(sc);
         }
 
         /* ---- output gate then projection. Gate BEFORE o_proj, and no norm on it,
@@ -535,10 +581,9 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     float *ct   = q    + (size_t)T * H * qh;        /* [kvw] transient */
     float *ql   = ct   + (size_t)kvw;               /* [q_lora]        */
     float *qa   = ql   + (size_t)c->q_lora;         /* [H][kl] absorbed queries */
-    float *al   = qa   + (size_t)H * kl;            /* [kl] latent attention sum */
-    float *acc  = al   + (size_t)kl;                /* [H][vh]         */
+    float *acc  = qa   + (size_t)H * kl;            /* [H][vh]         */
     float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate    */
-    float *sc   = gbuf + (size_t)H * vh;            /* [span] scores   */
+    /* the score row and latent sum are per thread, allocated by the attention loop */
 
     const size_t kvb_row = k3_row_bytes(w->wdt, kl);
 
@@ -587,6 +632,25 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         const int s0 = k3_kv_first(kv, p);
         int nsink = kv->window ? kv->sinks : 0;
         if (nsink > p + 1) nsink = p + 1;
+        /* PARALLEL over heads, bit-identical for the same reason as the expanded
+         * path: a head's scores and latent sum are private to the thread running it,
+         * and nothing inside a head changes order. span is exactly the number of
+         * scores the two passes below write. The rolling count is clamped because a
+         * position still inside the sink region has s0 > p and an empty second pass;
+         * unclamped it goes negative and the row overlaps the latent sum. */
+        const int roll = p - s0 + 1;
+        const int span = nsink + (roll > 0 ? roll : 0);
+#ifdef _OPENMP
+#       pragma omp parallel
+#endif
+        {
+        float *sc = (float *)malloc(((size_t)span + (size_t)kl) * sizeof(float));
+        if (!sc) k3_fatal_oom("MLA latent attention scores",
+                              ((size_t)span + (size_t)kl) * sizeof(float));
+        float *al = sc + span;                      /* [kl] latent attention sum */
+#ifdef _OPENMP
+#       pragma omp for schedule(static)
+#endif
         for (int h = 0; h < H; h++) {
             const float *qah = qa + (size_t)h * kl;
             const float *qrh = qt + (size_t)h * qh + qn;   /* the unrotated rope slots */
@@ -632,6 +696,8 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
             const unsigned char *wuv =
                 (const unsigned char *)w->kv_b + (size_t)(h * kvd + qn) * kvb_row;
             k3_mmw(acc + (size_t)h * vh, al, wuv, w->wdt, kl, vh);
+        }
+        free(sc);
         }
 
         /* ---- gate then projection, unchanged: the gate is why W_UV could not be
@@ -679,9 +745,10 @@ size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span)
          + (size_t)(c->kv_lora + c->qk_rope)           /* ct transient        */
          + (size_t)c->q_lora
          + (size_t)H * c->kv_lora                      /* absorbed queries    */
-         + (size_t)c->kv_lora                          /* latent attn sum     */
-         + (size_t)2 * H * vh                          /* acc, gbuf           */
-         + (size_t)(span > T ? span : T);              /* scores              */
+         + (size_t)2 * H * vh;                         /* acc, gbuf           */
+    /* The score row and latent sum are per thread and allocated by the attention
+     * loop, so they are not sized here and `span` no longer enters the total. */
+    (void)span;
 }
 
 /* The transposed product, W row-major and never moved.
@@ -876,8 +943,8 @@ size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode)
     size_t n = (size_t)T * H * qh                      /* q            */
              + (size_t)(c->kv_lora + c->qk_rope)       /* ct transient */
              + (size_t)c->q_lora
-             + (size_t)2 * H * vh                      /* acc, gbuf    */
-             + (size_t)(cap > T ? cap : T);            /* scores       */
+             + (size_t)2 * H * vh;                     /* acc, gbuf    */
+    (void)cap;   /* score rows are per thread, allocated by the attention loop */
     if (!cached_mode) n += (size_t)T * H * kvd + (size_t)T * c->qk_rope;
     return n;
 }
@@ -1294,11 +1361,11 @@ size_t k3_layer_scratch(const K3Cfg *c, int T)
 /* Same, sized for a specific KV layout and attention span.
  *
  * The layout matters here because the two MLA paths want different scratch: the
- * expanded one holds a score row as wide as the cache, the latent one additionally
- * holds H absorbed queries (96 x 512 floats at the released dimensions) and the latent
- * attention sum. Sizing a latent run with k3_layer_scratch would under-allocate by
- * about 200 KB per layer and overwrite whatever followed, so the caller must say which
- * layout it is going to use rather than letting the default stand in. */
+ * latent one additionally holds H absorbed queries (96 x 512 floats at the released
+ * dimensions). Sizing a latent run with k3_layer_scratch would under-allocate by about
+ * 200 KB per layer and overwrite whatever followed, so the caller must say which layout
+ * it is going to use rather than letting the default stand in. Neither form holds the
+ * attention score rows any more: those are per thread, allocated by the head loop. */
 size_t k3_layer_scratch_kv(const K3Cfg *c, int T, int span, int mode)
 {
     /* The uncached path is still reachable from the same buffer (any layer may run
@@ -1611,33 +1678,6 @@ void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
     }
 }
 
-/* A whole BYTE to its two E2M1 values, so the inner loop does one 8-byte load instead
- * of masking, shifting and two separate lookups. 2 KB, built once, shared by all
- * threads after initialisation. */
-static float K3_E2M1_PAIR[256][2];
-static int   k3_pair_ready = 0;
-
-static void k3_pair_init(void)
-{
-    for (int b = 0; b < 256; b++) {
-        K3_E2M1_PAIR[b][0] = K3_E2M1[b & 0x0F];   /* low nibble  = EVEN element */
-        K3_E2M1_PAIR[b][1] = K3_E2M1[b >> 4];     /* high nibble = ODD element  */
-    }
-    k3_pair_ready = 1;
-}
-
-/* E8M0 byte to its power of two. 255 is NaN by spec and maps to zero. Precomputed
- * because ldexpf in the group loop is a function call the compiler will not inline
- * into a vectorised body. */
-static float K3_E8M0[256];
-static int   k3_e8m0_ready = 0;
-
-static void k3_e8m0_init(void)
-{
-    for (int b = 0; b < 256; b++) K3_E8M0[b] = (b == 255) ? 0.0f : ldexpf(1.0f, b - 127);
-    k3_e8m0_ready = 1;
-}
-
 /* y[rows] = W[rows][in] . x[in], with W read straight out of packed MXFP4 and never
  * materialised as floats. This is not an optimisation; it is what makes streaming
  * experts possible at all.
@@ -1761,8 +1801,7 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
     const int pcols = in / 2;                     /* two elements per byte */
     const int ngrp  = (in + group - 1) / group;
 
-    if (!k3_pair_ready)  k3_pair_init();
-    if (!k3_e8m0_ready)  k3_e8m0_init();
+    k3_mx_tables();
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (rows > 64)
@@ -1782,8 +1821,7 @@ void k3_matmul_mx4(float *y, const float *x, const void *W, int in, int out)
     const size_t pn = (size_t)in / 2u;
     const unsigned char *base = (const unsigned char *)W;
 
-    if (!k3_pair_ready)  k3_pair_init();
-    if (!k3_e8m0_ready)  k3_e8m0_init();
+    k3_mx_tables();
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
