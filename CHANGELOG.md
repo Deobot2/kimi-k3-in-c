@@ -112,8 +112,6 @@ not needing the bytes at all.
   the flag set before it could see the tables, and multiply by zeros. Now built through
   `pthread_once`. This became reachable once W_UV's matmul runs inside the per-head
   parallel loop.
-- The latent attention's score count is clamped for a position still inside the sink
-  region, where the rolling pass is empty and the unclamped count goes negative.
 - The trunk reader's `hits`/`misses` are classified once per bind rather than incremented
   by whichever thread performed the read, so they sum to the bind count instead of double
   counting every prefetched layer.
