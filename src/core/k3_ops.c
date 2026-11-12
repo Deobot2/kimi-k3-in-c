@@ -753,87 +753,82 @@ size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span)
 
 /* The transposed product, W row-major and never moved.
  *
- * Column-outer rather than row-outer: each output element gets its own double
- * accumulator summed over rows in index order, so the result does not depend on how the
- * loop is scheduled and the OpenMP and serial forms agree to the bit. Row-outer would
- * need an accumulator array and a reduction whose order changes with the thread count.
+ * Every output y[j] gets its own double accumulator, summed over rows in index order,
+ * one multiply then one add per row (no fused multiply-add). That order is the contract,
+ * and it is kept exactly; what changes is only the order in which the work is visited.
  *
- * The stride is unfriendly -- consecutive rows are `in` elements apart -- but the whole
- * of W_UK[h] is 128 KB at the released dimensions and stays in L2 across the sweep. */
+ * Columns are processed in blocks of K3_TR_BLK. Within a block the loop is ROW-outer:
+ * one row's slice of the block is a contiguous run of bytes, and the update
+ * acc[j] += x[r] * w[r][j] has no dependency across j, so it vectorises. The old
+ * column-outer form read one element per row per column with a stride of a whole row
+ * and could not vectorise at all. Each y[j] still sees rows 0..rows-1 in order, so the
+ * result is bit-identical to it, at any thread count.
+ *
+ * Blocks rather than whole rows so the threaded form needs no reduction: a block is
+ * owned by one thread. The only caller runs inside a parallel loop over heads, where
+ * this pragma does not fork; the block structure is what helps there. */
+#define K3_TR_BLK 64
+
 void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int rows)
 {
-    if (wdt == K3_WBF16) {
-        const uint16_t *w16 = (const uint16_t *)W;
+    const int nblk = (in + K3_TR_BLK - 1) / K3_TR_BLK;
+    const unsigned char *base = (const unsigned char *)W;
+    const size_t stride = k3_row_bytes(wdt, in);
+    if (wdt == K3_WMX4) k3_mx_tables();
+
 #ifdef _OPENMP
-#       pragma omp parallel for schedule(static) if (in > 64)
+#   pragma omp parallel for schedule(static) if (in > 64)
 #endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++)
-                acc += (double)x[r] * (double)k3_bf16f(w16[(size_t)r * in + j]);
-            y[j] = (float)acc;
-        }
-    } else if (wdt == K3_WMX4) {
-        /* A quantised trunk. Column j of row r is the nibble at byte j/2 of that row,
-         * scaled by the E8M0 exponent of the group j/32 -- so the transposed sweep needs
-         * both a nibble select and a per-group scale lookup, where the bf16 case needed
-         * neither. Written out rather than routed through mxfp4_rowdot because that
-         * kernel walks a row forwards and this walks a column downwards; sharing it
-         * would mean expanding every row to floats to use one element of each.
-         *
-         * This exists so --mla-latent composes with a quantised trunk. Without it the
-         * absorbed query projection would read MXFP4 bytes as fp32 -- finite, plausible,
-         * and a completely different model. */
-        const size_t stride = k3_row_bytes(K3_WMX4, in);
-        const size_t pn = (size_t)in / 2u;
-        const unsigned char *base = (const unsigned char *)W;
-#ifdef _OPENMP
-#       pragma omp parallel for schedule(static) if (in > 64)
-#endif
-        for (int j = 0; j < in; j++) {
-            const size_t byte = (size_t)j >> 1;
-            const int    odd  = j & 1;
-            const size_t grp  = (size_t)j / K3_MXFP4_GROUP;
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++) {
-                const unsigned char *row = base + (size_t)r * stride;
-                const unsigned char sb = row[pn + grp];
-                if (sb == 255) continue;              /* NaN scale: contributes nothing */
-                const unsigned char nib = odd ? (row[byte] >> 4) : (row[byte] & 0x0F);
-                acc += (double)x[r] * (double)K3_E2M1[nib] * (double)ldexpf(1.0f, (int)sb - 127);
-            }
-            y[j] = (float)acc;
-        }
-    } else if (wdt == K3_WI8) {
-        /* Per-row [f32 scale][int8 * in]: the scale is a property of the ROW, so it
-         * multiplies x[r] once rather than every element of the column. */
-        const size_t stride = k3_row_bytes(K3_WI8, in);
-        const unsigned char *base = (const unsigned char *)W;
-#ifdef _OPENMP
-#       pragma omp parallel for schedule(static) if (in > 64)
-#endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++) {
-                const unsigned char *row = base + (size_t)r * stride;
+    for (int bk = 0; bk < nblk; bk++) {
+        const int j0 = bk * K3_TR_BLK;
+        const int nj = (in - j0) < K3_TR_BLK ? (in - j0) : K3_TR_BLK;
+        double acc[K3_TR_BLK];
+        for (int j = 0; j < nj; j++) acc[j] = 0.0;
+
+        for (int r = 0; r < rows; r++) {
+            const unsigned char *row = base + (size_t)r * stride;
+            const double xr = (double)x[r];
+            if (wdt == K3_WBF16) {
+                const uint16_t *w16 = (const uint16_t *)row + j0;
+                for (int j = 0; j < nj; j++) acc[j] += xr * (double)k3_bf16f(w16[j]);
+            } else if (wdt == K3_WMX4) {
+                /* A quantised trunk: column j of row r is the nibble at byte j/2,
+                 * scaled by the E8M0 exponent of group j/32. Without this branch the
+                 * absorbed query would read MXFP4 bytes as fp32 -- finite, plausible,
+                 * and a completely different model. The product is formed as
+                 * (x * e2m1) * scale exactly as before; a NaN scale (255) skips its
+                 * group rather than adding zeros, also as before. */
+                const size_t pn = (size_t)in / 2u;
+                for (int j = 0; j < nj; ) {
+                    const int jj = j0 + j;
+                    const int g = jj / K3_MXFP4_GROUP;
+                    int ge = (g + 1) * K3_MXFP4_GROUP - j0;
+                    if (ge > nj) ge = nj;
+                    const unsigned char sb = row[pn + (size_t)g];
+                    if (sb == 255) { j = ge; continue; }
+                    const double sc = (double)K3_E8M0[sb];
+                    for (; j < ge; j++) {
+                        const int c = j0 + j;
+                        const unsigned char by = row[c >> 1];
+                        const unsigned char nib = (c & 1) ? (by >> 4) : (by & 0x0F);
+                        acc[j] += xr * (double)K3_E2M1[nib] * sc;
+                    }
+                }
+            } else if (wdt == K3_WI8) {
+                /* Per-row [f32 scale][int8 * in]: (x * s) * w, as before. */
                 float s; memcpy(&s, row, sizeof s);
-                acc += (double)x[r] * (double)s * (double)((const int8_t *)(row + 4))[j];
+                const double xs = xr * (double)s;
+                const int8_t *w8 = (const int8_t *)(row + 4) + j0;
+                for (int j = 0; j < nj; j++) acc[j] += xs * (double)w8[j];
+            } else {
+                const float *wf = (const float *)row + j0;
+                for (int j = 0; j < nj; j++) acc[j] += xr * (double)wf[j];
             }
-            y[j] = (float)acc;
         }
-    } else {
-        const float *wf = (const float *)W;
-#ifdef _OPENMP
-#       pragma omp parallel for schedule(static) if (in > 64)
-#endif
-        for (int j = 0; j < in; j++) {
-            double acc = 0.0;
-            for (int r = 0; r < rows; r++)
-                acc += (double)x[r] * (double)wf[(size_t)r * in + j];
-            y[j] = (float)acc;
-        }
+        for (int j = 0; j < nj; j++) y[j0 + j] = (float)acc[j];
     }
 }
+#undef K3_TR_BLK
 
 /* ---------------------------------------------------------------- router ---- */
 void k3_router(int *idx, float *w, const float *x, const float *W,
