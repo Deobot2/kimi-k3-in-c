@@ -361,15 +361,15 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
  *      by exactly one thread in exactly the order below. Results are therefore
  *      identical at any thread count, which the fixtures rely on.
  *
- *   2. FOUR ACCUMULATORS, PARTITIONED BY i%4, REDUCED AS (a0+a1)+(a2+a3). The split
- *      keeps the FMA pipeline full, a single accumulator serialises on the latency
- *      chain, but it is written out explicitly rather than left to the compiler
- *      because it fixes a summation ORDER. k3_matmul_bf16 and both AVX2 paths
- *      reproduce this exact partition and this exact tree, which is what makes the
- *      three implementations agree bit for bit.
+ *   2. SIXTEEN DOUBLE ACCUMULATORS, PARTITIONED BY i%16, EACH UPDATED WITH fma(),
+ *      REDUCED AS ((a0+a4)+(a8+a12)) ... then (b0+b1)+(b2+b3). The split keeps the
+ *      FMA pipeline full -- a single accumulator serialises on the add latency chain --
+ *      but it is written out explicitly rather than left to the compiler because it
+ *      fixes a summation ORDER. k3_matmul_bf16 (scalar and AVX2) reproduces this exact
+ *      partition and this exact tree, which is what makes them agree bit for bit.
  *
- * Floating-point addition is not associative, so the four-way split is a real change
- * to the arithmetic relative to a sequential sum. Keeping the accumulators in double
+ * Floating-point addition is not associative, so the split is a real change to the
+ * arithmetic relative to a sequential sum. Keeping the accumulators in double
  * bounds the difference far below fp32 output precision; making them float would not.
  */
 void k3_matmul(float *y, const float *x, const float *W, int in, int out)
@@ -1538,21 +1538,19 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
  *   exactly the values an fp32 copy would have supplied. The only difference from
  *   k3_matmul is WHERE the widening happens, not what is widened.
  *
- * The accumulator layout mirrors k3_matmul deliberately, four partial sums in double,
- * reduced in the same order, so the two kernels agree to the bit on identical input.
+ * The accumulator layout mirrors k3_matmul deliberately: sixteen partial sums in
+ * double, element i into lane i%16, reduced by the same tree, so the two kernels agree
+ * to the bit on identical input.
  *
- * THE AVX2 PATH IS BIT-IDENTICAL TO THE SCALAR PATH, not merely close. A __m256d holds
- * exactly four doubles, and loading four consecutive elements per iteration places
- * element i in lane i%4: the same partition as the scalar accumulators, with the same
- * sequential order within each lane. Reducing with (a0+a1)+(a2+a3) then reproduces the
- * scalar result exactly. Two details carry that guarantee:
+ * THE AVX2 PATH IS BIT-IDENTICAL TO THE SCALAR PATH, not merely close. Four __m256d
+ * accumulators hold sixteen doubles, and the loads place element i in lane i%16: the
+ * same partition as the scalar accumulators, with the same sequential order within
+ * each lane. Two details carry that guarantee:
  *
- *   - MUL THEN ADD, never _mm256_fmadd_pd. The build sets -ffp-contract=off, so the
- *     scalar code rounds the product and the sum separately while an FMA rounds once.
- *     Here the product happens to be exact (a bf16 widens exactly, and float x float
- *     needs 48 mantissa bits, which fits double's 53), so the two would agree anyway
- *     but that is a proof about the inputs. Mul-then-add is a proof about the code.
- *   - The scalar tail loop is reused verbatim for the in % 4 remainder.
+ *   - FUSED IN BOTH. _mm256_fmadd_pd per lane is the same IEEE operation as scalar
+ *     fma() in double, and the scalar path calls fma() explicitly, so -ffp-contract=off
+ *     (which only stops the COMPILER fusing) does not make them diverge.
+ *   - The scalar tail loop is reused verbatim for the in % 16 remainder.
  */
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
 {
