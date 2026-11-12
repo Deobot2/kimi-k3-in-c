@@ -15,6 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "json.h"
 #include "k3.h"
 
@@ -38,6 +42,44 @@ static int g_pass = 0, g_fail = 0;
 static int g_skip = 0;
 
 /* ------------------------------------------------------------- utilities ---- */
+/* ---- thread-count invariance ----
+ * Several kernels split work across OpenMP threads (MLA attention per head, the KDA
+ * recurrence per head, matmul rows) and claim the output does not depend on how many
+ * threads ran. A fixture comparison at a tolerance cannot see that claim break: a
+ * reduction whose order follows the thread count is off by a few ulps, well inside it.
+ * So the same call is run at one thread and at four, and the outputs must be the same
+ * BYTES. Four is forced even on a smaller machine: oversubscribing is fine for this. */
+static int set_threads(int n)
+{
+#ifdef _OPENMP
+    const int old = omp_get_max_threads();
+    omp_set_num_threads(n);
+    return old;
+#else
+    (void)n;
+    return 1;
+#endif
+}
+
+static void report_same(const char *name, const float *a, const float *b, size_t n)
+{
+#ifdef _OPENMP
+    if (memcmp(a, b, n * sizeof(float)) == 0) {
+        printf("  PASS  %-14s 1 vs 4 threads, bit-identical over %zu values\n", name, n);
+        g_pass++;
+    } else {
+        size_t i = 0; while (i < n && memcmp(a + i, b + i, sizeof(float)) == 0) i++;
+        printf("  FAIL  %-14s 1 vs 4 threads differ, first at [%zu]: %.9g vs %.9g\n",
+               name, i, (double)a[i], (double)b[i]);
+        g_fail++;
+    }
+#else
+    (void)a; (void)b; (void)n;
+    printf("  SKIP  %-14s built without OpenMP\n", name);
+    g_skip++;
+#endif
+}
+
 static char *slurp(const char *path)
 {
     FILE *f = fopen(path, "rb");
@@ -529,6 +571,36 @@ static void t_mla(const char *dir)
                     kv.cached = t + 1;
                 }
                 report_x("mla_lat_window", y2, eo, n_out, 8.0);
+
+                /* Both attention loops run one head per thread. Batched for the
+                 * expanded path, one position at a time for the latent one, so the
+                 * cached > 0 head loop is the one that is checked. */
+                float *ya = (float *)malloc((size_t)T * c.hidden * sizeof(float));
+                float *yb = (float *)malloc((size_t)T * c.hidden * sizeof(float));
+                if (ya && yb) {
+                    const size_t nv = (size_t)T * c.hidden;
+                    const int old = set_threads(1);
+                    k3_mla(ya, x, &w, &c, T, scratch);
+                    set_threads(4);
+                    k3_mla(yb, x, &w, &c, T, scratch);
+                    report_same("mla_threads", ya, yb, nv);
+
+                    for (int pass = 0; pass < 2; pass++) {
+                        set_threads(pass ? 4 : 1);
+                        memset(lat, 0, (size_t)T * kvw * sizeof(float));
+                        memset(&kv, 0, sizeof kv);
+                        kv.mode = K3_KV_LATENT; kv.lat = lat; kv.cap = T;
+                        float *yo = pass ? yb : ya;
+                        for (int t = 0; t < T; t++) {
+                            k3_mla_latent(yo + (size_t)t * c.hidden,
+                                          x + (size_t)t * c.hidden, &w, &c, 1, sc2, &kv);
+                            kv.cached = t + 1;
+                        }
+                    }
+                    report_same("mla_lat_thr", ya, yb, nv);
+                    set_threads(old);
+                }
+                free(ya); free(yb);
             }
             free(lat); free(y2); free(sc2);
         }
@@ -674,6 +746,26 @@ static void t_kda_layer(const char *dir, const char *file)
             report(nm, y, eo, n_out);
             if (es) { snprintf(nm, sizeof nm, "%s_state", file);
                       report(nm, st, es, n_st); }
+
+            /* The recurrence runs one head per thread; output AND carried state must
+             * not depend on how many threads ran it. */
+            const size_t ns = (size_t)P * c.kda_head_dim + (size_t)3 * P * hist;
+            const size_t ny = (size_t)T * c.hidden;
+            float *st2 = (float *)calloc(ns, sizeof(float));
+            float *y2  = (float *)malloc(ny * sizeof(float));
+            if (st2 && y2) {
+                const int old = set_threads(1);
+                memset(st, 0, ns * sizeof(float));
+                k3_kda_layer(y, x, &w, &c, T, st, sc);
+                set_threads(4);
+                k3_kda_layer(y2, x, &w, &c, T, st2, sc);
+                set_threads(old);
+                snprintf(nm, sizeof nm, "%s_thr", file);
+                report_same(nm, y, y2, ny);
+                snprintf(nm, sizeof nm, "%s_st_thr", file);
+                report_same(nm, st, st2, ns);
+            }
+            free(st2); free(y2);
         }
         free(st); free(sc); free(y);
     }

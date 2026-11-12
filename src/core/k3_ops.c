@@ -1317,7 +1317,7 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
      * slice of q/k/v/al/o, and its own beta column. The recurrence is sequential in t
      * WITHIN a head, so the loops nest head-outer here and each head walks its own t in
      * order; per-head arithmetic is untouched and the results are bit-identical to the
-     * serial form (gated by test_ops' kda fixtures under 1 vs N threads). The recurrence
+     * serial form (gated by test_ops: kda_layer*_thr runs 1 vs 4 threads). The recurrence
      * is 0.4% of FLOPs but, serial, it is a majority of non-matmul wall time at high
      * core counts. wr is a full P-wide work row, so wr + h*D gives each head a private
      * slice with no new allocation. */
