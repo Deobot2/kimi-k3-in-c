@@ -1572,6 +1572,14 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
  */
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
 {
+#if defined(__AVX2__)
+    /* x widened to double ONCE, not once per row: every row multiplies the same x, and
+     * the per-row cvtps_pd was half the instructions of the inner loop. The widening is
+     * exact, so the products and the result are unchanged. */
+    double *xd = (double *)malloc((size_t)in * sizeof(double));
+    if (!xd) k3_fatal_oom("bf16 matmul widened input", (size_t)in * sizeof(double));
+    for (int i = 0; i < in; i++) xd[i] = (double)x[i];
+#endif
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
 #endif
@@ -1598,16 +1606,16 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
                 const __m128i h3 = _mm_loadl_epi64((const __m128i *)(row + i + 12));
                 v0 = _mm256_fmadd_pd(
                     _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h0), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i)), v0);
+                    _mm256_loadu_pd(xd + i), v0);
                 v1 = _mm256_fmadd_pd(
                     _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h1), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 4)), v1);
+                    _mm256_loadu_pd(xd + i + 4), v1);
                 v2 = _mm256_fmadd_pd(
                     _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h2), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 8)), v2);
+                    _mm256_loadu_pd(xd + i + 8), v2);
                 v3 = _mm256_fmadd_pd(
                     _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h3), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 12)), v3);
+                    _mm256_loadu_pd(xd + i + 12), v3);
             }
             /* (v0+v1)+(v2+v3) lanewise, then the same cross-lane pairing as scalar */
             const __m256d vt = _mm256_add_pd(_mm256_add_pd(v0, v1),
@@ -1632,6 +1640,9 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
         for (; i < in; i++) acc = fma((double)k3_bf16f(row[i]), (double)x[i], acc);
         y[o] = (float)acc;
     }
+#if defined(__AVX2__)
+    free(xd);
+#endif
 }
 
 /* Per-row int8 matmul for the draft model: each row is [f32 scale][int8 * in]. The int8
