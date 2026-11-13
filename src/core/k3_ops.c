@@ -30,6 +30,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
@@ -101,6 +104,28 @@ static void k3_fatal_bound(const char *what, long value, long limit)
 /* The released config lists full_attn_layers ONE-BASED, and
  * configuration_kimi_k3.py:152-156 tests (layer_idx + 1) in kda_layers. Getting this
  * off by one silently swaps KDA and MLA layers throughout the stack. */
+/* Per-thread scratch for a loop parallelised over attention heads. Thread 0 borrows the
+ * caller's buffer, so a serial build (or a one-thread run) allocates nothing; every
+ * other thread gets its own. Heads are independent, so this changes no arithmetic: each
+ * head is still computed by exactly one thread in exactly the serial order. */
+static float *k3_head_buf(float *shared, size_t n, const char *what)
+{
+#ifdef _OPENMP
+    if (omp_get_thread_num() != 0) {
+        float *b = (float *)malloc(n * sizeof(float));
+        if (!b) k3_fatal_oom(what, n * sizeof(float));
+        return b;
+    }
+#endif
+    (void)what;
+    return shared;
+}
+
+static void k3_head_buf_free(float *b, const float *shared)
+{
+    if (b != shared) free(b);
+}
+
 int k3_is_mla(const K3Cfg *c, int layer)
 {
     for (int i = 0; i < c->n_full_attn; i++)
@@ -437,9 +462,9 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     float *ql   = ct   + (size_t)kvw;               /* [q_lora]       */
     float *acc  = ql   + (size_t)c->q_lora;         /* [H][vh]        */
     float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate   */
-    float *sc   = gbuf + (size_t)H * vh;            /* [last+1] scores */
+    float *sc_shared = gbuf + (size_t)H * vh;       /* [last+1] scores */
     /* Without a cache the keys/values live in scratch and cover only this call. */
-    float *kvs  = sc   + (size_t)(last + 1);        /* [T][H][kvd]    */
+    float *kvs  = sc_shared + (size_t)(last + 1);   /* [T][H][kvd]    */
     float *rps  = kvs  + (kvc ? 0 : (size_t)T * H * kvd);   /* [T][qr] */
 
     #define K3_KV_AT(p)   (kvc   ? kvc   + (size_t)(p) * H * kvd : kvs + (size_t)(p) * H * kvd)
@@ -466,6 +491,16 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     /* ---- attention, per head, causal ---- */
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
+        /* Heads are independent, so they run in parallel; each thread has its own
+         * score row (see k3_head_buf). The per-head arithmetic is untouched. */
+#ifdef _OPENMP
+#       pragma omp parallel if (H > 1)
+#endif
+        {
+        float *sc = k3_head_buf(sc_shared, (size_t)p + 1, "MLA attention scores");
+#ifdef _OPENMP
+#       pragma omp for schedule(static)
+#endif
         for (int h = 0; h < H; h++) {
             const float *qt = q + ((size_t)t * H + h) * qh;
             float m = -INFINITY;
@@ -490,6 +525,8 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                 const float *vs = K3_KV_AT(s) + (size_t)h * kvd + qn;
                 for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
             }
+        }
+        k3_head_buf_free(sc, sc_shared);
         }
 
         /* ---- output gate then projection. Gate BEFORE o_proj, and no norm on it,
@@ -548,10 +585,10 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     float *ct   = q    + (size_t)T * H * qh;        /* [kvw] transient */
     float *ql   = ct   + (size_t)kvw;               /* [q_lora]        */
     float *qa   = ql   + (size_t)c->q_lora;         /* [H][kl] absorbed queries */
-    float *al   = qa   + (size_t)H * kl;            /* [kl] latent attention sum */
-    float *acc  = al   + (size_t)kl;                /* [H][vh]         */
+    float *al_shared = qa + (size_t)H * kl;         /* [kl] latent attention sum */
+    float *acc  = al_shared + (size_t)kl;           /* [H][vh]         */
     float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate    */
-    float *sc   = gbuf + (size_t)H * vh;            /* [span] scores   */
+    float *sc_shared = gbuf + (size_t)H * vh;       /* [span] scores   */
 
     const size_t kvb_row = k3_row_bytes(w->wdt, kl);
 
@@ -600,6 +637,21 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         const int s0 = k3_kv_first(kv, p);
         int nsink = kv->window ? kv->sinks : 0;
         if (nsink > p + 1) nsink = p + 1;
+        /* positions attended: the sinks plus the rolling span [s0, p], which is empty
+         * while p is still inside the sink region (s0 > p there) */
+        const size_t natt = (size_t)nsink + (size_t)(s0 <= p ? p - s0 + 1 : 0);
+        /* Heads in parallel, each thread with its own score row and latent sum (see
+         * k3_head_buf); the per-head arithmetic is untouched. The W_UV product below
+         * runs inside this region, so its own OpenMP loop does not fork again. */
+#ifdef _OPENMP
+#       pragma omp parallel if (H > 1)
+#endif
+        {
+        float *sc = k3_head_buf(sc_shared, natt, "MLA latent attention scores");
+        float *al = k3_head_buf(al_shared, (size_t)kl, "MLA latent attention sum");
+#ifdef _OPENMP
+#       pragma omp for schedule(static)
+#endif
         for (int h = 0; h < H; h++) {
             const float *qah = qa + (size_t)h * kl;
             const float *qrh = qt + (size_t)h * qh + qn;   /* the unrotated rope slots */
@@ -645,6 +697,9 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
             const unsigned char *wuv =
                 (const unsigned char *)w->kv_b + (size_t)(h * kvd + qn) * kvb_row;
             k3_mmw(acc + (size_t)h * vh, al, wuv, w->wdt, kl, vh);
+        }
+        k3_head_buf_free(al, al_shared);
+        k3_head_buf_free(sc, sc_shared);
         }
 
         /* ---- gate then projection, unchanged: the gate is why W_UV could not be
