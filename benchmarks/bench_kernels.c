@@ -79,6 +79,11 @@ int main(void)
         float *y = (float *)malloc((size_t)out * sizeof(float));
         if (!W || !x || !y) { printf("alloc failed\n"); return 1; }
         fillb((unsigned char *)W, (size_t)in * out * 2, 12345u);
+        /* Random bytes are ~1/128 NaN or Inf as bf16, so every one of the 12288 rows
+         * would contain one and the output hash below would fingerprint nothing but NaN
+         * payloads. Clearing exponent bit 6 (0x4000) keeps every value finite and below
+         * 2, so the hash checks real arithmetic. */
+        for (size_t i = 0; i < (size_t)in * out; i++) W[i] &= 0xBFFFu;
         fillf(x, in, 999u);
 
         k3_matmul_bf16(y, x, W, in, out);              /* warm */
