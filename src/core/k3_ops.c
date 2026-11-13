@@ -1719,7 +1719,7 @@ static void k3_pair_init(void)
  * once per element. At group 32 each group is exactly 16 packed bytes.
  *
  * PRECONDITIONS, none of these are checked, and violating them corrupts memory:
- *   - group <= 64. The expanded group goes into a fixed wf[64] stack buffer.
+ *   - group is even, so every group starts on a byte boundary (group/2 bytes each).
  *   - `in` is even. The packed row stride is in/2 bytes, two elements per byte.
  *   - `packed` is rows x (in/2) bytes; `scales` is rows x ceil(in/group) bytes.
  *   - A scale byte of 255 is NaN by the OCP MX spec and zeroes its whole group.
@@ -1761,43 +1761,46 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
             int n = in - g * group;
             if (n > group) n = group;
 
-            /* Expand the group to floats first, then take a plain dot product. The
-             * split exists so the second loop can vectorise, which it cannot do while
-             * a table lookup sits in the middle of the accumulation. */
-            float wf[64];                         /* group is 32 for K3; 64 is headroom */
-            const int half = n >> 1;
-            for (int j = 0; j < half; j++) {
-                const float *pv = K3_E2M1_PAIR[pb[j]];
-                wf[2 * j]     = pv[0];
-                wf[2 * j + 1] = pv[1];
-            }
-            if (n & 1) wf[n - 1] = K3_E2M1_PAIR[pb[half]][0];
-
-            /* Four double lanes partitioned by i%4, reduced as (s0+s1)+(s2+s3), in BOTH
-             * the scalar and the AVX2 path so the two agree bit for bit on every
-             * machine. The split is written out rather than left to the compiler
-             * because a sequential floating-point reduction may not be reassociated
-             * without -ffast-math, which this build does not set: expressed as one
-             * serial accumulator, the hottest loop in the engine compiles to scalar
-             * adds no matter what the surrounding code looks like.
+            /* Two fused accumulators over the group, element i to accumulator
+             * (i/4)%2 and lane i%4, lanewise-summed then cross-lane paired, as
+             * ((a0+a1)+(a2+a3)). The AVX2 and scalar paths are the identical partition
+             * (_mm256_fmadd_pd per lane is the same IEEE operation as fma()), so they
+             * agree bit for bit on every machine. The split is written out because a
+             * sequential floating-point reduction may not be reassociated without
+             * -ffast-math, which this build does not set; as one serial accumulator
+             * the hottest loop in the engine compiles to scalar adds.
              *
              * The lane split changes the summation order. See the accuracy contract on
              * the function above for why that is bounded at ~1e-16 relative. */
-            /* Two fused vector accumulators over the 32-element group, element i to
-             * accumulator (i/4)%2, lanewise-summed then cross-lane paired; the scalar
-             * path is the identical partition with fma(), which is the same IEEE
-             * operation, so both paths stay bit-identical. Same reasoning as the
-             * fp32/bf16 kernels above; the group is short, so two accumulators
-             * suffice to break the add-latency chain. */
             double sub;
             int i = 0;
 #if defined(__AVX2__)
             {
+                /* Nibbles are decoded in registers, eight at a time: four packed bytes
+                 * hold elements i..i+7 at bit offsets 0,4,...,28 (low nibble = even
+                 * element), so a broadcast and a per-lane shift put element l in lane
+                 * l. The magnitude is the low three bits, looked up by a permute of
+                 * the eight non-negative E2M1 values; bit 3 is the sign and is moved
+                 * to bit 31 and XORed in. That reproduces every K3_E2M1 entry exactly,
+                 * -0.0 included, so the products are the ones the scalar table gives.
+                 * The old form expanded the group through a byte table into a stack
+                 * buffer and reloaded it, which cost more than the arithmetic. */
+                const __m256  mag  = _mm256_loadu_ps(K3_E2M1);       /* entries 0..7 */
+                const __m256i shv  = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
+                const __m256i m4   = _mm256_set1_epi32(0x0F);
+                const __m256i sgn  = _mm256_set1_epi32((int)0x80000000u);
                 __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
                 for (; i + 7 < n; i += 8) {
-                    v0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(wf + i)),
+                    int32_t word;
+                    memcpy(&word, pb + (i >> 1), sizeof word);
+                    const __m256i nib = _mm256_and_si256(
+                        _mm256_srlv_epi32(_mm256_set1_epi32(word), shv), m4);
+                    const __m256 wv = _mm256_xor_ps(
+                        _mm256_permutevar8x32_ps(mag, nib),
+                        _mm256_castsi256_ps(_mm256_and_si256(_mm256_slli_epi32(nib, 28), sgn)));
+                    v0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_castps256_ps128(wv)),
                                          _mm256_cvtps_pd(_mm_loadu_ps(xg + i)), v0);
-                    v1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(wf + i + 4)),
+                    v1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(wv, 1)),
                                          _mm256_cvtps_pd(_mm_loadu_ps(xg + i + 4)), v1);
                 }
                 double a[4];
@@ -1806,16 +1809,29 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
             }
 #else
             {
+                /* Expand eight elements to floats, then a plain dot product: a table
+                 * lookup in the middle of the accumulation would stop it vectorising. */
                 double s[8] = {0};
-                for (; i + 7 < n; i += 8)
+                for (; i + 7 < n; i += 8) {
+                    float wf[8];
+                    for (int j = 0; j < 4; j++) {
+                        const float *pv = K3_E2M1_PAIR[pb[(i >> 1) + j]];
+                        wf[2 * j]     = pv[0];
+                        wf[2 * j + 1] = pv[1];
+                    }
                     for (int l = 0; l < 8; l++)
-                        s[l] = fma((double)wf[i + l], (double)xg[i + l], s[l]);
+                        s[l] = fma((double)wf[l], (double)xg[i + l], s[l]);
+                }
                 double b0 = s[0] + s[4], b1 = s[1] + s[5];
                 double b2 = s[2] + s[6], b3 = s[3] + s[7];
                 sub = (b0 + b1) + (b2 + b3);
             }
 #endif
-            for (; i < n; i++) sub = fma((double)wf[i], (double)xg[i], sub);
+            for (; i < n; i++) {
+                const unsigned char by = pb[i >> 1];
+                sub = fma((double)K3_E2M1[(i & 1) ? (by >> 4) : (by & 0x0F)],
+                          (double)xg[i], sub);
+            }
             acc += sub * (double)K3_E8M0[sb];
         }
     }
