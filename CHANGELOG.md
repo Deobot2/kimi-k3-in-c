@@ -92,6 +92,20 @@ not needing the bytes at all.
 - Saved state records the KV layout and window geometry and refuses a mismatch: the two
   caches hold different tensors of the same float count, so restoring one as the other
   would be fluent and wrong. State version 1 → 2.
+- **Kernel speedups, every one bit-identical.** Each was checked by memcmp or an output
+  hash against the kernel it replaces, not only against fixture tolerances:
+  - MXFP4 expert matmul decodes nibbles in AVX2 registers instead of through a stack
+    table: 3072×3584 goes from 1.83 ms to 0.90 ms (12.0 → 24.5 GFLOP/s, 4 threads).
+  - The AVX2 bf16 matmul widens `x` to double once per call, not once per row:
+    12288×7168 goes from 42.3 ms to 29.0 ms single-threaded.
+  - `k3_matmul_tr` (the `--mla-latent` W_UK absorption) is blocked by 32 columns:
+    2–4× faster on every weight type.
+  - MLA attention runs its head loop in parallel on both cache layouts. At T=2000 with
+    64 heads on 4 threads the expanded path goes from 14.6 s to 4.9 s.
+  - `k3_kda_step` makes two passes over the state instead of four, with no heap
+    allocation per call.
+- `bench_kernels` keeps its bf16 weights finite. Before this, every output was NaN, so the
+  printed hash only fingerprinted NaN payloads.
 
 ### Fixed
 
