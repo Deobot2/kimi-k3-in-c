@@ -355,14 +355,16 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
  *      by exactly one thread in exactly the order below. Results are therefore
  *      identical at any thread count, which the fixtures rely on.
  *
- *   2. FOUR ACCUMULATORS, PARTITIONED BY i%4, REDUCED AS (a0+a1)+(a2+a3). The split
- *      keeps the FMA pipeline full, a single accumulator serialises on the latency
- *      chain, but it is written out explicitly rather than left to the compiler
- *      because it fixes a summation ORDER. k3_matmul_bf16 and both AVX2 paths
- *      reproduce this exact partition and this exact tree, which is what makes the
- *      three implementations agree bit for bit.
+ *   2. SIXTEEN FUSED ACCUMULATORS, ELEMENT i TO a[i%16], REDUCED AS
+ *        b[k] = (a[k] + a[k+4]) + (a[k+8] + a[k+12])     k = 0..3
+ *        acc  = (b[0] + b[1]) + (b[2] + b[3])
+ *      then the in%16 tail fused into acc in order. The split keeps the FMA pipeline
+ *      full, a single accumulator serialises on the latency chain, but it is written
+ *      out explicitly rather than left to the compiler because it fixes a summation
+ *      ORDER. k3_matmul_bf16 reproduces this exact partition and tree in both its
+ *      scalar and AVX2 forms, which is what makes the kernels agree bit for bit.
  *
- * Floating-point addition is not associative, so the four-way split is a real change
+ * Floating-point addition is not associative, so the sixteen-way split is a real change
  * to the arithmetic relative to a sequential sum. Keeping the accumulators in double
  * bounds the difference far below fp32 output precision; making them float would not.
  */
@@ -1579,21 +1581,21 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
  *   exactly the values an fp32 copy would have supplied. The only difference from
  *   k3_matmul is WHERE the widening happens, not what is widened.
  *
- * The accumulator layout mirrors k3_matmul deliberately, four partial sums in double,
- * reduced in the same order, so the two kernels agree to the bit on identical input.
+ * The accumulator layout mirrors k3_matmul deliberately, the same sixteen fused partial
+ * sums in double reduced by the same tree, so the two kernels agree to the bit on
+ * identical input (test_ops asserts it).
  *
- * THE AVX2 PATH IS BIT-IDENTICAL TO THE SCALAR PATH, not merely close. A __m256d holds
- * exactly four doubles, and loading four consecutive elements per iteration places
- * element i in lane i%4: the same partition as the scalar accumulators, with the same
- * sequential order within each lane. Reducing with (a0+a1)+(a2+a3) then reproduces the
- * scalar result exactly. Two details carry that guarantee:
+ * THE AVX2 PATH IS BIT-IDENTICAL TO THE SCALAR PATH, not merely close. Four __m256d
+ * accumulators v0..v3 each take four consecutive elements per 16-element step, so lane
+ * l of v_m holds exactly scalar a[4m + l], summed in the same order. Lanewise
+ * (v0+v1)+(v2+v3) is then b[l], and the cross-lane (b0+b1)+(b2+b3) finishes the same
+ * tree. Two details carry that guarantee:
  *
- *   - MUL THEN ADD, never _mm256_fmadd_pd. The build sets -ffp-contract=off, so the
- *     scalar code rounds the product and the sum separately while an FMA rounds once.
- *     Here the product happens to be exact (a bf16 widens exactly, and float x float
- *     needs 48 mantissa bits, which fits double's 53), so the two would agree anyway
- *     but that is a proof about the inputs. Mul-then-add is a proof about the code.
- *   - The scalar tail loop is reused verbatim for the in % 4 remainder.
+ *   - _mm256_fmadd_pd per lane is the same IEEE operation as scalar fma() in double:
+ *     one rounding of a*b+c. The scalar path calls fma() EXPLICITLY, so
+ *     -ffp-contract=off (which forbids the compiler from fusing on its own) does not
+ *     separate the two. Replace either with mul-then-add and they diverge.
+ *   - The scalar tail loop is reused verbatim for the in % 16 remainder.
  */
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
 {
@@ -1782,22 +1784,20 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
             }
             if (n & 1) wf[n - 1] = K3_E2M1_PAIR[pb[half]][0];
 
-            /* Four double lanes partitioned by i%4, reduced as (s0+s1)+(s2+s3), in BOTH
-             * the scalar and the AVX2 path so the two agree bit for bit on every
-             * machine. The split is written out rather than left to the compiler
-             * because a sequential floating-point reduction may not be reassociated
-             * without -ffast-math, which this build does not set: expressed as one
-             * serial accumulator, the hottest loop in the engine compiles to scalar
-             * adds no matter what the surrounding code looks like.
+            /* Eight fused lanes, element i to s[i%8], in BOTH the scalar and the AVX2
+             * path so the two agree bit for bit on every machine: v0 lane l is s[l] and
+             * v1 lane l is s[4+l], so the lanewise v0+v1 is s[l]+s[l+4] and the
+             * cross-lane (b0+b1)+(b2+b3) is the scalar tree. fma() and _mm256_fmadd_pd
+             * are the same IEEE operation. The group is short, so two vector
+             * accumulators suffice to break the add-latency chain.
              *
-             * The lane split changes the summation order. See the accuracy contract on
-             * the function above for why that is bounded at ~1e-16 relative. */
-            /* Two fused vector accumulators over the 32-element group, element i to
-             * accumulator (i/4)%2, lanewise-summed then cross-lane paired; the scalar
-             * path is the identical partition with fma(), which is the same IEEE
-             * operation, so both paths stay bit-identical. Same reasoning as the
-             * fp32/bf16 kernels above; the group is short, so two accumulators
-             * suffice to break the add-latency chain. */
+             * The split is written out rather than left to the compiler because a
+             * sequential floating-point reduction may not be reassociated without
+             * -ffast-math, which this build does not set: expressed as one serial
+             * accumulator, the hottest loop in the engine compiles to scalar adds no
+             * matter what the surrounding code looks like. It changes the summation
+             * order; see the accuracy contract on the function above for why that is
+             * bounded at ~1e-16 relative. */
             double sub;
             int i = 0;
 #if defined(__AVX2__)
