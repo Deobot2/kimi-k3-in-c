@@ -279,48 +279,71 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 }
 
 /* -------------------------------------------------------- KDA recurrence ---- */
+/* The four logical steps (decay, read, delta write, output) are executed as TWO passes
+ * over S rather than four, because each pair touches every row exactly once in the same
+ * row order and the second step of a pair only needs that row's freshly computed value:
+ *
+ *   pass A, row i:  row *= alpha[i];   u += k[i] * row      (decay, then read)
+ *   pass B, row i:  row += kb * d;     o += q[i] * row      (write, then output)
+ *
+ * Every accumulator still sums over i = 0..dk-1 in index order, and every element sees
+ * the same operations in the same sequence, so the results are bit-identical to the
+ * four-pass form. What changes is memory traffic: S is dk*dv floats per head (64 KB at
+ * the released dimensions), and halving the sweeps over it halves the dominant cost of
+ * a step. Pass B cannot be merged into pass A: the write needs the COMPLETE u, which is
+ * only known once every row has been read.
+ *
+ * kb = k[i]*beta is hoisted, and d = v - u is formed once instead of per row. Both are
+ * exact re-expressions: the original `ki * beta * (v[j] - u[j])` parses as
+ * (ki*beta) * (v[j]-u[j]), and with -ffp-contract=off each product rounds identically. */
+#define K3_KDA_STACK_DV 256
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
-    /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
-     *    channel, not a scalar, which is what "channel-wise forget gate" means. */
+    /* u lives on the stack at every released head width. This runs once per head per
+     * token per KDA layer, inside an OpenMP region, so a calloc here was thousands of
+     * allocator round trips per token contending on the heap lock. The heap remains
+     * only as a fallback for a config wider than the stack buffer. */
+    float ubuf[K3_KDA_STACK_DV];
+    float *u = ubuf;
+    if (dv > K3_KDA_STACK_DV) {
+        /* Must be resolved BEFORE S is touched: failing after the decay would leave the
+         * state permanently scaled but never updated. */
+        u = (float *)malloc((size_t)dv * sizeof(float));
+        if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    }
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
+
+    /* pass A: 1. channel-wise decay of ROW i by alpha[i] (per key channel, not a
+     * scalar), then 2. read u = S^T k from the decayed row. */
     for (int i = 0; i < dk; i++) {
         float *row = S + (size_t)i * dv;
         const float a = alpha[i];
         for (int j = 0; j < dv; j++) row[j] *= a;
-    }
-
-    /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
-     * would leave the recurrent state permanently scaled but never updated -- silent,
-     * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
-    for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) u[j] += ki * row[j];
     }
 
-    /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
-     *    it a DELTA rule rather than plain accumulation. */
-    for (int i = 0; i < dk; i++) {
-        const float ki = k[i];
-        if (ki == 0.0f) continue;
-        float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
-    }
+    /* (v - u) is the prediction error: this is what makes it a DELTA rule rather than
+     * plain accumulation. u is dead after this, so it holds d in place. */
+    for (int j = 0; j < dv; j++) u[j] = v[j] - u[j];
 
-    /* 4. output from the ALREADY UPDATED state: o = S^T q */
+    /* pass B: 3. rank-one delta write, then 4. output o = S^T q from the ALREADY
+     * UPDATED row. */
     for (int j = 0; j < dv; j++) o[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
+        float *row = S + (size_t)i * dv;
+        const float ki = k[i];
+        if (ki != 0.0f) {
+            const float kb = ki * beta;
+            for (int j = 0; j < dv; j++) row[j] += kb * u[j];
+        }
         const float qi = q[i];
         if (qi == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
+    if (u != ubuf) free(u);
 }
 
 /* ---------------------------------------------------------------- matmul ---- */
