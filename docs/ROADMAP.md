@@ -57,17 +57,28 @@ Two background threads now exist as well — the trunk reader and the expert-cac
 speculator — so the sweep should cover their interaction with the OpenMP pool rather
 than assuming the pool has the machine to itself.
 
-## 4. SIMD in the KDA recurrence
+## 4. SIMD in the KDA recurrence: largely done by the compiler, verify per toolchain
 
-The bf16 trunk matmul and the MXFP4 expert matmul already have hand-written AVX2 paths
-(`src/core/k3_ops.c`), each written to reproduce the scalar reduction order exactly. The
-KDA recurrence does not: it is still plain scalar C, and it is the largest remaining
-un-vectorised kernel on the non-I/O path.
+The bf16 trunk matmul and the MXFP4 expert matmul have hand-written AVX2 paths
+(`src/core/k3_ops.c`), each written to reproduce the scalar reduction order exactly,
+because their inner loops are REDUCTIONS and the compiler may not reorder those without
+`-ffast-math`.
 
-`k3_matmul_tr`, added for the latent KV cache's query absorption, is the second: it is a
-strided column sweep with a double accumulator per output and no vector path at all. It
-runs 96 times per MLA layer per token, so it is small next to the recurrence but it is
-new and it is scalar.
+The KDA recurrence is different in kind. Every inner loop of `k3_kda_step` is
+element-wise across `j` (`row[j] *= a`, `u[j] += k*row[j]`, `row[j] += kb*d[j]`,
+`o[j] += q*row[j]`), so vectorising it requires no reassociation and is bit-identical by
+construction. GCC (`-fopt-info-vec`) and clang (`-Rpass=loop-vectorize`) both report all
+four loops vectorised at `-O3`. The step now makes two passes over S per token instead
+of four and no longer allocates; what remains is bound by S traffic (64 KB per head),
+not by missing SIMD.
+
+`k3_matmul_tr` now sweeps columns in blocks of 16 with one accumulator per column, which
+turns its inner loop element-wise too: the bf16, int8 and fp32 blocks are reported
+vectorised by both compilers, and the MXFP4 block by GCC.
+
+What is left: hand intrinsics are only worth writing if a supported compiler stops
+vectorising these loops, so the useful work is a CI check on the vectorisation report,
+not more code.
 
 ## 5. Sampling
 
