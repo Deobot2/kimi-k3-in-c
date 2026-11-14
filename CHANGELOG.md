@@ -71,6 +71,20 @@ not needing the bytes at all.
 
 ### Changed
 
+- **CPU kernels, all bit-identical** (each verified with `memcmp` against the previous
+  implementation, not against a tolerance). The CPU side is off the critical path while
+  the engine is I/O bound, so these matter most on a resident trunk and at long context.
+  Single-machine timings, 4 threads, three runs each in the commit messages:
+  - `k3_router`: eight experts per loop, each still one in-order accumulator, about 2.2×
+    (896×7168: ~1.4 ms → 0.65 ms, × 92 layers per token).
+  - MLA attention (`k3_mla_cached`, `k3_mla_latent`): heads in parallel with private
+    score rows. This is the part of decode that grows with context, and it was serial.
+  - `k3_matmul_tr`: columns in blocks of 16 so every cache line is used once, and the
+    E8M0 table instead of `ldexpf` per element: 2–4× on bf16/fp32/int8, roughly 6× on MXFP4 across both changes.
+  - `k3_shortconv`: channels in parallel, about 2–3× at decode and 3–4× at prefill.
+  - `k3_kda_step`: two passes over the state instead of four, and no heap allocation
+    per head per token, about 15% single-threaded.
+
 - **Expert cache replacement is S3-FIFO, not LRU.** The project's own simulator put 25.5
   points between LRU and Belady at 64 GB, and its own conclusion was that the lever is the
   policy rather than the size. Small FIFO, main FIFO, ghost queue; uniform object size
