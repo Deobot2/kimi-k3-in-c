@@ -230,34 +230,45 @@ void k3_shortconv(float *y, const float *x, const float *w, float *state,
                   int channels, int k, int T)
 {
     const int hist = k - 1;
-    /* hist can be 0 when k == 1, and malloc(0) is permitted to return NULL. Guard on
+    /* One history row per channel, so channels can run in parallel: each reads and
+     * writes only its own x/y column, its own taps and its own buf slice, and walks t in
+     * order, so per-channel arithmetic is unchanged and the result is bit-identical at
+     * any thread count. Serial, this was three passes over H*D = 12288 channels per KDA
+     * layer on one core.
+     *
+     * hist can be 0 when k == 1, and malloc(0) is permitted to return NULL. Guard on
      * hist rather than on buf, or a legitimate k == 1 configuration silently skips the
      * whole convolution and leaves y untouched. */
-    float *buf = hist ? (float *)malloc((size_t)hist * sizeof(float)) : NULL;
-    if (hist && !buf) k3_fatal_oom("ShortConv history", (size_t)hist * sizeof(float));
+    const size_t hb = (size_t)channels * hist;
+    float *bufs = hist ? (float *)malloc(hb * sizeof(float)) : NULL;
+    if (hist && !bufs) k3_fatal_oom("ShortConv history", hb * sizeof(float));
+    if (hist) {   /* memcpy/memset with a NULL pointer is UB even at length 0 */
+        if (state) memcpy(bufs, state, hb * sizeof(float));
+        else       memset(bufs, 0, hb * sizeof(float));
+    }
 
+#ifdef _OPENMP
+#   pragma omp parallel for schedule(static) if ((size_t)channels * T * k >= 32768)
+#endif
     for (int c = 0; c < channels; c++) {
-        if (hist) {   /* memcpy/memset with a NULL pointer is UB even at length 0 */
-            if (state) memcpy(buf, state + (size_t)c * hist, (size_t)hist * sizeof(float));
-            else       memset(buf, 0, (size_t)hist * sizeof(float));
-        }
-
+        float *buf = hist ? bufs + (size_t)c * hist : NULL;
+        const float *wc = w + (size_t)c * k;
         for (int t = 0; t < T; t++) {
             const float cur = x[(size_t)t * channels + c];
             /* taps are ordered oldest..newest, matching conv1d over a left-padded
              * sequence: w[k-1] multiplies the CURRENT input. */
-            float acc = w[(size_t)c * k + hist] * cur;
+            float acc = wc[hist] * cur;
             for (int j = 0; j < hist; j++)
-                acc += w[(size_t)c * k + j] * buf[j];
+                acc += wc[j] * buf[j];
 
             for (int j = 0; j + 1 < hist; j++) buf[j] = buf[j + 1];
             if (hist > 0) buf[hist - 1] = cur;
 
             y[(size_t)t * channels + c] = acc * sigmoidf_(acc);   /* SiLU, fused */
         }
-        if (state && hist) memcpy(state + (size_t)c * hist, buf, (size_t)hist * sizeof(float));
     }
-    free(buf);
+    if (state && hist) memcpy(state, bufs, hb * sizeof(float));
+    free(bufs);
 }
 
 /* ------------------------------------------------------------ KDA decay ----- */
