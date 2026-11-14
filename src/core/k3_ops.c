@@ -30,9 +30,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
@@ -498,16 +495,21 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
      * layer per token on one core, the part of decode that grows with context. */
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
+        /* `par` is a constant 0 without OpenMP, so the serial build keeps using the
+         * scratch row and never allocates. omp.h is not needed for any of this. */
 #ifdef _OPENMP
-#       pragma omp parallel if (H > 1 && (size_t)(p + 1) * H * (qh + vh) >= 65536)
+        const int par = H > 1 && (size_t)(p + 1) * H * (qh + vh) >= 65536;
+#       pragma omp parallel if (par)
+#else
+        const int par = 0;
 #endif
         {
             float *sct = sc;
-#ifdef _OPENMP
-            if (omp_get_num_threads() > 1) {
+            if (par) {
                 sct = (float *)malloc((size_t)(p + 1) * sizeof(float));
                 if (!sct) k3_fatal_oom("MLA per-thread scores", (size_t)(p + 1) * sizeof(float));
             }
+#ifdef _OPENMP
 #           pragma omp for schedule(static)
 #endif
             for (int h = 0; h < H; h++) {
@@ -652,17 +654,20 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
          * which changes no arithmetic: its rows are independent too. */
         const int need = nsink + (p - s0 + 1);
 #ifdef _OPENMP
-#       pragma omp parallel if (H > 1 && (size_t)need * H * (kl + qr) >= 65536)
+        const int par = H > 1 && (size_t)need * H * (kl + qr) >= 65536;
+#       pragma omp parallel if (par)
+#else
+        const int par = 0;
 #endif
         {
             float *sct = sc, *alt = al;
-#ifdef _OPENMP
-            if (omp_get_num_threads() > 1) {
+            if (par) {
                 const size_t nb = ((size_t)need + (size_t)kl) * sizeof(float);
                 sct = (float *)malloc(nb);
                 if (!sct) k3_fatal_oom("MLA latent per-thread rows", nb);
                 alt = sct + need;
             }
+#ifdef _OPENMP
 #           pragma omp for schedule(static)
 #endif
             for (int h = 0; h < H; h++) {
