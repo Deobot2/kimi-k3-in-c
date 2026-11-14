@@ -30,6 +30,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
@@ -486,33 +489,53 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         k3_mmw(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, H * kvd);
     }
 
-    /* ---- attention, per head, causal ---- */
+    /* ---- attention, per head, causal ----
+     * Heads are independent: each reads the shared keys/values and its own query, and
+     * writes only its own vh-wide slice of acc. They run in parallel, each thread with a
+     * PRIVATE score row (the shared `sc` in scratch cannot be split between threads),
+     * and every head's arithmetic is the same sequence as the serial loop, so the
+     * output is bit-identical at any thread count. Serial, this was ~30K*p MACs per
+     * layer per token on one core, the part of decode that grows with context. */
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
-        for (int h = 0; h < H; h++) {
-            const float *qt = q + ((size_t)t * H + h) * qh;
-            float m = -INFINITY;
-            for (int s = 0; s <= p; s++) {                 /* causal: s <= p */
-                const float *ks = K3_KV_AT(s) + (size_t)h * kvd;
-                const float *kr = K3_ROPE_AT(s);           /* shared slot */
-                double d = 0.0;
-                for (int i = 0; i < qn; i++) d += (double)qt[i] * (double)ks[i];
-                /* the rope slot is UNROTATED but still scored, and the SAME 64
-                 * values serve every head. Dropping this term is the silent bug. */
-                for (int i = 0; i < qr; i++) d += (double)qt[qn + i] * (double)kr[i];
-                sc[s] = (float)d * scale;
-                if (sc[s] > m) m = sc[s];
+#ifdef _OPENMP
+#       pragma omp parallel if (H > 1 && (size_t)(p + 1) * H * (qh + vh) >= 65536)
+#endif
+        {
+            float *sct = sc;
+#ifdef _OPENMP
+            if (omp_get_num_threads() > 1) {
+                sct = (float *)malloc((size_t)(p + 1) * sizeof(float));
+                if (!sct) k3_fatal_oom("MLA per-thread scores", (size_t)(p + 1) * sizeof(float));
             }
-            double z = 0.0;
-            for (int s = 0; s <= p; s++) { sc[s] = expf(sc[s] - m); z += sc[s]; }
+#           pragma omp for schedule(static)
+#endif
+            for (int h = 0; h < H; h++) {
+                const float *qt = q + ((size_t)t * H + h) * qh;
+                float m = -INFINITY;
+                for (int s = 0; s <= p; s++) {                 /* causal: s <= p */
+                    const float *ks = K3_KV_AT(s) + (size_t)h * kvd;
+                    const float *kr = K3_ROPE_AT(s);           /* shared slot */
+                    double d = 0.0;
+                    for (int i = 0; i < qn; i++) d += (double)qt[i] * (double)ks[i];
+                    /* the rope slot is UNROTATED but still scored, and the SAME 64
+                     * values serve every head. Dropping this term is the silent bug. */
+                    for (int i = 0; i < qr; i++) d += (double)qt[qn + i] * (double)kr[i];
+                    sct[s] = (float)d * scale;
+                    if (sct[s] > m) m = sct[s];
+                }
+                double z = 0.0;
+                for (int s = 0; s <= p; s++) { sct[s] = expf(sct[s] - m); z += sct[s]; }
 
-            float *o = acc + (size_t)h * vh;
-            for (int j = 0; j < vh; j++) o[j] = 0.0f;
-            for (int s = 0; s <= p; s++) {
-                const float pr = (float)(sc[s] / z);
-                const float *vs = K3_KV_AT(s) + (size_t)h * kvd + qn;
-                for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
+                float *o = acc + (size_t)h * vh;
+                for (int j = 0; j < vh; j++) o[j] = 0.0f;
+                for (int s = 0; s <= p; s++) {
+                    const float pr = (float)(sct[s] / z);
+                    const float *vs = K3_KV_AT(s) + (size_t)h * kvd + qn;
+                    for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
+                }
             }
+            if (sct != sc) free(sct);
         }
 
         /* ---- output gate then projection. Gate BEFORE o_proj, and no norm on it,
@@ -623,51 +646,73 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         const int s0 = k3_kv_first(kv, p);
         int nsink = kv->window ? kv->sinks : 0;
         if (nsink > p + 1) nsink = p + 1;
-        for (int h = 0; h < H; h++) {
-            const float *qah = qa + (size_t)h * kl;
-            const float *qrh = qt + (size_t)h * qh + qn;   /* the unrotated rope slots */
-            float m = -INFINITY;
-            int n = 0;
-            /* sinks first, then the rolling span: ascending in absolute position, so
-             * the reduction order matches the contiguous case wherever they coincide */
-            for (int pass = 0; pass < 2; pass++) {
-                const int a = pass ? s0 : 0;
-                const int b = pass ? p : nsink - 1;
-                for (int s = a; s <= b; s++) {
-                    const int slot = k3_kv_slot(kv, s);
-                    const float *cs = kv->lat + (size_t)slot * kvw;
-                    double d = 0.0;
-                    for (int i = 0; i < kl; i++) d += (double)qah[i] * (double)cs[i];
-                    /* the rope slot is UNROTATED but still scored, and the SAME 64
-                     * values serve every head -- here they are simply the tail of the
-                     * cached latent rather than a separate array */
-                    for (int i = 0; i < qr; i++) d += (double)qrh[i] * (double)cs[kl + i];
-                    sc[n] = (float)d * scale;
-                    if (sc[n] > m) m = sc[n];
-                    n++;
-                }
+        /* Heads in parallel, each thread with PRIVATE score and latent-sum rows; see
+         * the same loop in k3_mla_cached for why this is bit-identical. The k3_mmw
+         * inside then runs serially on its thread (nested regions are not enabled),
+         * which changes no arithmetic: its rows are independent too. */
+        const int need = nsink + (p - s0 + 1);
+#ifdef _OPENMP
+#       pragma omp parallel if (H > 1 && (size_t)need * H * (kl + qr) >= 65536)
+#endif
+        {
+            float *sct = sc, *alt = al;
+#ifdef _OPENMP
+            if (omp_get_num_threads() > 1) {
+                const size_t nb = ((size_t)need + (size_t)kl) * sizeof(float);
+                sct = (float *)malloc(nb);
+                if (!sct) k3_fatal_oom("MLA latent per-thread rows", nb);
+                alt = sct + need;
             }
-            double z = 0.0;
-            for (int i = 0; i < n; i++) { sc[i] = expf(sc[i] - m); z += sc[i]; }
+#           pragma omp for schedule(static)
+#endif
+            for (int h = 0; h < H; h++) {
+                const float *qah = qa + (size_t)h * kl;
+                const float *qrh = qt + (size_t)h * qh + qn;   /* the unrotated rope slots */
+                float m = -INFINITY;
+                int n = 0;
+                /* sinks first, then the rolling span: ascending in absolute position, so
+                 * the reduction order matches the contiguous case wherever they coincide */
+                for (int pass = 0; pass < 2; pass++) {
+                    const int a = pass ? s0 : 0;
+                    const int b = pass ? p : nsink - 1;
+                    for (int s = a; s <= b; s++) {
+                        const int slot = k3_kv_slot(kv, s);
+                        const float *cs = kv->lat + (size_t)slot * kvw;
+                        double d = 0.0;
+                        for (int i = 0; i < kl; i++) d += (double)qah[i] * (double)cs[i];
+                        /* the rope slot is UNROTATED but still scored, and the SAME 64
+                         * values serve every head -- here they are simply the tail of the
+                         * cached latent rather than a separate array */
+                        for (int i = 0; i < qr; i++) d += (double)qrh[i] * (double)cs[kl + i];
+                        sct[n] = (float)d * scale;
+                        if (sct[n] > m) m = sct[n];
+                        n++;
+                    }
+                }
+                double z = 0.0;
+                for (int i = 0; i < n; i++) { sct[i] = expf(sct[i] - m); z += sct[i]; }
 
-            /* weighted sum IN LATENT SPACE, then one W_UV per head. This is the second
-             * half of the absorption: the 512-wide sum happens once, the 24576x512
-             * expansion never happens at all. */
-            for (int i = 0; i < kl; i++) al[i] = 0.0f;
-            n = 0;
-            for (int pass = 0; pass < 2; pass++) {
-                const int a = pass ? s0 : 0;
-                const int b = pass ? p : nsink - 1;
-                for (int s = a; s <= b; s++) {
-                    const int slot = k3_kv_slot(kv, s);
-                    const float pr = (float)(sc[n++] / z);
-                    const float *cs = kv->lat + (size_t)slot * kvw;
-                    for (int i = 0; i < kl; i++) al[i] += pr * cs[i];
+                /* weighted sum IN LATENT SPACE, then one W_UV per head. This is the second
+                 * half of the absorption: the 512-wide sum happens once, the 24576x512
+                 * expansion never happens at all. */
+                for (int i = 0; i < kl; i++) alt[i] = 0.0f;
+                n = 0;
+                for (int pass = 0; pass < 2; pass++) {
+                    const int a = pass ? s0 : 0;
+                    const int b = pass ? p : nsink - 1;
+                    for (int s = a; s <= b; s++) {
+                        const int slot = k3_kv_slot(kv, s);
+                        const float pr = (float)(sct[n++] / z);
+                        const float *cs = kv->lat + (size_t)slot * kvw;
+                        for (int i = 0; i < kl; i++) alt[i] += pr * cs[i];
+                    }
                 }
+                const unsigned char *wuv =
+                    (const unsigned char *)w->kv_b + (size_t)(h * kvd + qn) * kvb_row;
+                k3_mmw(acc + (size_t)h * vh, alt, wuv, w->wdt, kl, vh);
             }
-            const unsigned char *wuv =
-                (const unsigned char *)w->kv_b + (size_t)(h * kvd + qn) * kvb_row;
-            k3_mmw(acc + (size_t)h * vh, al, wuv, w->wdt, kl, vh);
+
+            if (sct != sc) free(sct);
         }
 
         /* ---- gate then projection, unchanged: the gate is why W_UV could not be
