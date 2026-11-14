@@ -707,6 +707,33 @@ size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span)
          + (size_t)(span > T ? span : T);              /* scores              */
 }
 
+/* A whole BYTE to its two E2M1 values, so the inner loop does one 8-byte load instead
+ * of masking, shifting and two separate lookups. 2 KB, built once, shared by all
+ * threads after initialisation. */
+static float K3_E2M1_PAIR[256][2];
+static int   k3_pair_ready = 0;
+
+static void k3_pair_init(void)
+{
+    for (int b = 0; b < 256; b++) {
+        K3_E2M1_PAIR[b][0] = K3_E2M1[b & 0x0F];   /* low nibble  = EVEN element */
+        K3_E2M1_PAIR[b][1] = K3_E2M1[b >> 4];     /* high nibble = ODD element  */
+    }
+    k3_pair_ready = 1;
+}
+
+/* E8M0 byte to its power of two. 255 is NaN by spec and maps to zero. Precomputed
+ * because ldexpf in the group loop is a function call the compiler will not inline
+ * into a vectorised body. */
+static float K3_E8M0[256];
+static int   k3_e8m0_ready = 0;
+
+static void k3_e8m0_init(void)
+{
+    for (int b = 0; b < 256; b++) K3_E8M0[b] = (b == 255) ? 0.0f : ldexpf(1.0f, b - 127);
+    k3_e8m0_ready = 1;
+}
+
 /* The transposed product, W row-major and never moved.
  *
  * Column-outer rather than row-outer: each output element gets its own double
@@ -743,6 +770,10 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
         const size_t stride = k3_row_bytes(K3_WMX4, in);
         const size_t pn = (size_t)in / 2u;
         const unsigned char *base = (const unsigned char *)W;
+        /* The table, not ldexpf: this sits in the innermost loop, rows*in times per
+         * call, and ldexpf is an out-of-line libm call. The values are identical
+         * (ldexpf is exact for these powers of two, subnormal 2^-127 included). */
+        if (!k3_e8m0_ready) k3_e8m0_init();
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (in > 64)
 #endif
@@ -756,7 +787,7 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
                 const unsigned char sb = row[pn + grp];
                 if (sb == 255) continue;              /* NaN scale: contributes nothing */
                 const unsigned char nib = odd ? (row[byte] >> 4) : (row[byte] & 0x0F);
-                acc += (double)x[r] * (double)K3_E2M1[nib] * (double)ldexpf(1.0f, (int)sb - 127);
+                acc += (double)x[r] * (double)K3_E2M1[nib] * (double)K3_E8M0[sb];
             }
             y[j] = (float)acc;
         }
@@ -1632,33 +1663,6 @@ void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
         for (; i < in; i++) acc += (float)w[i] * x[i];
         y[o] = acc * scale;
     }
-}
-
-/* A whole BYTE to its two E2M1 values, so the inner loop does one 8-byte load instead
- * of masking, shifting and two separate lookups. 2 KB, built once, shared by all
- * threads after initialisation. */
-static float K3_E2M1_PAIR[256][2];
-static int   k3_pair_ready = 0;
-
-static void k3_pair_init(void)
-{
-    for (int b = 0; b < 256; b++) {
-        K3_E2M1_PAIR[b][0] = K3_E2M1[b & 0x0F];   /* low nibble  = EVEN element */
-        K3_E2M1_PAIR[b][1] = K3_E2M1[b >> 4];     /* high nibble = ODD element  */
-    }
-    k3_pair_ready = 1;
-}
-
-/* E8M0 byte to its power of two. 255 is NaN by spec and maps to zero. Precomputed
- * because ldexpf in the group loop is a function call the compiler will not inline
- * into a vectorised body. */
-static float K3_E8M0[256];
-static int   k3_e8m0_ready = 0;
-
-static void k3_e8m0_init(void)
-{
-    for (int b = 0; b < 256; b++) K3_E8M0[b] = (b == 255) ? 0.0f : ldexpf(1.0f, b - 127);
-    k3_e8m0_ready = 1;
 }
 
 /* y[rows] = W[rows][in] . x[in], with W read straight out of packed MXFP4 and never
