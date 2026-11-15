@@ -1933,7 +1933,7 @@ void k3_mmw_n(float *y, const float *x, const void *W, int wdt, int in, int out,
  * matrix read once per token block instead of once per token. Gate and up land side
  * by side in one [gate | up] row per token, which is the layout k3_situ_glu reads.
  * Tokens go through in chunks so the buffers stay bounded at any prompt length:
- * 64 x 3 x I floats, 14 MB at the dense layer's width. */
+ * 64 x 3 x I floats, 26 MB at the dense layer's width of 33792. */
 static void glu_mlp_n(float *y, const float *x, const void *Wg, const void *Wu,
                       const void *Wd, int wdt, int E, int I, int T, const K3Cfg *c)
 {
