@@ -547,10 +547,14 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     float *ct   = q    + (size_t)T * H * qh;        /* [kvw] transient */
     float *ql   = ct   + (size_t)kvw;               /* [q_lora]        */
     float *qa   = ql   + (size_t)c->q_lora;         /* [H][kl] absorbed queries */
-    float *al   = qa   + (size_t)H * kl;            /* [kl] latent attention sum */
-    float *acc  = al   + (size_t)kl;                /* [H][vh]         */
+    float *al0  = qa   + (size_t)H * kl;            /* [H][kl] latent attention sums */
+    float *acc  = al0  + (size_t)H * kl;            /* [H][vh]         */
     float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate    */
-    float *sc   = gbuf + (size_t)H * vh;            /* [span] scores   */
+    float *sc0  = gbuf + (size_t)H * vh;            /* [H][span] scores */
+    /* Scores and latent sums are per head so the heads can run in parallel. The span
+     * of one head's scores is everything the cache can hold for this call. */
+    const int span = kv->window ? (kv->window > last + 1 ? last + 1 : kv->window)
+                                : last + 1;
 
     const size_t kvb_row = k3_row_bytes(w->wdt, kl);
 
@@ -599,7 +603,14 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         const int s0 = k3_kv_first(kv, p);
         int nsink = kv->window ? kv->sinks : 0;
         if (nsink > p + 1) nsink = p + 1;
+        /* Heads are independent and each owns its slice of sc0/al0/acc, so they run in
+         * parallel without any change to the arithmetic within a head. */
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static)
+#endif
         for (int h = 0; h < H; h++) {
+            float *sc = sc0 + (size_t)h * span;
+            float *al = al0 + (size_t)h * kl;
             const float *qah = qa + (size_t)h * kl;
             const float *qrh = qt + (size_t)h * qh + qn;   /* the unrotated rope slots */
             float m = -INFINITY;
@@ -691,9 +702,9 @@ size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span)
          + (size_t)(c->kv_lora + c->qk_rope)           /* ct transient        */
          + (size_t)c->q_lora
          + (size_t)H * c->kv_lora                      /* absorbed queries    */
-         + (size_t)c->kv_lora                          /* latent attn sum     */
+         + (size_t)H * c->kv_lora                      /* latent attn sums    */
          + (size_t)2 * H * vh                          /* acc, gbuf           */
-         + (size_t)(span > T ? span : T);              /* scores              */
+         + (size_t)H * (span > T ? span : T);          /* scores, per head    */
 }
 
 /* The transposed product, W row-major and never moved.

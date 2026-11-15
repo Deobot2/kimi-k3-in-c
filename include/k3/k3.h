@@ -354,6 +354,9 @@ int    k3_kv_slot(const K3KvCache *kv, int p);
 /* Lowest absolute position still resident in the rolling region at position p. */
 int    k3_kv_first(const K3KvCache *kv, int p);
 
+/* Scratch for k3_mla_latent, in floats. span bounds the positions one head attends to
+ * (cache capacity, or the window). Scores and latent sums are per head, so this is
+ * O(n_heads * span): about 50 MB at 131k context, against 7.25 GB of latent cache. */
 size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span);
 void   k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                      int T, float *scratch, const K3KvCache *kv);
