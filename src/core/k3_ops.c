@@ -1621,6 +1621,53 @@ static double rowdot_bf16(const uint16_t *row, const float *x, int in)
     }
 }
 
+#if defined(__AVX2__)
+/* rowdot_bf16 for two activations at once, sharing the bf16 -> double widening of the
+ * row between them. Each activation keeps its own four accumulators, partitioned and
+ * reduced exactly as in rowdot_bf16, so *ra and *rb are bitwise what two separate
+ * rowdot_bf16 calls return. Used by the multi-token path, where widening the weights
+ * rather than streaming them is the cost once they sit in cache. */
+static void rowdot_bf16_x2(const uint16_t *row, const float *xa, const float *xb,
+                           int in, double *ra, double *rb)
+{
+    __m256d a0 = _mm256_setzero_pd(), a1 = _mm256_setzero_pd();
+    __m256d a2 = _mm256_setzero_pd(), a3 = _mm256_setzero_pd();
+    __m256d b0 = _mm256_setzero_pd(), b1 = _mm256_setzero_pd();
+    __m256d b2 = _mm256_setzero_pd(), b3 = _mm256_setzero_pd();
+    int i = 0;
+#define K3_W4(off) _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32( \
+        _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(row + i + (off)))), 16)))
+#define K3_X4(p, off) _mm256_cvtps_pd(_mm_loadu_ps((p) + i + (off)))
+    for (; i + 15 < in; i += 16) {
+        __m256d w = K3_W4(0);
+        a0 = _mm256_fmadd_pd(w, K3_X4(xa, 0), a0);
+        b0 = _mm256_fmadd_pd(w, K3_X4(xb, 0), b0);
+        w = K3_W4(4);
+        a1 = _mm256_fmadd_pd(w, K3_X4(xa, 4), a1);
+        b1 = _mm256_fmadd_pd(w, K3_X4(xb, 4), b1);
+        w = K3_W4(8);
+        a2 = _mm256_fmadd_pd(w, K3_X4(xa, 8), a2);
+        b2 = _mm256_fmadd_pd(w, K3_X4(xb, 8), b2);
+        w = K3_W4(12);
+        a3 = _mm256_fmadd_pd(w, K3_X4(xa, 12), a3);
+        b3 = _mm256_fmadd_pd(w, K3_X4(xb, 12), b3);
+    }
+#undef K3_W4
+#undef K3_X4
+    double t[4];
+    _mm256_storeu_pd(t, _mm256_add_pd(_mm256_add_pd(a0, a1), _mm256_add_pd(a2, a3)));
+    double sa = (t[0] + t[1]) + (t[2] + t[3]);
+    _mm256_storeu_pd(t, _mm256_add_pd(_mm256_add_pd(b0, b1), _mm256_add_pd(b2, b3)));
+    double sb = (t[0] + t[1]) + (t[2] + t[3]);
+    for (; i < in; i++) {
+        const double wv = (double)k3_bf16f(row[i]);
+        sa = fma(wv, (double)xa[i], sa);
+        sb = fma(wv, (double)xb[i], sb);
+    }
+    *ra = sa; *rb = sb;
+}
+#endif
+
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
 {
 #ifdef _OPENMP
@@ -1909,7 +1956,18 @@ static void mmw_n_ld(float *y, size_t ldy, const float *x, size_t ldx, const voi
 #endif
         for (int o = 0; o < out; o++) {
             const unsigned char *row = base + (size_t)o * rb;
-            for (int tt = 0; tt < nt; tt++) {
+            int tt = 0;
+#if defined(__AVX2__)
+            if (wdt == K3_WBF16)
+                for (; tt + 1 < nt; tt += 2) {
+                    double ra, rbv;
+                    rowdot_bf16_x2((const uint16_t *)row, xb + (size_t)tt * ldx,
+                                   xb + (size_t)(tt + 1) * ldx, in, &ra, &rbv);
+                    yb[(size_t)tt * ldy + o]       = (float)ra;
+                    yb[(size_t)(tt + 1) * ldy + o] = (float)rbv;
+                }
+#endif
+            for (; tt < nt; tt++) {
                 const float *xt = xb + (size_t)tt * ldx;
                 float r;
                 if (wdt == K3_WBF16)     r = (float)rowdot_bf16((const uint16_t *)row, xt, in);
