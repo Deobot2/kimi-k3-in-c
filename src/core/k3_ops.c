@@ -1668,8 +1668,50 @@ static void rowdot_bf16_x2(const uint16_t *row, const float *xa, const float *xb
 }
 #endif
 
+#if defined(__AVX2__)
+/* rowdot_bf16 against an activation already widened to double. float -> double is
+ * exact, so this is the same arithmetic with the same partition and reduction; it only
+ * stops redoing the activation's conversion for every one of `out` rows. */
+static double rowdot_bf16_xd(const uint16_t *row, const double *xd, const float *x, int in)
+{
+    __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
+    __m256d v2 = _mm256_setzero_pd(), v3 = _mm256_setzero_pd();
+    int i = 0;
+#define K3_W4(off) _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32( \
+        _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(row + i + (off)))), 16)))
+    for (; i + 15 < in; i += 16) {
+        v0 = _mm256_fmadd_pd(K3_W4(0),  _mm256_loadu_pd(xd + i),      v0);
+        v1 = _mm256_fmadd_pd(K3_W4(4),  _mm256_loadu_pd(xd + i + 4),  v1);
+        v2 = _mm256_fmadd_pd(K3_W4(8),  _mm256_loadu_pd(xd + i + 8),  v2);
+        v3 = _mm256_fmadd_pd(K3_W4(12), _mm256_loadu_pd(xd + i + 12), v3);
+    }
+#undef K3_W4
+    double a[4];
+    _mm256_storeu_pd(a, _mm256_add_pd(_mm256_add_pd(v0, v1), _mm256_add_pd(v2, v3)));
+    double acc = (a[0] + a[1]) + (a[2] + a[3]);
+    for (; i < in; i++) acc = fma((double)k3_bf16f(row[i]), (double)x[i], acc);
+    return acc;
+}
+#endif
+
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
 {
+#if defined(__AVX2__)
+    /* Widen x once for the whole matrix rather than once per row. Below the OpenMP
+     * gate the matrix is too small for the allocation to pay. */
+    if (out > 64) {
+        double *xd = (double *)malloc((size_t)in * sizeof(double));
+        if (!xd) k3_fatal_oom("bf16 matmul activation", (size_t)in * sizeof(double));
+        for (int i = 0; i < in; i++) xd[i] = (double)x[i];
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int o = 0; o < out; o++)
+            y[o] = (float)rowdot_bf16_xd(W + (size_t)o * in, xd, x, in);
+        free(xd);
+        return;
+    }
+#endif
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
 #endif
