@@ -857,15 +857,38 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
      * ORDER INSIDE an expert is untouched: thread t still sums i = 0..hidden-1 in
      * sequence into its own double. Splitting the outer loop therefore cannot change a
      * single bit, which is why this needs no tolerance and no re-gating. */
+    /* Eight experts per iteration. Each expert's sum is still ONE serial chain over
+     * i = 0..hidden-1, with the same separately rounded multiply and add as before, so
+     * every score is bitwise unchanged. Interleaving eight independent chains only lets
+     * the core overlap them: one chain is bound by the add latency, about four cycles
+     * per element, and that is what made this loop cost more than its arithmetic. */
+    enum { RB = 8 };
+    const int nblk = (n_experts + RB - 1) / RB;
 #ifdef _OPENMP
 #   pragma omp parallel for schedule(static)
 #endif
-    for (int e = 0; e < n_experts; e++) {
-        const float *row = W + (size_t)e * hidden;
-        double acc = 0.0;
-        for (int i = 0; i < hidden; i++) acc += (double)row[i] * (double)x[i];
-        score[e]  = 1.0f / (1.0f + expf(-(float)acc));
-        choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
+    for (int blk = 0; blk < nblk; blk++) {
+        const int e0 = blk * RB;
+        const int ne = (n_experts - e0 < RB) ? n_experts - e0 : RB;
+        double acc[RB] = {0};
+        if (ne == RB) {
+            const float *r0 = W + (size_t)e0 * hidden;
+            for (int i = 0; i < hidden; i++) {
+                const double xi = (double)x[i];
+                for (int k = 0; k < RB; k++)
+                    acc[k] += (double)r0[(size_t)k * hidden + i] * xi;
+            }
+        } else {
+            for (int k = 0; k < ne; k++) {
+                const float *row = W + (size_t)(e0 + k) * hidden;
+                for (int i = 0; i < hidden; i++) acc[k] += (double)row[i] * (double)x[i];
+            }
+        }
+        for (int k = 0; k < ne; k++) {
+            const int e = e0 + k;
+            score[e]  = 1.0f / (1.0f + expf(-(float)acc[k]));
+            choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
+        }
     }
 
     /* top-k by repeated max. n_experts is 896 and topk is 16, so this is 14k
