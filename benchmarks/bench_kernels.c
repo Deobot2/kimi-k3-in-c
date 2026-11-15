@@ -99,6 +99,29 @@ int main(void)
         fnv("bf16 ", y, out);
         printf("             trunk is 56.74 G params/token -> %.2f s/token at this rate\n",
                2.0 * 56.74e9 / 1e9 / (gflop / dt));
+
+        /* Prefill: T tokens through the same matrix. A per-token loop re-streams all
+         * 176 MB of W per token; k3_mmw_n reads it once per block of tokens. Both give
+         * bitwise the same result, which is checked here rather than assumed. */
+        {
+            const int T = 64;
+            float *xs = (float *)malloc((size_t)T * in * sizeof(float));
+            float *ya = (float *)malloc((size_t)T * out * sizeof(float));
+            float *yb = (float *)malloc((size_t)T * out * sizeof(float));
+            if (!xs || !ya || !yb) { printf("alloc failed\n"); return 1; }
+            fillf(xs, (size_t)T * in, 31337u);
+            double ta = now_s();
+            for (int t = 0; t < T; t++)
+                k3_mmw(ya + (size_t)t * out, xs + (size_t)t * in, W, K3_WBF16, in, out);
+            ta = now_s() - ta;
+            double tb = now_s();
+            k3_mmw_n(yb, xs, W, K3_WBF16, in, out, T);
+            tb = now_s() - tb;
+            printf("bf16 prefill T=%d   per-token loop %7.1f ms   k3_mmw_n %7.1f ms   %s\n",
+                   T, ta * 1e3, tb * 1e3,
+                   memcmp(ya, yb, (size_t)T * out * sizeof(float)) ? "DIFFER" : "bit-identical");
+            free(xs); free(ya); free(yb);
+        }
         free(W); free(x); free(y);
     }
 

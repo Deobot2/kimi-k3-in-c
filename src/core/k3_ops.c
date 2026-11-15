@@ -355,13 +355,9 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
  * to the arithmetic relative to a sequential sum. Keeping the accumulators in double
  * bounds the difference far below fp32 output precision; making them float would not.
  */
-void k3_matmul(float *y, const float *x, const float *W, int in, int out)
+static double rowdot_f32(const float *row, const float *x, int in)
 {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
-#endif
-    for (int o = 0; o < out; o++) {
-        const float *row = W + (size_t)o * in;
+    {
         /* Sixteen accumulators, EXPLICITLY fused products. fma() in double is the
          * same IEEE operation as _mm256_fmadd_pd per lane, so the scalar and vector
          * paths stay bit-identical while the dependent-add latency chain that made
@@ -379,8 +375,17 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
         double b3 = (a[3] + a[7]) + (a[11] + a[15]);
         double acc = (b0 + b1) + (b2 + b3);
         for (; i < in; i++) acc = fma((double)row[i], (double)x[i], acc);
-        y[o] = (float)acc;
+        return acc;
     }
+}
+
+void k3_matmul(float *y, const float *x, const float *W, int in, int out)
+{
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out > 64)
+#endif
+    for (int o = 0; o < out; o++)
+        y[o] = (float)rowdot_f32(W + (size_t)o * in, x, in);
 }
 
 /* ------------------------------------------------------------- Gated MLA ---- */
@@ -1238,16 +1243,18 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
     float *o  = bt + (size_t)T * H;      float *gb = o + (size_t)T * P;
     float *wr = gb + P;                  float *fa = wr + P;
 
-    /* 1. projections */
-    for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
-        k3_mmw(q + (size_t)t * P, xt, w->q, w->wdt, E, P);
-        k3_mmw(k + (size_t)t * P, xt, w->k, w->wdt, E, P);
-        k3_mmw(v + (size_t)t * P, xt, w->v, w->wdt, E, P);
-        k3_mmw(bt + (size_t)t * H, xt, w->b, w->wdt, E, H);
-        /* ONE shared low-rank pair feeds every head: [E->D] then [D->H*D] */
-        k3_mmw(fa, xt, w->f_a, w->wdt, E, D);
-        k3_mmw(z + (size_t)t * P, fa, w->f_b, w->wdt, D, P);
+    /* 1. projections, all T tokens per matrix so each is streamed once per token
+     *    block rather than once per token (k3_mmw_n is bitwise k3_mmw per token) */
+    k3_mmw_n(q,  x, w->q, w->wdt, E, P, T);
+    k3_mmw_n(k,  x, w->k, w->wdt, E, P, T);
+    k3_mmw_n(v,  x, w->v, w->wdt, E, P, T);
+    k3_mmw_n(bt, x, w->b, w->wdt, E, H, T);
+    /* ONE shared low-rank pair feeds every head: [E->D] then [D->H*D]. The [T][D]
+     * intermediate borrows o, which the recurrence does not write until step 6. */
+    {
+        float *fat = (T == 1) ? fa : o;
+        k3_mmw_n(fat, x, w->f_a, w->wdt, E, D, T);
+        k3_mmw_n(z, fat, w->f_b, w->wdt, D, P, T);
     }
 
     /* 2. ShortConv with fused SiLU, carrying state across calls */
@@ -1302,16 +1309,18 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
         }
     }
 
-    /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection */
+    /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection. The gate's
+     * [T][P] pre-activations reuse z, which is dead once step 5 has consumed it. */
+    float *gt = (T == 1) ? gb : z;
+    k3_mmw_n(gt, x, w->g, w->wdt, E, P, T);
     for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
         float *ot = o + (size_t)t * P;
+        const float *gq = gt + (size_t)t * P;
         for (int h = 0; h < H; h++)
             k3_rmsnorm(ot + (size_t)h * D, ot + (size_t)h * D, w->o_norm, D, c->rms_eps);
-        k3_mmw(gb, xt, w->g, w->wdt, E, P);
-        for (int i = 0; i < P; i++) ot[i] *= sigmoidf_(gb[i]);
-        k3_mmw(out + (size_t)t * E, ot, w->o, w->wdt, P, E);
+        for (int i = 0; i < P; i++) ot[i] *= sigmoidf_(gq[i]);
     }
+    k3_mmw_n(out, o, w->o, w->wdt, P, E, T);
     free(Sown);
 }
 
@@ -1522,13 +1531,9 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
  *     but that is a proof about the inputs. Mul-then-add is a proof about the code.
  *   - The scalar tail loop is reused verbatim for the in % 4 remainder.
  */
-void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
+static double rowdot_bf16(const uint16_t *row, const float *x, int in)
 {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
-#endif
-    for (int o = 0; o < out; o++) {
-        const uint16_t *row = W + (size_t)o * in;
+    {
         int i = 0;
         double acc;
 #if defined(__AVX2__)
@@ -1582,8 +1587,17 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
         }
 #endif
         for (; i < in; i++) acc = fma((double)k3_bf16f(row[i]), (double)x[i], acc);
-        y[o] = (float)acc;
+        return acc;
     }
+}
+
+void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
+{
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out > 64)
+#endif
+    for (int o = 0; o < out; o++)
+        y[o] = (float)rowdot_bf16(W + (size_t)o * in, x, in);
 }
 
 /* Per-row int8 matmul for the draft model: each row is [f32 scale][int8 * in]. The int8
@@ -1592,15 +1606,9 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
  * determinism contract (K3_WI8 is draft-only, and the exact model decides every emitted
  * token), so it accumulates in float with fused products and the natural AVX2 reduction,
  * which is what makes it fast. */
-void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
+static float rowdot_q8(const unsigned char *row, const float *x, int in)
 {
-    const unsigned char *base = (const unsigned char *)W;
-    const size_t rowb = (size_t)4 + (size_t)in;
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
-#endif
-    for (int o = 0; o < out; o++) {
-        const unsigned char *row = base + (size_t)o * rowb;
+    {
         float scale;
         memcpy(&scale, row, 4);
         const int8_t *w = (const int8_t *)(row + 4);
@@ -1637,8 +1645,19 @@ void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
         }
 #endif
         for (; i < in; i++) acc += (float)w[i] * x[i];
-        y[o] = acc * scale;
+        return acc * scale;
     }
+}
+
+void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
+{
+    const unsigned char *base = (const unsigned char *)W;
+    const size_t rowb = (size_t)4 + (size_t)in;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out > 64)
+#endif
+    for (int o = 0; o < out; o++)
+        y[o] = rowdot_q8(base + (size_t)o * rowb, x, in);
 }
 
 /* A whole BYTE to its two E2M1 values, so the inner loop does one 8-byte load instead
@@ -1821,6 +1840,52 @@ void k3_matmul_mx4(float *y, const float *x, const void *W, int in, int out)
     for (int r = 0; r < out; r++) {
         const unsigned char *row = base + (size_t)r * rb;
         y[r] = (float)mxfp4_rowdot(x, row, row + pn, in, K3_MXFP4_GROUP);
+    }
+}
+
+/* T activations against one matrix: y[t][out] = W . x[t][in], for every t < T.
+ *
+ * Every (t, o) element is produced by the SAME row-dot routine k3_mmw uses, so the
+ * output is bitwise identical to T separate k3_mmw calls, at any thread count. What
+ * changes is only the order the dots are visited in. A per-token loop of k3_mmw
+ * streams the whole matrix from memory once per token; here the rows are swept once
+ * per block of K3_MM_TB tokens, each row is dotted against the whole block while it
+ * is still in L1, and the block of activations (16 x 28 KB at hidden 7168) stays in
+ * L2. That is a K3_MM_TB-fold cut in weight traffic for prefill and --ppl, where a
+ * matrix-vector product is otherwise memory bound. */
+enum { K3_MM_TB = 16 };
+
+void k3_mmw_n(float *y, const float *x, const void *W, int wdt, int in, int out, int T)
+{
+    if (T <= 1) { if (T == 1) k3_mmw(y, x, W, wdt, in, out); return; }
+    if (wdt == K3_WMX4) {
+        if (!k3_pair_ready)  k3_pair_init();
+        if (!k3_e8m0_ready)  k3_e8m0_init();
+    }
+    const unsigned char *base = (const unsigned char *)W;
+    const size_t rb = k3_row_bytes(wdt, in);
+    const size_t pn = (size_t)in / 2u;
+
+    for (int t0 = 0; t0 < T; t0 += K3_MM_TB) {
+        const int nt = (T - t0 < K3_MM_TB) ? T - t0 : K3_MM_TB;
+        const float *xb = x + (size_t)t0 * in;
+        float *yb = y + (size_t)t0 * out;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out > 64)
+#endif
+        for (int o = 0; o < out; o++) {
+            const unsigned char *row = base + (size_t)o * rb;
+            for (int tt = 0; tt < nt; tt++) {
+                const float *xt = xb + (size_t)tt * in;
+                float r;
+                if (wdt == K3_WBF16)     r = (float)rowdot_bf16((const uint16_t *)row, xt, in);
+                else if (wdt == K3_WI8)  r = rowdot_q8(row, xt, in);
+                else if (wdt == K3_WMX4) r = (float)mxfp4_rowdot(xt, row, row + pn, in,
+                                                                 K3_MXFP4_GROUP);
+                else                     r = (float)rowdot_f32((const float *)row, xt, in);
+                yb[(size_t)tt * out + o] = r;
+            }
+        }
     }
 }
 

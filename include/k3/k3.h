@@ -458,6 +458,11 @@ static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
     else                      k3_matmul(y, x, (const float *)W, in, out);
 }
 
+/* T tokens at once: y is [T][out], x is [T][in]. Bitwise identical to T calls of
+ * k3_mmw, but each weight row is read once per block of tokens rather than once per
+ * token, so prefill and --ppl stop being bound by re-streaming the weights. */
+void k3_mmw_n(float *y, const float *x, const void *W, int wdt, int in, int out, int T);
+
 /* Byte stride of one row for a per-row int8 matrix: the f32 scale plus `in` int8 weights.
  * bf16 and fp32 are per-element and take the element form. */
 static inline size_t k3_wsz(int wdt) { return wdt == K3_WBF16 ? 2u : 4u; }
