@@ -87,7 +87,8 @@ memset(&moe, 0, sizeof moe);   /* required, not defensive */
 Weight matrices are tagged pointers: `K3_WF32` (0), `K3_WBF16` (1), `K3_WI8` (2, the
 int8 draft container) or `K3_WMX4` (3, a quantised trunk). Because `K3_WF32` is zero, a
 `memset` struct defaults to fp32. Dispatch through `k3_mmw()` rather than calling the
-typed matmuls directly, and size a row with `k3_row_bytes()` rather than multiplying by
+typed matmuls directly (or `k3_mmw_n()` for T tokens against one matrix: bitwise T calls
+of `k3_mmw()`, with each weight row read once per 16 tokens instead of once per token), and size a row with `k3_row_bytes()` rather than multiplying by
 an element size — `K3_WI8` and `K3_WMX4` carry their scales inline, so a row is not
 `in * sizeof(element)`.
 

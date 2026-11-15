@@ -92,9 +92,35 @@ not needing the bytes at all.
 - Saved state records the KV layout and window geometry and refuses a mismatch: the two
   caches hold different tensors of the same float count, so restoring one as the other
   would be fluent and wrong. State version 1 → 2.
+- **Kernel speedups, all bitwise identical to what they replace** (each checked by hash
+  or `memcmp` against the previous implementation, on 1 and 4 threads):
+  - MXFP4 row dot decodes nibbles in registers: 1.73 → 0.97 ms for a 3072×3584 expert
+    matrix.
+  - bf16 matmul widens the activation to double once per call rather than once per row:
+    49.6 → 34.0 ms single-threaded at 12288×7168.
+  - `k3_matmul_tr` (the `--mla-latent` W_UK absorption) is column-blocked: 4–8× faster.
+  - Both MLA paths run attention heads in parallel: 531.6 → 170.9 ms per latent MLA layer
+    per token at 8k context (4 threads), 238.3 → 107.4 ms expanded at 4k.
+  - The router interleaves eight experts' serial sums: 2× faster, same routing.
+- **Multi-token calls stream each weight matrix once per 16 tokens, not once per token.**
+  New `k3_mmw_n(y, x, W, wdt, in, out, T)` is bitwise T calls of `k3_mmw`; KDA, both
+  MLA paths, the streamed MoE prefill chunk (down/up projections, shared expert) and the
+  dense layer use it, so prefill, full recompute and `--ppl` stop re-reading each layer
+  from RAM per token. A two-token bf16 row dot shares the weight widening on top.
+  `scale_test` at real dimensions: 186 → 90 ms/token; MLA at T=24: 701 → 307 ms.
+- MLA scratch now holds per-head score rows and per-token projection buffers:
+  `k3_mla_scratch_cached`/`_latent` grow by `(n_heads-1)·span` plus
+  `(T-1)·(q_lora+kv_lora+qk_rope+n_heads·v_head)` floats. Size through those functions
+  as before; at T=4096 the layer total is unchanged, because KDA's need is larger.
+- **`tests/unit/test_prefill.c`**: the multi-token paths against their per-token
+  definitions by `memcmp`, including the streamed MoE prefill chunk, which no test
+  reached before.
 
 ### Fixed
 
+- `bench_kernels` filled its bf16 matrix with raw random bytes, so every row held a NaN
+  and the printed hash fingerprinted NaN payloads rather than arithmetic. Weights are now
+  finite; the new reference is `4132e034c975775d`.
 - The trunk reader's `hits`/`misses` are classified once per bind rather than incremented
   by whichever thread performed the read, so they sum to the bind count instead of double
   counting every prefetched layer.
