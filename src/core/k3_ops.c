@@ -69,8 +69,10 @@ static void k3_e8m0_init(void)
     k3_e8m0_ready = 1;
 }
 
-static void mmw_n_ld(float *y, const float *x, size_t ldx, const void *W, int wdt,
-                     int in, int out, int T);
+static void mmw_n_ld(float *y, size_t ldy, const float *x, size_t ldx, const void *W,
+                     int wdt, int in, int out, int T);
+static void glu_mlp_n(float *y, const float *x, const void *Wg, const void *Wu,
+                      const void *Wd, int wdt, int E, int I, int T, const K3Cfg *c);
 
 static void k3_fatal_oom(const char *what, size_t bytes)
 {
@@ -471,7 +473,8 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         memcpy(K3_ROPE_AT(cached + t), ctt + c->kv_lora, (size_t)qr * sizeof(float));
     }
     /* positions cached..cached+T-1 are contiguous in either key/value store */
-    mmw_n_ld(K3_KV_AT(cached), ct, (size_t)kvw, w->kv_b, w->wdt, c->kv_lora, H * kvd, T);
+    mmw_n_ld(K3_KV_AT(cached), (size_t)H * kvd, ct, (size_t)kvw, w->kv_b, w->wdt,
+             c->kv_lora, H * kvd, T);
 
     /* The gate depends only on x, so it is projected for every token up front; each
      * token's attention output is then gated into its row, and o_proj runs once over
@@ -1167,12 +1170,13 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         float *wtt = rwt + (size_t)t * K;
         k3_router(it, wtt, xt, w->gate, w->bias, E, c->n_experts, K,
                   c->moe_renorm, c->routed_scale);
-        k3_mmw(zz + (size_t)t * Ll, xt, w->down, w->wdt, E, Ll);
         for (int j = 0; j < K; j++) {
             const int e = it[j];
             if (e >= 0 && e < c->n_experts && !seen[e]) { seen[e] = 1; uniq[nu++] = e; }
         }
     }
+
+    k3_mmw_n(zz, x, w->down, w->wdt, E, Ll, T);
 
     /* 2. expert-major: fetch each unique expert ONCE, apply it to every (token, slot)
      * that selected it. gu/act/edn are reused per (expert, token). */
@@ -1206,8 +1210,6 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
     /* 3. per token, sum contributions in the ORIGINAL top-k order, then the tail of the
      * MoE exactly as k3_moe does it, so every float matches the per-token path. */
     for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
-        float *ot = out + (size_t)t * E;
         const float *wtt = rwt + (size_t)t * K;
         /* Reuse this token's now-dead down-projection slot as the aggregate. */
         float *acc = zz + (size_t)t * Ll;
@@ -1219,17 +1221,16 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         }
         if (c->latent_norm) k3_rmsnorm(acc, acc, w->latent_norm, Ll, c->rms_eps);
         if (g_cal && c->latent_norm) k3_calib_observe(K3_CAL_LAT, acc, 1, Ll);
-        k3_mmw(ot, acc, w->up, w->wdt, Ll, E);
-
-        float *sgu  = gu;                 /* [2*SI] */
-        float *sact = sgu + 2 * SI;       /* [SI]   */
-        float *sdn  = sact + SI;          /* [E]    */
-        k3_mmw(sgu,      xt, w->sh1, w->wdt, E, SI);
-        k3_mmw(sgu + SI, xt, w->sh3, w->wdt, E, SI);
-        k3_situ_glu(sact, sgu, SI, c->situ_b1, c->situ_b2);
-        k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
-        for (int i = 0; i < E; i++) ot[i] += sdn[i];
     }
+    k3_mmw_n(out, zz, w->up, w->wdt, Ll, E, T);
+
+    /* the shared expert, on the ORIGINAL input, added unweighted after the up-projection
+     * exactly as k3_moe adds it */
+    float *sdn = (float *)malloc((size_t)T * E * sizeof(float));
+    if (!sdn) k3_fatal_oom("MoE prefill shared expert", (size_t)T * E * sizeof(float));
+    glu_mlp_n(sdn, x, w->sh1, w->sh3, w->sh2, w->wdt, E, SI, T, c);
+    for (size_t i = 0; i < (size_t)T * E; i++) out[i] += sdn[i];
+    free(sdn);
 
     free(ridx); free(rwt); free(zz); free(contrib); free(uniq); free(seen);
 }
@@ -1497,6 +1498,9 @@ void k3_decoder_layer_kv(float *h, float *block_residual, int *n_blocks,
          * the whole chunk; decode (T == 1) and the resident path fall straight through
          * to k3_moe inside, byte-identical. */
         k3_moe_prefill(tmp, hin, w->moe, c, T, idx, wt, sub);
+    } else if (T > 1) {
+        glu_mlp_n(tmp, hin, w->dense_gate, w->dense_up, w->dense_down, w->wdt,
+                  E, c->dense_inter, T, c);
     } else {
         for (int t = 0; t < T; t++) {
             k3_mmw(dgu, hin + (size_t)t * E, w->dense_gate, w->wdt, E, c->dense_inter);
@@ -1881,10 +1885,11 @@ void k3_matmul_mx4(float *y, const float *x, const void *W, int in, int out)
  * matrix-vector product is otherwise memory bound. */
 enum { K3_MM_TB = 16 };
 
-/* x rows are ldx floats apart (ldx >= in), so a caller can feed the leading `in`
- * columns of a wider row without copying them out. */
-static void mmw_n_ld(float *y, const float *x, size_t ldx, const void *W, int wdt,
-                     int in, int out, int T)
+/* x rows are ldx floats apart (ldx >= in) and y rows ldy apart (ldy >= out), so a
+ * caller can read the leading columns of a wider row, or write into one, without a
+ * copy. */
+static void mmw_n_ld(float *y, size_t ldy, const float *x, size_t ldx, const void *W,
+                     int wdt, int in, int out, int T)
 {
     if (T <= 1) { if (T == 1) k3_mmw(y, x, W, wdt, in, out); return; }
     if (wdt == K3_WMX4) {
@@ -1898,7 +1903,7 @@ static void mmw_n_ld(float *y, const float *x, size_t ldx, const void *W, int wd
     for (int t0 = 0; t0 < T; t0 += K3_MM_TB) {
         const int nt = (T - t0 < K3_MM_TB) ? T - t0 : K3_MM_TB;
         const float *xb = x + (size_t)t0 * ldx;
-        float *yb = y + (size_t)t0 * out;
+        float *yb = y + (size_t)t0 * ldy;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
 #endif
@@ -1912,7 +1917,7 @@ static void mmw_n_ld(float *y, const float *x, size_t ldx, const void *W, int wd
                 else if (wdt == K3_WMX4) r = (float)mxfp4_rowdot(xt, row, row + pn, in,
                                                                  K3_MXFP4_GROUP);
                 else                     r = (float)rowdot_f32((const float *)row, xt, in);
-                yb[(size_t)tt * out + o] = r;
+                yb[(size_t)tt * ldy + o] = r;
             }
         }
     }
@@ -1920,7 +1925,34 @@ static void mmw_n_ld(float *y, const float *x, size_t ldx, const void *W, int wd
 
 void k3_mmw_n(float *y, const float *x, const void *W, int wdt, int in, int out, int T)
 {
-    mmw_n_ld(y, x, (size_t)in, W, wdt, in, out, T);
+    mmw_n_ld(y, (size_t)out, x, (size_t)in, W, wdt, in, out, T);
+}
+
+/* A SiTU-GLU MLP over T tokens: y[t] = Wd . situ(Wg . x[t], Wu . x[t]). Bitwise the
+ * per-token sequence k3_mmw(gate), k3_mmw(up), k3_situ_glu, k3_mmw(down), with each
+ * matrix read once per token block instead of once per token. Gate and up land side
+ * by side in one [gate | up] row per token, which is the layout k3_situ_glu reads.
+ * Tokens go through in chunks so the buffers stay bounded at any prompt length:
+ * 64 x 3 x I floats, 14 MB at the dense layer's width. */
+static void glu_mlp_n(float *y, const float *x, const void *Wg, const void *Wu,
+                      const void *Wd, int wdt, int E, int I, int T, const K3Cfg *c)
+{
+    enum { CH = 64 };
+    const int nch = T < CH ? T : CH;
+    float *gu  = (float *)malloc((size_t)nch * 3 * I * sizeof(float));
+    if (!gu) k3_fatal_oom("GLU MLP batch", (size_t)nch * 3 * I * sizeof(float));
+    float *act = gu + (size_t)nch * 2 * I;
+    for (int t0 = 0; t0 < T; t0 += CH) {
+        const int n = (T - t0 < CH) ? T - t0 : CH;
+        const float *xb = x + (size_t)t0 * E;
+        mmw_n_ld(gu,     (size_t)2 * I, xb, (size_t)E, Wg, wdt, E, I, n);
+        mmw_n_ld(gu + I, (size_t)2 * I, xb, (size_t)E, Wu, wdt, E, I, n);
+        for (int t = 0; t < n; t++)
+            k3_situ_glu(act + (size_t)t * I, gu + (size_t)t * 2 * I, I,
+                        c->situ_b1, c->situ_b2);
+        k3_mmw_n(y + (size_t)t0 * E, act, Wd, wdt, I, E, n);
+    }
+    free(gu);
 }
 
 void k3_mxfp4_dequant(float *out, const unsigned char *packed,
