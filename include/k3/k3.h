@@ -239,8 +239,9 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out);
  *     T*H*(qk_nope+qk_rope)      q
  *   + T*H*(qk_nope+v_head)       kv
  *   + T*(kv_lora+qk_rope)        compressed latent plus the shared rope slot
- *   + q_lora                     transient
- *   + 2*H*v_head                 attention accumulator and gate buffer
+ *   + T*q_lora                   query latent
+ *   + H*v_head                   attention accumulator
+ *   + T*H*v_head                 gate, then gated output, one row per token
  *   + H*T                        scores, one row per head so heads run in parallel
  * floats. Use k3_mla_scratch() rather than recomputing this.
  */
