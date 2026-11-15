@@ -79,6 +79,10 @@ int main(void)
         float *y = (float *)malloc((size_t)out * sizeof(float));
         if (!W || !x || !y) { printf("alloc failed\n"); return 1; }
         fillb((unsigned char *)W, (size_t)in * out * 2, 12345u);
+        /* Clear the top exponent bit so every weight is finite (|w| < 2). Raw random
+         * bytes put a NaN in every row, which made every output NaN and the hash below
+         * a fingerprint of NaN payloads rather than of the arithmetic. */
+        for (size_t i = 0; i < (size_t)in * out; i++) W[i] &= 0xBFFFu;
         fillf(x, in, 999u);
 
         k3_matmul_bf16(y, x, W, in, out);              /* warm */
