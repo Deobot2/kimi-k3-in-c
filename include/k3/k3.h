@@ -239,8 +239,8 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out);
  *     T*H*(qk_nope+qk_rope)      q
  *   + T*H*(qk_nope+v_head)       kv
  *   + T*(kv_lora+qk_rope)        compressed latent plus the shared rope slot
- *   + q_lora                     transient
- *   + 2*H*v_head                 attention accumulator and gate buffer
+ *   + T*q_lora                   q_a output, per token
+ *   + T*2*H*v_head               attention accumulator and gate buffer, per token
  *   + T                          scores
  * floats. Use k3_mla_scratch() rather than recomputing this.
  */
@@ -462,6 +462,11 @@ static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
  * speculative verify through k3_mmw re-reads the whole matrix from DRAM once per token;
  * this fetches each row once and dots it against every token while it is in L1. */
 void k3_mmw_t(float *Y, const float *X, const void *W, int wdt, int in, int out, int T);
+/* The same with explicit row strides: X rows are ldx floats apart, Y rows ldy apart.
+ * Lets a caller multiply a prefix of each row (the latent part of a [kv_lora + rope]
+ * vector, say) or write into a wider output without copying. */
+void k3_mmw_ts(float *Y, size_t ldy, const float *X, size_t ldx, const void *W, int wdt,
+               int in, int out, int T);
 
 /* Byte stride of one row for a per-row int8 matrix: the f32 scale plus `in` int8 weights.
  * bf16 and fp32 are per-element and take the element form. */
