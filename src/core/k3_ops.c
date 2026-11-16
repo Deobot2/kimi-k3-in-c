@@ -926,38 +926,27 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 }
 
 /* ---------------------------------------------------------------- router ---- */
-void k3_router(int *idx, float *w, const float *x, const float *W,
-               const float *bias, int hidden, int n_experts, int topk,
-               int renorm, float routed_scale)
+/* Router logits for T tokens: score[t][e] = sigmoid(W[e] . x[t]) and choice = score +
+ * bias. Shared by k3_router (T == 1) and the batched MoE prefill.
+ *
+ * logits in float32 with no bias, then an independent sigmoid per expert. The reference
+ * upcasts both operands explicitly; a double accumulator here matches it.
+ *
+ * PARALLEL over experts, and bit-identical because of it. This is 896 dot products of
+ * length 7168 = 6.4M multiply-adds per token per MoE layer, pure arithmetic with no I/O
+ * to hide behind. Each block writes only its own experts' entries, and the ACCUMULATION
+ * ORDER INSIDE an expert is untouched: it is summed i = 0..hidden-1 in sequence into its
+ * own double, one mul then one add (no fma: this build keeps -ffp-contract=off).
+ *
+ * EIGHT EXPERTS PER PASS. A single double-add chain of length 7168 is bound by add
+ * latency, not throughput: the core sat waiting ~4 cycles per element. Eight experts'
+ * chains are independent, so interleaving them fills the adder while every expert's own
+ * sum keeps its order, and the eight rows share each load of x. For T > 1 the same
+ * eight rows (229 KB at 7168 wide) are then reused, from cache, for every token, where
+ * calling k3_router per token re-streamed the whole 25.7 MB gate T times. */
+static void router_logits(float *score, float *choice, const float *X, const float *W,
+                          const float *bias, int hidden, int n_experts, int T)
 {
-    /* Returning early here would leave idx[] and w[] untouched, and k3_moe forms
-     * `w->w1 + idx[j]*I*L` from them one line later -- an arbitrary pointer built from
-     * uninitialised stack. */
-    float *score  = (float *)malloc((size_t)n_experts * sizeof(float));
-    float *choice = (float *)malloc((size_t)n_experts * sizeof(float));
-    if (!score || !choice) k3_fatal_oom("router scores", (size_t)n_experts * sizeof(float) * 2);
-
-    /* logits in float32 with no bias, then an independent sigmoid per expert. The
-     * reference upcasts both operands explicitly; a double accumulator here matches
-     * it and costs nothing at this width. */
-    /* PARALLEL over experts, and bit-identical because of it.
-     *
-     * This is 896 dot products of length 7168 = 6.4M multiply-adds, per token, per MoE
-     * layer, so 590M across the 92 of them -- and it ran on ONE core while every other
-     * matmul in the engine was already threaded. It is pure arithmetic with no I/O to
-     * hide behind, so it sat squarely on the critical path.
-     *
-     * Each iteration writes only its own score[e] and choice[e], and the ACCUMULATION
-     * ORDER INSIDE an expert is untouched: thread t still sums i = 0..hidden-1 in
-     * sequence into its own double. Splitting the outer loop therefore cannot change a
-     * single bit, which is why this needs no tolerance and no re-gating. */
-    /* EIGHT EXPERTS PER PASS, each still ONE sequential accumulator. A single
-     * double-add chain of length 7168 is bound by add latency, not throughput: the
-     * core sat waiting ~4 cycles per element. Eight experts' chains are independent,
-     * so interleaving them fills the adder while every expert's own sum is formed in
-     * exactly the order it always was, i = 0..hidden-1, one mul then one add (no fma:
-     * this build keeps -ffp-contract=off). The score is therefore bit-identical, and
-     * the eight rows also share each load of x. */
     enum { RB = 8 };
     const int nblk = (n_experts + RB - 1) / RB;
 #ifdef _OPENMP
@@ -966,27 +955,36 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
     for (int b = 0; b < nblk; b++) {
         const int e0 = b * RB;
         const int ne = (n_experts - e0 < RB) ? n_experts - e0 : RB;
-        double acc[RB] = {0};
-        if (ne == RB) {
-            const float *r0 = W + (size_t)e0 * hidden;
-            for (int i = 0; i < hidden; i++) {
-                const double xi = (double)x[i];
-                for (int k = 0; k < RB; k++)
-                    acc[k] += (double)r0[(size_t)k * hidden + i] * xi;
+        for (int t = 0; t < T; t++) {
+            const float *x = X + (size_t)t * hidden;
+            double acc[RB] = {0};
+            if (ne == RB) {
+                const float *r0 = W + (size_t)e0 * hidden;
+                for (int i = 0; i < hidden; i++) {
+                    const double xi = (double)x[i];
+                    for (int k = 0; k < RB; k++)
+                        acc[k] += (double)r0[(size_t)k * hidden + i] * xi;
+                }
+            } else {
+                for (int k = 0; k < ne; k++) {
+                    const float *row = W + (size_t)(e0 + k) * hidden;
+                    for (int i = 0; i < hidden; i++) acc[k] += (double)row[i] * (double)x[i];
+                }
             }
-        } else {
+            float *sc = score + (size_t)t * n_experts, *ch = choice + (size_t)t * n_experts;
             for (int k = 0; k < ne; k++) {
-                const float *row = W + (size_t)(e0 + k) * hidden;
-                for (int i = 0; i < hidden; i++) acc[k] += (double)row[i] * (double)x[i];
+                const int e = e0 + k;
+                sc[e] = 1.0f / (1.0f + expf(-(float)acc[k]));
+                ch[e] = sc[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
             }
-        }
-        for (int k = 0; k < ne; k++) {
-            const int e = e0 + k;
-            score[e]  = 1.0f / (1.0f + expf(-(float)acc[k]));
-            choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
         }
     }
+}
 
+/* Top-k selection and weighting for one token, from its logits. Consumes choice. */
+static void router_select(int *idx, float *w, const float *score, float *choice,
+                          int n_experts, int topk, int renorm, float routed_scale)
+{
     /* top-k by repeated max. n_experts is 896 and topk is 16, so this is 14k
      * comparisons per token per layer: cheap next to an 18 MB expert read, and it
      * avoids a sort. Marking taken entries with -INFINITY keeps ties deterministic
@@ -1008,8 +1006,34 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
         for (int j = 0; j < topk; j++) w[j] *= inv;
     }
     for (int j = 0; j < topk; j++) w[j] *= routed_scale;
+}
 
+/* T tokens' routing at once; idx and w are [T][topk]. Each token's result is
+ * bit-identical to k3_router on that token alone. */
+static void router_t(int *idx, float *w, const float *X, const float *W,
+                     const float *bias, int hidden, int n_experts, int topk,
+                     int renorm, float routed_scale, int T)
+{
+    /* Returning early here would leave idx[] and w[] untouched, and k3_moe forms
+     * `w->w1 + idx[j]*I*L` from them one line later -- an arbitrary pointer built from
+     * uninitialised stack. */
+    const size_t n = (size_t)T * n_experts;
+    float *score  = (float *)malloc(n * sizeof(float));
+    float *choice = (float *)malloc(n * sizeof(float));
+    if (!score || !choice) k3_fatal_oom("router scores", n * sizeof(float) * 2);
+    router_logits(score, choice, X, W, bias, hidden, n_experts, T);
+    for (int t = 0; t < T; t++)
+        router_select(idx + (size_t)t * topk, w + (size_t)t * topk,
+                      score + (size_t)t * n_experts, choice + (size_t)t * n_experts,
+                      n_experts, topk, renorm, routed_scale);
     free(score); free(choice);
+}
+
+void k3_router(int *idx, float *w, const float *x, const float *W,
+               const float *bias, int hidden, int n_experts, int topk,
+               int renorm, float routed_scale)
+{
+    router_t(idx, w, x, W, bias, hidden, n_experts, topk, renorm, routed_scale, 1);
 }
 
 /* --------------------------------------------------------------- AttnRes ---- */
@@ -1285,12 +1309,10 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
     /* Same hint as the per-token path: routing has not happened yet and the source may
      * have a guess worth starting now. */
     if (w->src->speculate) w->src->speculate(w->src, w->layer);
+    router_t(ridx, rwt, x, w->gate, w->bias, E, c->n_experts, K,
+             c->moe_renorm, c->routed_scale, T);
     for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
-        int   *it = ridx + (size_t)t * K;
-        float *wtt = rwt + (size_t)t * K;
-        k3_router(it, wtt, xt, w->gate, w->bias, E, c->n_experts, K,
-                  c->moe_renorm, c->routed_scale);
+        const int *it = ridx + (size_t)t * K;
         for (int j = 0; j < K; j++) {
             const int e = it[j];
             if (e >= 0 && e < c->n_experts && !seen[e]) { seen[e] = 1; uniq[nu++] = e; }
