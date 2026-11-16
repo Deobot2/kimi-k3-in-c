@@ -282,45 +282,60 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
-    /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
-     *    channel, not a scalar, which is what "channel-wise forget gate" means. */
+    /* The four logical steps (k3.h) run as TWO passes over S instead of four. S is
+     * dk*dv floats (64 KB per head at the released dims) and is touched once per head
+     * per token, so each pass is a full trip through L1/L2; fusing halves the number of
+     * trips. (On a 4-core Xeon the wall-time change was inside run-to-run noise; the
+     * count of passes is the claim, not a speedup.)
+     *
+     * The fusion is legal, and bit-identical, because each fused step consumes row i of
+     * S only after the previous step has finished with row i:
+     *   pass A  decay row i, then add its contribution to u = S^T k. u needs EVERY row
+     *           decayed before step 3 may begin, so the passes cannot merge further.
+     *   pass B  write row i with the now-complete u, then add it to o = S^T q. Step 4
+     *           reads the UPDATED state, which row i is by the time it is read.
+     * Accumulation into u and o still runs over i in ascending order, and every product
+     * keeps its original form and association, so no sum is reordered. */
+
+    /* u lives on the stack for any realistic head size: this runs H*T times per KDA
+     * layer, inside the per-head OpenMP region, where a calloc/free pair per call puts
+     * every thread through the allocator for a 512-byte temporary. */
+    enum { KDA_STACK_DV = 256 };
+    float ustack[KDA_STACK_DV];
+    float *u = ustack;
+    if (dv > KDA_STACK_DV) {
+        /* Allocated BEFORE S is touched: a failure after the decay would leave the
+         * recurrent state scaled but never updated. (k3_fatal_oom does not return,
+         * but the ordering keeps that true even if it ever did.) */
+        u = (float *)malloc((size_t)dv * sizeof(float));
+        if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    }
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
+
+    /* pass A: steps 1+2. The gate is per key channel, not a scalar: that is what
+     * "channel-wise forget gate" means. */
     for (int i = 0; i < dk; i++) {
         float *row = S + (size_t)i * dv;
         const float a = alpha[i];
         for (int j = 0; j < dv; j++) row[j] *= a;
-    }
-
-    /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
-     * would leave the recurrent state permanently scaled but never updated -- silent,
-     * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
-    for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) u[j] += ki * row[j];
     }
 
-    /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
-     *    it a DELTA rule rather than plain accumulation. */
-    for (int i = 0; i < dk; i++) {
-        const float ki = k[i];
-        if (ki == 0.0f) continue;
-        float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
-    }
-
-    /* 4. output from the ALREADY UPDATED state: o = S^T q */
+    /* pass B: steps 3+4. (v - u) is the prediction error: this is what makes it a
+     * DELTA rule rather than plain accumulation. */
     for (int j = 0; j < dv; j++) o[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
+        float *row = S + (size_t)i * dv;
+        const float ki = k[i];
+        if (ki != 0.0f)
+            for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
         const float qi = q[i];
         if (qi == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
+    if (u != ustack) free(u);
 }
 
 /* ---------------------------------------------------------------- matmul ---- */
