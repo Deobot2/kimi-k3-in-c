@@ -1647,14 +1647,28 @@ void k3_decoder_layer_kv(float *h, float *block_residual, int *n_blocks,
          * the whole chunk; decode (T == 1) and the resident path fall straight through
          * to k3_moe inside, byte-identical. */
         k3_moe_prefill(tmp, hin, w->moe, c, T, idx, wt, sub);
+    } else if (T == 1) {
+        k3_mmw(dgu, hin, w->dense_gate, w->wdt, E, c->dense_inter);
+        k3_mmw(dgu + c->dense_inter, hin, w->dense_up, w->wdt, E, c->dense_inter);
+        k3_situ_glu(sub, dgu, c->dense_inter, c->situ_b1, c->situ_b2);
+        k3_mmw(tmp, sub, w->dense_down, w->wdt, c->dense_inter, E);
     } else {
-        for (int t = 0; t < T; t++) {
-            k3_mmw(dgu, hin + (size_t)t * E, w->dense_gate, w->wdt, E, c->dense_inter);
-            k3_mmw(dgu + c->dense_inter, hin + (size_t)t * E, w->dense_up, w->wdt,
-                      E, c->dense_inter);
-            k3_situ_glu(sub, dgu, c->dense_inter, c->situ_b1, c->situ_b2);
-            k3_mmw(tmp + (size_t)t * E, sub, w->dense_down, w->wdt, c->dense_inter, E);
-        }
+        /* Prefill: all T tokens per weight read, bit-identical to the T == 1 form per
+         * token. The [T] buffers are taken here rather than in the layer scratch, which
+         * would otherwise have to grow by 3*T*dense_inter for every layer to serve the
+         * one or two dense ones. */
+        const int DI = c->dense_inter;
+        const size_t n = (size_t)T * DI;
+        float *G = (float *)malloc(3 * n * sizeof(float));
+        if (!G) k3_fatal_oom("dense MLP prefill", 3 * n * sizeof(float));
+        float *U = G + n, *A = U + n;
+        k3_mmw_t(G, hin, w->dense_gate, w->wdt, E, DI, T);
+        k3_mmw_t(U, hin, w->dense_up,   w->wdt, E, DI, T);
+        for (int t = 0; t < T; t++)
+            k3_situ_glu2(A + (size_t)t * DI, G + (size_t)t * DI, U + (size_t)t * DI, DI,
+                         c->situ_b1, c->situ_b2);
+        k3_mmw_t(tmp, A, w->dense_down, w->wdt, DI, E, T);
+        free(G);
     }
 
     for (size_t i = 0; i < (size_t)T * E; i++) pref[i] += tmp[i];
