@@ -210,10 +210,11 @@ static inline float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
 /* See k3.h. Incremented whenever a streamed expert cannot be fetched. */
 long k3_expert_drops = 0;
 
-void k3_situ_glu(float *y, const float *x, int n, float b1, float b2)
+/* SiTU-GLU with gate and up in separate buffers. k3_situ_glu is this on [gate | up];
+ * the batched paths keep the two halves apart, and share the arithmetic by calling it. */
+static void k3_situ_glu2(float *y, const float *gate, const float *up, int n,
+                         float b1, float b2)
 {
-    const float *gate = x;
-    const float *up   = x + n;
     for (int i = 0; i < n; i++) {
         const float g = gate[i];
         /* The sigmoid takes the UNCAPPED gate. Feeding it the capped value instead
@@ -223,6 +224,11 @@ void k3_situ_glu(float *y, const float *x, int n, float b1, float b2)
         const float u = b2 * tanhf(up[i] / b2);
         y[i] = a * u;
     }
+}
+
+void k3_situ_glu(float *y, const float *x, int n, float b1, float b2)
+{
+    k3_situ_glu2(y, x, x + n, n, b1, b2);
 }
 
 /* ------------------------------------------------------------- ShortConv ---- */
@@ -1137,6 +1143,9 @@ size_t k3_moe_scratch(const K3Cfg *c)
  * out/x are [T][E], idx/wt scratch are topk-wide (reused per token), scratch is one
  * k3_moe_scratch. This path requires w->src (streamed); the resident path stays on
  * k3_moe, which is what the oracle gates exercise. */
+static void mxfp4_mm_gather(float *const *ys, const float *const *xs, int n,
+                            const unsigned char *packed, const unsigned char *scales,
+                            int in, int rows);
 static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
                               const K3Cfg *c, int T, float *scratch);
 
@@ -1198,18 +1207,35 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         float *wtt = rwt + (size_t)t * K;
         k3_router(it, wtt, xt, w->gate, w->bias, E, c->n_experts, K,
                   c->moe_renorm, c->routed_scale);
-        k3_mmw(zz + (size_t)t * Ll, xt, w->down, w->wdt, E, Ll);
         for (int j = 0; j < K; j++) {
             const int e = it[j];
             if (e >= 0 && e < c->n_experts && !seen[e]) { seen[e] = 1; uniq[nu++] = e; }
         }
     }
+    k3_mmw_t(zz, x, w->down, w->wdt, E, Ll, T);
 
-    /* 2. expert-major: fetch each unique expert ONCE, apply it to every (token, slot)
-     * that selected it. gu/act/edn are reused per (expert, token). */
-    float *gu  = scratch;                 /* [2*I] */
-    float *act = gu + 2 * I;              /* [I]   */
-    float *edn = act + I;                 /* [Ll]  */
+    /* 2. expert-major: fetch each unique expert ONCE, and apply it to every (token,
+     * slot) that selected it in ONE sweep of its bytes. A token routes to a given
+     * expert at most once, so at most T pairs share an expert. Each pair's result is
+     * bit-identical to running k3_matmul_mxfp4 on that token alone (mxfp4_mm_gather);
+     * what changes is that the 17.55 MB expert is walked, and its nibbles expanded,
+     * once per expert rather than once per token that chose it. */
+    float *G   = (float *)malloc((size_t)T * I * sizeof(float));
+    float *U   = (float *)malloc((size_t)T * I * sizeof(float));
+    float *A   = (float *)malloc((size_t)T * I * sizeof(float));
+    const float **xs = (const float **)malloc((size_t)T * sizeof(*xs));
+    float **gs = (float **)malloc((size_t)T * sizeof(*gs));
+    float **us = (float **)malloc((size_t)T * sizeof(*us));
+    const float **as = (const float **)malloc((size_t)T * sizeof(*as));
+    float **ds = (float **)malloc((size_t)T * sizeof(*ds));
+    if (!G || !U || !A || !xs || !gs || !us || !as || !ds)
+        k3_fatal_oom("MoE prefill expert batch", (size_t)3 * T * I * sizeof(float));
+    for (int t = 0; t < T; t++) {
+        gs[t] = G + (size_t)t * I;
+        us[t] = U + (size_t)t * I;
+        as[t] = A + (size_t)t * I;
+    }
+    (void)scratch;
     if (w->src->getmany) w->src->getmany(w->src, w->layer, uniq, nu);
     for (int u = 0; u < nu; u++) {
         const int e = uniq[u];
@@ -1220,25 +1246,28 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
                             "this chunk is CORRUPT\n", w->layer, e);
             continue;
         }
+        int n = 0;
         for (int t = 0; t < T; t++) {
-            const int   *it = ridx + (size_t)t * K;
-            const float *zt = zz  + (size_t)t * Ll;
+            const int *it = ridx + (size_t)t * K;
             for (int j = 0; j < K; j++) {
                 if (it[j] != e) continue;
-                k3_matmul_mxfp4(gu,     zt, q.p1, q.s1, Ll, I, K3_MXFP4_GROUP);
-                k3_matmul_mxfp4(gu + I, zt, q.p3, q.s3, Ll, I, K3_MXFP4_GROUP);
-                k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
-                k3_matmul_mxfp4(edn, act, q.p2, q.s2, I, Ll, K3_MXFP4_GROUP);
-                memcpy(contrib + ((size_t)t * K + j) * Ll, edn, (size_t)Ll * sizeof(float));
+                xs[n] = zz + (size_t)t * Ll;
+                ds[n] = contrib + ((size_t)t * K + j) * Ll;
+                n++;
             }
         }
+        mxfp4_mm_gather(gs, xs, n, q.p1, q.s1, Ll, I);
+        mxfp4_mm_gather(us, xs, n, q.p3, q.s3, Ll, I);
+        for (int k = 0; k < n; k++)
+            k3_situ_glu2(A + (size_t)k * I, gs[k], us[k], I, c->situ_b1, c->situ_b2);
+        mxfp4_mm_gather(ds, as, n, q.p2, q.s2, I, Ll);
     }
+    free(G); free(U); free(A); free(xs); free(gs); free(us); free(as); free(ds);
 
     /* 3. per token, sum contributions in the ORIGINAL top-k order, then the tail of the
-     * MoE exactly as k3_moe does it, so every float matches the per-token path. */
+     * MoE exactly as k3_moe does it, so every float matches the per-token path. The
+     * up-projection and the shared expert run over all T tokens per weight read. */
     for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
-        float *ot = out + (size_t)t * E;
         const float *wtt = rwt + (size_t)t * K;
         /* Reuse this token's now-dead down-projection slot as the aggregate. */
         float *acc = zz + (size_t)t * Ll;
@@ -1250,17 +1279,26 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         }
         if (c->latent_norm) k3_rmsnorm(acc, acc, w->latent_norm, Ll, c->rms_eps);
         if (g_cal && c->latent_norm) k3_calib_observe(K3_CAL_LAT, acc, 1, Ll);
-        k3_mmw(ot, acc, w->up, w->wdt, Ll, E);
-
-        float *sgu  = gu;                 /* [2*SI] */
-        float *sact = sgu + 2 * SI;       /* [SI]   */
-        float *sdn  = sact + SI;          /* [E]    */
-        k3_mmw(sgu,      xt, w->sh1, w->wdt, E, SI);
-        k3_mmw(sgu + SI, xt, w->sh3, w->wdt, E, SI);
-        k3_situ_glu(sact, sgu, SI, c->situ_b1, c->situ_b2);
-        k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
-        for (int i = 0; i < E; i++) ot[i] += sdn[i];
     }
+    k3_mmw_t(out, zz, w->up, w->wdt, Ll, E, T);
+
+    /* 6. shared expert on the ORIGINAL input, added unweighted. contrib is dead now,
+     * so its T*K*Ll floats hold the shared expert's buffers whenever they fit; when a
+     * config makes them larger, a separate buffer is taken. */
+    const size_t shn = (size_t)T * (3 * (size_t)SI + E);
+    float *shb = (shn <= (size_t)T * K * Ll) ? contrib
+                                             : (float *)malloc(shn * sizeof(float));
+    if (!shb) k3_fatal_oom("MoE prefill shared expert", shn * sizeof(float));
+    float *sg = shb, *su = sg + (size_t)T * SI, *sa = su + (size_t)T * SI;
+    float *sd = sa + (size_t)T * SI;
+    k3_mmw_t(sg, x, w->sh1, w->wdt, E, SI, T);
+    k3_mmw_t(su, x, w->sh3, w->wdt, E, SI, T);
+    for (int t = 0; t < T; t++)
+        k3_situ_glu2(sa + (size_t)t * SI, sg + (size_t)t * SI, su + (size_t)t * SI, SI,
+                     c->situ_b1, c->situ_b2);
+    k3_mmw_t(sd, sa, w->sh2, w->wdt, SI, E, T);
+    for (size_t i = 0; i < (size_t)T * E; i++) out[i] += sd[i];
+    if (shb != contrib) free(shb);
 
     free(ridx); free(rwt); free(zz); free(contrib); free(uniq); free(seen);
 }
@@ -1805,6 +1843,52 @@ static void k3_pair_init(void)
  * 1e-6 against dequantise-then-matmul on real checkpoint weights, gated by
  * tests/unit/test_expert.c. The margin is nine orders of magnitude.
  */
+/* The dot of one expanded MXFP4 group with the matching slice of x. Shared by the
+ * single- and multi-token row kernels so both run the same lanes and the same tree. */
+static inline double mxfp4_groupdot(const float *wf, const float *xg, int n)
+{
+    /* Two fused vector accumulators over the 32-element group, element i to
+     * accumulator (i/4)%2, lanewise-summed then cross-lane paired; the scalar
+     * path is the identical partition with fma(), which is the same IEEE
+     * operation, so both paths stay bit-identical. The split is written out
+     * rather than left to the compiler because a sequential floating-point
+     * reduction may not be reassociated without -ffast-math, which this build
+     * does not set. The group is short, so two accumulators suffice to break
+     * the add-latency chain.
+     *
+     * The lane split changes the summation order relative to a serial sum. See
+     * the accuracy contract on k3_matmul_mxfp4 for why that is bounded at
+     * ~1e-16 relative. */
+    double sub;
+    int i = 0;
+#if defined(__AVX2__)
+    {
+        __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
+        for (; i + 7 < n; i += 8) {
+            v0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(wf + i)),
+                                 _mm256_cvtps_pd(_mm_loadu_ps(xg + i)), v0);
+            v1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(wf + i + 4)),
+                                 _mm256_cvtps_pd(_mm_loadu_ps(xg + i + 4)), v1);
+        }
+        double a[4];
+        _mm256_storeu_pd(a, _mm256_add_pd(v0, v1));
+        sub = (a[0] + a[1]) + (a[2] + a[3]);
+    }
+#else
+    {
+        double s[8] = {0};
+        for (; i + 7 < n; i += 8)
+            for (int l = 0; l < 8; l++)
+                s[l] = fma((double)wf[i + l], (double)xg[i + l], s[l]);
+        double b0 = s[0] + s[4], b1 = s[1] + s[5];
+        double b2 = s[2] + s[6], b3 = s[3] + s[7];
+        sub = (b0 + b1) + (b2 + b3);
+    }
+#endif
+    for (; i < n; i++) sub = fma((double)wf[i], (double)xg[i], sub);
+    return sub;
+}
+
 /* ONE row of an MXFP4 matrix, dotted with x.
  *
  * Factored out so the two callers -- the routed experts, whose packed nibbles and E8M0
@@ -1842,53 +1926,69 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
             }
             if (n & 1) wf[n - 1] = K3_E2M1_PAIR[pb[half]][0];
 
-            /* Four double lanes partitioned by i%4, reduced as (s0+s1)+(s2+s3), in BOTH
-             * the scalar and the AVX2 path so the two agree bit for bit on every
-             * machine. The split is written out rather than left to the compiler
-             * because a sequential floating-point reduction may not be reassociated
-             * without -ffast-math, which this build does not set: expressed as one
-             * serial accumulator, the hottest loop in the engine compiles to scalar
-             * adds no matter what the surrounding code looks like.
-             *
-             * The lane split changes the summation order. See the accuracy contract on
-             * the function above for why that is bounded at ~1e-16 relative. */
-            /* Two fused vector accumulators over the 32-element group, element i to
-             * accumulator (i/4)%2, lanewise-summed then cross-lane paired; the scalar
-             * path is the identical partition with fma(), which is the same IEEE
-             * operation, so both paths stay bit-identical. Same reasoning as the
-             * fp32/bf16 kernels above; the group is short, so two accumulators
-             * suffice to break the add-latency chain. */
-            double sub;
-            int i = 0;
-#if defined(__AVX2__)
-            {
-                __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
-                for (; i + 7 < n; i += 8) {
-                    v0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(wf + i)),
-                                         _mm256_cvtps_pd(_mm_loadu_ps(xg + i)), v0);
-                    v1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(wf + i + 4)),
-                                         _mm256_cvtps_pd(_mm_loadu_ps(xg + i + 4)), v1);
-                }
-                double a[4];
-                _mm256_storeu_pd(a, _mm256_add_pd(v0, v1));
-                sub = (a[0] + a[1]) + (a[2] + a[3]);
-            }
-#else
-            {
-                double s[8] = {0};
-                for (; i + 7 < n; i += 8)
-                    for (int l = 0; l < 8; l++)
-                        s[l] = fma((double)wf[i + l], (double)xg[i + l], s[l]);
-                double b0 = s[0] + s[4], b1 = s[1] + s[5];
-                double b2 = s[2] + s[6], b3 = s[3] + s[7];
-                sub = (b0 + b1) + (b2 + b3);
-            }
-#endif
-            for (; i < n; i++) sub = fma((double)wf[i], (double)xg[i], sub);
+            const double sub = mxfp4_groupdot(wf, xg, n);
             acc += sub * (double)K3_E8M0[sb];
         }
     }
     return acc;
+}
+
+/* One MXFP4 row against up to K3_MX_NT tokens, expanding each group's nibbles ONCE.
+ *
+ * acc[k] is bit-identical to mxfp4_rowdot(xs[k], pr, sr, in, group): each token sums the
+ * same groups in the same order, each group through the same mxfp4_groupdot, scaled the
+ * same way. The expansion was the part repeated per token and is now shared. */
+#define K3_MX_NT 8
+static void mxfp4_rowdot_n(const float *const *xs, int nt, const unsigned char *pr,
+                           const unsigned char *sr, int in, int group, double *acc)
+{
+    const int ngrp  = (in + group - 1) / group;
+    const int gbyte = group / 2;
+    for (int k = 0; k < nt; k++) acc[k] = 0.0;
+    for (int g = 0; g < ngrp; g++) {
+        const unsigned char sb = sr[g];
+        if (sb == 255) continue;
+        const unsigned char *pb = pr + (size_t)g * gbyte;
+        int n = in - g * group;
+        if (n > group) n = group;
+        float wf[64];
+        const int half = n >> 1;
+        for (int j = 0; j < half; j++) {
+            const float *pv = K3_E2M1_PAIR[pb[j]];
+            wf[2 * j]     = pv[0];
+            wf[2 * j + 1] = pv[1];
+        }
+        if (n & 1) wf[n - 1] = K3_E2M1_PAIR[pb[half]][0];
+        const double sc = (double)K3_E8M0[sb];
+        for (int k = 0; k < nt; k++)
+            acc[k] += mxfp4_groupdot(wf, xs[k] + (size_t)g * group, n) * sc;
+    }
+}
+
+/* ys[k] = W . xs[k] for n gathered tokens, W in split MXFP4 planes (the routed-expert
+ * layout of k3_matmul_mxfp4). Each ys[k] is bit-identical to k3_matmul_mxfp4 on xs[k];
+ * the expert's bytes are walked once for all n tokens instead of n times. */
+static void mxfp4_mm_gather(float *const *ys, const float *const *xs, int n,
+                            const unsigned char *packed, const unsigned char *scales,
+                            int in, int rows)
+{
+    const int pcols = in / 2;
+    const int ngrp  = (in + K3_MXFP4_GROUP - 1) / K3_MXFP4_GROUP;
+    if (!k3_pair_ready)  k3_pair_init();
+    if (!k3_e8m0_ready)  k3_e8m0_init();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (rows > 64)
+#endif
+    for (int r = 0; r < rows; r++) {
+        const unsigned char *pr = packed + (size_t)r * pcols;
+        const unsigned char *sr = scales + (size_t)r * ngrp;
+        for (int k0 = 0; k0 < n; k0 += K3_MX_NT) {
+            const int nt = (n - k0 < K3_MX_NT) ? n - k0 : K3_MX_NT;
+            double acc[K3_MX_NT];
+            mxfp4_rowdot_n(xs + k0, nt, pr, sr, in, K3_MXFP4_GROUP, acc);
+            for (int k = 0; k < nt; k++) ys[k0 + k][r] = (float)acc[k];
+        }
+    }
 }
 
 void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,

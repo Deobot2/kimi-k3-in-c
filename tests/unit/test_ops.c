@@ -1075,6 +1075,99 @@ static void t_mmw_t(void)
     }
 }
 
+/* The batched MoE prefill must equal per-token k3_moe EXACTLY.
+ *
+ * k3_moe_prefill reorders WHICH expert is fetched when and walks each one once for every
+ * token that chose it, but promises that every output float is the one the per-token
+ * path would produce. Nothing else in the weightless suite drives the batched path
+ * (it needs a streamed source and T > 1), so without this a broken gather, a token
+ * written to the wrong top-k slot, or a reordered sum would only surface on real
+ * weights. The source below serves MXFP4 experts from memory, with NaN scale bytes
+ * sprinkled in; T = 11 and few experts force several tokens per expert, and topk = 3
+ * makes slots and tokens easy to confuse. */
+typedef struct { unsigned char *p[3], *s[3]; } MoeT_Exp;
+static MoeT_Exp *g_moet;
+static int moet_get(struct K3ExpertSrc *self, int layer, int e, K3ExpertQ *q)
+{
+    (void)self; (void)layer;
+    q->p1 = g_moet[e].p[0]; q->s1 = g_moet[e].s[0];
+    q->p3 = g_moet[e].p[1]; q->s3 = g_moet[e].s[1];
+    q->p2 = g_moet[e].p[2]; q->s2 = g_moet[e].s[2];
+    return 0;
+}
+
+static void t_moe_prefill(void)
+{
+    K3Cfg c; memset(&c, 0, sizeof c);
+    c.hidden = 96; c.latent = 64; c.moe_inter = 96; c.n_shared = 1;
+    c.n_experts = 6; c.topk = 3; c.moe_renorm = 1; c.routed_scale = 2.5f;
+    c.latent_norm = 1; c.situ_b1 = 3.0f; c.situ_b2 = 4.0f; c.rms_eps = 1e-6f;
+    const int T = 11, E = c.hidden, L = c.latent, I = c.moe_inter, NE = c.n_experts;
+
+    unsigned s = 0x0E0Eu;
+    #define MOET_R() (s ^= s << 13, s ^= s >> 17, s ^= s << 5, \
+                      ((float)(s >> 8) / 8388608.0f - 1.0f))
+    float *gate = (float *)malloc((size_t)NE * E * sizeof(float));
+    float *down = (float *)malloc((size_t)L * E * sizeof(float));
+    float *up   = (float *)malloc((size_t)E * L * sizeof(float));
+    float *sh1  = (float *)malloc((size_t)I * E * sizeof(float));
+    float *sh3  = (float *)malloc((size_t)I * E * sizeof(float));
+    float *sh2  = (float *)malloc((size_t)E * I * sizeof(float));
+    float *ln   = (float *)malloc((size_t)L * sizeof(float));
+    float *x    = (float *)malloc((size_t)T * E * sizeof(float));
+    float *ya   = (float *)malloc((size_t)T * E * sizeof(float));
+    float *yb   = (float *)malloc((size_t)T * E * sizeof(float));
+    float *scr  = (float *)malloc(k3_moe_scratch(&c) * sizeof(float));
+    g_moet = (MoeT_Exp *)calloc((size_t)NE, sizeof(MoeT_Exp));
+    if (!gate || !down || !up || !sh1 || !sh3 || !sh2 || !ln || !x || !ya || !yb || !scr
+        || !g_moet) { printf("  FAIL  moe_prefill (alloc)\n"); g_fail++; return; }
+    for (int i = 0; i < NE * E; i++) gate[i] = 0.3f * MOET_R();
+    for (int i = 0; i < L * E; i++)  { down[i] = 0.1f * MOET_R(); up[i] = 0.1f * MOET_R(); }
+    for (int i = 0; i < I * E; i++)  { sh1[i] = 0.1f * MOET_R(); sh3[i] = 0.1f * MOET_R();
+                                       sh2[i] = 0.1f * MOET_R(); }
+    for (int i = 0; i < L; i++) ln[i] = 1.0f + 0.2f * MOET_R();
+    for (int i = 0; i < T * E; i++) x[i] = MOET_R();
+    /* gate/up are [I][L], down is [L][I] */
+    const int ins[3] = { L, L, I }, rows[3] = { I, I, L };
+    for (int e = 0; e < NE; e++)
+        for (int m = 0; m < 3; m++) {
+            const size_t pb = (size_t)rows[m] * ins[m] / 2, sb = (size_t)rows[m] * ins[m] / 32;
+            g_moet[e].p[m] = (unsigned char *)malloc(pb);
+            g_moet[e].s[m] = (unsigned char *)malloc(sb);
+            for (size_t i = 0; i < pb; i++) { (void)MOET_R(); g_moet[e].p[m][i] = (unsigned char)(s >> 7); }
+            for (size_t i = 0; i < sb; i++) {
+                (void)MOET_R();
+                g_moet[e].s[m][i] = (s % 17 == 0) ? 255 : (unsigned char)(118 + s % 8);
+            }
+        }
+    #undef MOET_R
+
+    K3ExpertSrc src; memset(&src, 0, sizeof src);
+    src.get = moet_get;
+    K3MoeW w; memset(&w, 0, sizeof w);
+    w.gate = gate; w.down = down; w.up = up; w.sh1 = sh1; w.sh3 = sh3; w.sh2 = sh2;
+    w.latent_norm = ln; w.wdt = K3_WF32; w.src = &src;
+
+    int idx[K3_MAX_TOPK]; float wt[K3_MAX_TOPK];
+    k3_moe(ya, x, &w, &c, T, idx, wt, scr);
+    k3_moe_prefill(yb, x, &w, &c, T, idx, wt, scr);
+    if (memcmp(ya, yb, (size_t)T * E * sizeof(float)) == 0) {
+        printf("  PASS  moe_prefill    %d tokens, %d experts top-%d: batched bit-identical "
+               "to per-token\n", T, NE, c.topk);
+        g_pass++;
+    } else {
+        int bad = 0;
+        for (int i = 0; i < T * E; i++) if (ya[i] != yb[i]) bad++;
+        printf("  FAIL  moe_prefill    %d of %d outputs differ from per-token k3_moe\n",
+               bad, T * E);
+        g_fail++;
+    }
+    for (int e = 0; e < NE; e++)
+        for (int m = 0; m < 3; m++) { free(g_moet[e].p[m]); free(g_moet[e].s[m]); }
+    free(g_moet); free(gate); free(down); free(up); free(sh1); free(sh3); free(sh2);
+    free(ln); free(x); free(ya); free(yb); free(scr);
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -1113,6 +1206,7 @@ int main(int argc, char **argv)
     t_mxfp4(dir);
     t_matmul_bf16();
     t_mmw_t();
+    t_moe_prefill();
     t_kda_layer(dir, "kda_layer1");
     t_kda_layer(dir, "kda_layer8");
     t_layer(dir, "layer_kda");
