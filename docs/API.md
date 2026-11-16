@@ -91,6 +91,13 @@ typed matmuls directly, and size a row with `k3_row_bytes()` rather than multipl
 an element size — `K3_WI8` and `K3_WMX4` carry their scales inline, so a row is not
 `in * sizeof(element)`.
 
+For several tokens against the same matrix, use `k3_mmw_t(Y, X, W, wdt, in, out, T)`
+(X is `[T][in]`, Y is `[T][out]`), or `k3_mmw_ts` with explicit row strides when only a
+prefix of each input row is multiplied. Each `Y[t]` is **bit-identical** to `k3_mmw` on
+`X[t]` (both run the same per-row kernel, and `test_ops` checks it with `memcmp` in every
+format); the difference is that each weight row is read once for all T tokens. The layer
+functions already use it whenever they are called with T > 1.
+
 The tag is per STRUCT, not per tensor. A layer whose matmul weights are not all in the
 same format cannot be described, which is why the binder refuses one rather than picking
 a tag and reading the rest as the wrong bytes.

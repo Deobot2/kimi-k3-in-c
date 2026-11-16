@@ -71,6 +71,23 @@ not needing the bytes at all.
 
 ### Changed
 
+- **Multi-token trunk matmuls (`k3_mmw_t`, `k3_mmw_ts`)**, bit-identical per token to
+  `k3_mmw`. Every layer function now reads each trunk matrix once per call instead of
+  once per token, so a T-token prefill or speculative verify stops re-streaming the
+  trunk T times. On AVX2, bf16 rows are dotted two tokens at a time with the widen
+  shared. Measured on one KDA layer at T=32: ~250-330 ms to ~165-200 ms.
+- **Batched MoE prefill walks each expert once for all its tokens**, expanding each MXFP4
+  group once for up to eight tokens. One MoE layer at T=32: ~3.0 s to ~1.1-1.3 s.
+  `test_ops` gains `moe_prefill`, the first weightless test that reaches the batched path.
+- **Head-parallel MLA attention** in both cache layouts (the head loop was serial), and
+  **eight-way interleaved score dots** for cached positions, the router and the
+  transposed `k3_matmul_tr`. All bit-identical: the summation order of every output is
+  unchanged, only independent chains are overlapped. Decode at span 2048: ~100 ms to
+  ~25 ms per MLA layer on 4 cores; router ~1.2 ms to ~0.8 ms per call; `k3_matmul_tr`
+  2-7x depending on format.
+- **KDA recurrence step**: two passes over the per-head state instead of four, and no
+  allocation per call. Bit-identical; wall time within noise on the test machine.
+
 - **Expert cache replacement is S3-FIFO, not LRU.** The project's own simulator put 25.5
   points between LRU and Belady at 64 GB, and its own conclusion was that the lever is the
   policy rather than the size. Small FIFO, main FIFO, ghost queue; uniform object size
