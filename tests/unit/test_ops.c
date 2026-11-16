@@ -1012,6 +1012,69 @@ static void t_matmul_bf16(void)
     free(Wb); free(Wf); free(x); free(ya); free(yb);
 }
 
+/* k3_mmw_t must equal k3_mmw applied token by token, EXACTLY, in every weight format.
+ *
+ * The multi-token form exists only to change memory traffic, so any numeric difference
+ * at all means it is not running the same per-row kernel, and the prefill and the
+ * decode of the same token would then disagree. A tolerance would hide that. Shapes are
+ * odd where the format allows, so the tail loops after each vector stride are covered;
+ * MXFP4 widths must be multiples of 32, and its scale bytes include the NaN value 255
+ * so the skipped-group path is exercised too. */
+static void t_mmw_t(void)
+{
+    const int T = 5;
+    const int fmts[4] = { K3_WF32, K3_WBF16, K3_WI8, K3_WMX4 };
+    const char *nm[4] = { "f32", "bf16", "i8", "mx4" };
+    for (int f = 0; f < 4; f++) {
+        const int wdt = fmts[f];
+        const int in  = (wdt == K3_WMX4) ? 224 : 263;
+        const int out = 131;
+        const size_t rb = k3_row_bytes(wdt, in);
+        unsigned char *W = (unsigned char *)malloc(rb * out);
+        float *X  = (float *)malloc((size_t)T * in * sizeof(float));
+        float *Ya = (float *)malloc((size_t)T * out * sizeof(float));
+        float *Yb = (float *)malloc((size_t)T * out * sizeof(float));
+        if (!W || !X || !Ya || !Yb) { printf("  FAIL  mmw_t %s (alloc)\n", nm[f]); g_fail++; }
+        else {
+            unsigned s = 0xBADC0DEu + (unsigned)f;
+            for (int o = 0; o < out; o++) {
+                unsigned char *row = W + (size_t)o * rb;
+                for (int i = 0; i < in; i++) {
+                    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                    const float v = ((float)(s >> 8) / 8388608.0f - 1.0f) * 0.1f;
+                    if (wdt == K3_WF32)      memcpy(row + 4 * (size_t)i, &v, 4);
+                    else if (wdt == K3_WBF16) {
+                        uint32_t u; memcpy(&u, &v, 4);
+                        const uint16_t b = (uint16_t)(u >> 16);
+                        memcpy(row + 2 * (size_t)i, &b, 2);
+                    } else if (wdt == K3_WI8) row[4 + i] = (unsigned char)(s >> 3);
+                    else if (i < in / 2)      row[i] = (unsigned char)(s >> 5);
+                }
+                if (wdt == K3_WI8) { const float sc = 0.01f + 0.001f * (float)o; memcpy(row, &sc, 4); }
+                if (wdt == K3_WMX4)
+                    for (int g = 0; g < in / 32; g++)
+                        row[in / 2 + g] = (g == 3 && o % 5 == 0) ? 255 : (unsigned char)(120 + (o + g) % 12);
+            }
+            for (int i = 0; i < T * in; i++) {
+                s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                X[i] = (float)(s >> 8) / 8388608.0f - 1.0f;
+            }
+            for (int t = 0; t < T; t++)
+                k3_mmw(Ya + (size_t)t * out, X + (size_t)t * in, W, wdt, in, out);
+            k3_mmw_t(Yb, X, W, wdt, in, out, T);
+            if (memcmp(Ya, Yb, (size_t)T * out * sizeof(float)) == 0) {
+                printf("  PASS  mmw_t %-5s    %d tokens x %d rows bit-identical to k3_mmw\n",
+                       nm[f], T, out);
+                g_pass++;
+            } else {
+                printf("  FAIL  mmw_t %-5s    differs from k3_mmw token by token\n", nm[f]);
+                g_fail++;
+            }
+        }
+        free(W); free(X); free(Ya); free(Yb);
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -1049,6 +1112,7 @@ int main(int argc, char **argv)
     t_moe(dir);
     t_mxfp4(dir);
     t_matmul_bf16();
+    t_mmw_t();
     t_kda_layer(dir, "kda_layer1");
     t_kda_layer(dir, "kda_layer8");
     t_layer(dir, "layer_kda");

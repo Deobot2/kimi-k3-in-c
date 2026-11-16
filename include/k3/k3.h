@@ -455,6 +455,14 @@ static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
     else                      k3_matmul(y, x, (const float *)W, in, out);
 }
 
+/* k3_mmw over T tokens at once: Y[t] = W . X[t], with X [T][in] and Y [T][out].
+ *
+ * Y[t] is BIT-IDENTICAL to k3_mmw(Y[t], X[t], ...): both run the same per-row kernel on
+ * each (token, row) pair. What changes is memory traffic. A T-token prefill or
+ * speculative verify through k3_mmw re-reads the whole matrix from DRAM once per token;
+ * this fetches each row once and dots it against every token while it is in L1. */
+void k3_mmw_t(float *Y, const float *X, const void *W, int wdt, int in, int out, int T);
+
 /* Byte stride of one row for a per-row int8 matrix: the f32 scale plus `in` int8 weights.
  * bf16 and fp32 are per-element and take the element form. */
 static inline size_t k3_wsz(int wdt) { return wdt == K3_WBF16 ? 2u : 4u; }
