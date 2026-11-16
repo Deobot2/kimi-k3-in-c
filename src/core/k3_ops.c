@@ -424,6 +424,33 @@ static void k3_thread_scores_free(float *row, float *scratch_row)
     if (row != scratch_row) free(row);
 }
 
+/* d[k] += q . c[k] over n terms, for nk <= K3_DOT_NK independent vectors c[k], each
+ * summed STRICTLY in index order into its own double with a mul then an add. That is
+ * exactly the serial loop `for i: d += (double)q[i] * (double)c[i]`, so every d[k] is
+ * bit-identical to it; the k-loop only interleaves chains that never interact. A single
+ * such chain is bound by add latency, and the attention score loops below were made of
+ * nothing else, one chain per cached position. */
+#define K3_DOT_NK 8
+static inline void k3_dot_seq_n(double *d, const float *q, const float *const *c,
+                                int nk, int n)
+{
+    if (nk == K3_DOT_NK) {
+        double a[K3_DOT_NK];
+        for (int k = 0; k < K3_DOT_NK; k++) a[k] = d[k];
+        for (int i = 0; i < n; i++) {
+            const double qi = (double)q[i];
+            for (int k = 0; k < K3_DOT_NK; k++) a[k] += qi * (double)c[k][i];
+        }
+        for (int k = 0; k < K3_DOT_NK; k++) d[k] = a[k];
+        return;
+    }
+    for (int k = 0; k < nk; k++) {
+        double a = d[k];
+        for (int i = 0; i < n; i++) a += (double)q[i] * (double)c[k][i];
+        d[k] = a;
+    }
+}
+
 /* ------------------------------------------------------------- Gated MLA ---- */
 /* MLA with an optional KV cache, which is what makes incremental decode possible.
  *
@@ -530,16 +557,23 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         for (int h = 0; h < H; h++) {
             const float *qt = q + ((size_t)t * H + h) * qh;
             float m = -INFINITY;
-            for (int s = 0; s <= p; s++) {                 /* causal: s <= p */
-                const float *ks = K3_KV_AT(s) + (size_t)h * kvd;
-                const float *kr = K3_ROPE_AT(s);           /* shared slot */
-                double d = 0.0;
-                for (int i = 0; i < qn; i++) d += (double)qt[i] * (double)ks[i];
+            for (int s0 = 0; s0 <= p; s0 += K3_DOT_NK) {   /* causal: s <= p */
+                const int nk = (p + 1 - s0 < K3_DOT_NK) ? p + 1 - s0 : K3_DOT_NK;
+                const float *ks[K3_DOT_NK], *kr[K3_DOT_NK];
+                double d[K3_DOT_NK];
+                for (int k = 0; k < nk; k++) {
+                    ks[k] = K3_KV_AT(s0 + k) + (size_t)h * kvd;
+                    kr[k] = K3_ROPE_AT(s0 + k);            /* shared slot */
+                    d[k]  = 0.0;
+                }
+                k3_dot_seq_n(d, qt, ks, nk, qn);
                 /* the rope slot is UNROTATED but still scored, and the SAME 64
                  * values serve every head. Dropping this term is the silent bug. */
-                for (int i = 0; i < qr; i++) d += (double)qt[qn + i] * (double)kr[i];
-                sct[s] = (float)d * scale;
-                if (sct[s] > m) m = sct[s];
+                k3_dot_seq_n(d, qt + qn, kr, nk, qr);
+                for (int k = 0; k < nk; k++) {
+                    sct[s0 + k] = (float)d[k] * scale;
+                    if (sct[s0 + k] > m) m = sct[s0 + k];
+                }
             }
             double z = 0.0;
             for (int s = 0; s <= p; s++) { sct[s] = expf(sct[s] - m); z += sct[s]; }
@@ -696,18 +730,25 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
             for (int pass = 0; pass < 2; pass++) {
                 const int a = pass ? s0 : 0;
                 const int b = pass ? p : nsink - 1;
-                for (int s = a; s <= b; s++) {
-                    const int slot = k3_kv_slot(kv, s);
-                    const float *cs = kv->lat + (size_t)slot * kvw;
-                    double d = 0.0;
-                    for (int i = 0; i < kl; i++) d += (double)qah[i] * (double)cs[i];
+                for (int s = a; s <= b; s += K3_DOT_NK) {
+                    const int nk = (b + 1 - s < K3_DOT_NK) ? b + 1 - s : K3_DOT_NK;
+                    const float *cs[K3_DOT_NK], *cr[K3_DOT_NK];
+                    double d[K3_DOT_NK];
+                    for (int k = 0; k < nk; k++) {
+                        cs[k] = kv->lat + (size_t)k3_kv_slot(kv, s + k) * kvw;
+                        cr[k] = cs[k] + kl;
+                        d[k]  = 0.0;
+                    }
+                    k3_dot_seq_n(d, qah, cs, nk, kl);
                     /* the rope slot is UNROTATED but still scored, and the SAME 64
                      * values serve every head -- here they are simply the tail of the
                      * cached latent rather than a separate array */
-                    for (int i = 0; i < qr; i++) d += (double)qrh[i] * (double)cs[kl + i];
-                    sct[n] = (float)d * scale;
-                    if (sct[n] > m) m = sct[n];
-                    n++;
+                    k3_dot_seq_n(d, qrh, cr, nk, qr);
+                    for (int k = 0; k < nk; k++) {
+                        sct[n] = (float)d[k] * scale;
+                        if (sct[n] > m) m = sct[n];
+                        n++;
+                    }
                 }
             }
             double z = 0.0;
