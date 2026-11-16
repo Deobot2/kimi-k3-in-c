@@ -30,6 +30,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
@@ -386,6 +389,30 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
     }
 }
 
+/* A per-thread row of attention scores for the head-parallel MLA loops.
+ *
+ * Thread 0 (and therefore any serial run) uses the row the caller's scratch already
+ * holds, so a single-threaded build allocates nothing new. Every other thread takes
+ * its own row for the duration of one parallel region, once, not once per head. The
+ * rows are only ever written before they are read, so their contents never matter. */
+static float *k3_thread_scores(float *scratch_row, size_t n)
+{
+#ifdef _OPENMP
+    if (omp_get_thread_num() != 0) {
+        float *r = (float *)malloc(n * sizeof(float));
+        if (!r) k3_fatal_oom("per-thread attention scores", n * sizeof(float));
+        return r;
+    }
+#endif
+    (void)n;
+    return scratch_row;
+}
+
+static void k3_thread_scores_free(float *row, float *scratch_row)
+{
+    if (row != scratch_row) free(row);
+}
+
 /* ------------------------------------------------------------- Gated MLA ---- */
 /* MLA with an optional KV cache, which is what makes incremental decode possible.
  *
@@ -465,9 +492,23 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         k3_mmw(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, H * kvd);
     }
 
-    /* ---- attention, per head, causal ---- */
+    /* ---- attention, per head, causal ----
+     * Heads are independent: each reads the shared cache and writes only its own vh
+     * slice of acc, so they run in parallel with every head's arithmetic, and therefore
+     * the result, identical at any thread count. The score row is per THREAD, not the
+     * one in scratch, so the scratch contract is unchanged. At long context this loop is
+     * span * H * (qh + vh) multiply-adds per token per layer; serial, it was the largest
+     * single-threaded cost left in decode. */
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
+#ifdef _OPENMP
+#       pragma omp parallel if (H > 1 && p > 0)
+#endif
+        {
+        float *sct = k3_thread_scores(sc, (size_t)p + 1);
+#ifdef _OPENMP
+#       pragma omp for schedule(static)
+#endif
         for (int h = 0; h < H; h++) {
             const float *qt = q + ((size_t)t * H + h) * qh;
             float m = -INFINITY;
@@ -479,19 +520,21 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                 /* the rope slot is UNROTATED but still scored, and the SAME 64
                  * values serve every head. Dropping this term is the silent bug. */
                 for (int i = 0; i < qr; i++) d += (double)qt[qn + i] * (double)kr[i];
-                sc[s] = (float)d * scale;
-                if (sc[s] > m) m = sc[s];
+                sct[s] = (float)d * scale;
+                if (sct[s] > m) m = sct[s];
             }
             double z = 0.0;
-            for (int s = 0; s <= p; s++) { sc[s] = expf(sc[s] - m); z += sc[s]; }
+            for (int s = 0; s <= p; s++) { sct[s] = expf(sct[s] - m); z += sct[s]; }
 
             float *o = acc + (size_t)h * vh;
             for (int j = 0; j < vh; j++) o[j] = 0.0f;
             for (int s = 0; s <= p; s++) {
-                const float pr = (float)(sc[s] / z);
+                const float pr = (float)(sct[s] / z);
                 const float *vs = K3_KV_AT(s) + (size_t)h * kvd + qn;
                 for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
             }
+        }
+        k3_thread_scores_free(sct, sc);
         }
 
         /* ---- output gate then projection. Gate BEFORE o_proj, and no norm on it,
@@ -602,6 +645,19 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         const int s0 = k3_kv_first(kv, p);
         int nsink = kv->window ? kv->sinks : 0;
         if (nsink > p + 1) nsink = p + 1;
+        /* Head-parallel, exactly as in k3_mla_cached: heads share the read-only cache
+         * and write disjoint vh slices of acc. Each thread needs its own score row AND
+         * its own latent sum; thread 0 uses the ones in scratch. */
+        const int nspan = nsink + (p - s0 + 1);
+#ifdef _OPENMP
+#       pragma omp parallel if (H > 1 && p > 0)
+#endif
+        {
+        float *sct = k3_thread_scores(sc, (size_t)nspan + (size_t)kl);
+        float *alt = (sct == sc) ? al : sct + nspan;
+#ifdef _OPENMP
+#       pragma omp for schedule(static)
+#endif
         for (int h = 0; h < H; h++) {
             const float *qah = qa + (size_t)h * kl;
             const float *qrh = qt + (size_t)h * qh + qn;   /* the unrotated rope slots */
@@ -621,32 +677,34 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                      * values serve every head -- here they are simply the tail of the
                      * cached latent rather than a separate array */
                     for (int i = 0; i < qr; i++) d += (double)qrh[i] * (double)cs[kl + i];
-                    sc[n] = (float)d * scale;
-                    if (sc[n] > m) m = sc[n];
+                    sct[n] = (float)d * scale;
+                    if (sct[n] > m) m = sct[n];
                     n++;
                 }
             }
             double z = 0.0;
-            for (int i = 0; i < n; i++) { sc[i] = expf(sc[i] - m); z += sc[i]; }
+            for (int i = 0; i < n; i++) { sct[i] = expf(sct[i] - m); z += sct[i]; }
 
             /* weighted sum IN LATENT SPACE, then one W_UV per head. This is the second
              * half of the absorption: the 512-wide sum happens once, the 24576x512
              * expansion never happens at all. */
-            for (int i = 0; i < kl; i++) al[i] = 0.0f;
+            for (int i = 0; i < kl; i++) alt[i] = 0.0f;
             n = 0;
             for (int pass = 0; pass < 2; pass++) {
                 const int a = pass ? s0 : 0;
                 const int b = pass ? p : nsink - 1;
                 for (int s = a; s <= b; s++) {
                     const int slot = k3_kv_slot(kv, s);
-                    const float pr = (float)(sc[n++] / z);
+                    const float pr = (float)(sct[n++] / z);
                     const float *cs = kv->lat + (size_t)slot * kvw;
-                    for (int i = 0; i < kl; i++) al[i] += pr * cs[i];
+                    for (int i = 0; i < kl; i++) alt[i] += pr * cs[i];
                 }
             }
             const unsigned char *wuv =
                 (const unsigned char *)w->kv_b + (size_t)(h * kvd + qn) * kvb_row;
-            k3_mmw(acc + (size_t)h * vh, al, wuv, w->wdt, kl, vh);
+            k3_mmw(acc + (size_t)h * vh, alt, wuv, w->wdt, kl, vh);
+        }
+        k3_thread_scores_free(sct, sc);
         }
 
         /* ---- gate then projection, unchanged: the gate is why W_UV could not be
