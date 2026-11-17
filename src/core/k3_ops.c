@@ -1710,6 +1710,56 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
  * determinism contract (K3_WI8 is draft-only, and the exact model decides every emitted
  * token), so it accumulates in float with fused products and the natural AVX2 reduction,
  * which is what makes it fast. */
+/* rowdot_bf16 for TWO tokens against the same row, converting each 16-element chunk of
+ * the row to double once and using it twice. Each token keeps its own four
+ * accumulators fed in exactly rowdot_bf16's order, and the reductions and scalar tail
+ * are rowdot_bf16's, so r0 and r1 are bit-identical to two separate calls; only the
+ * bf16 -> double conversion, which is most of this kernel's work once the weights are
+ * in cache, is shared. Without AVX2 it IS two calls. */
+static inline void rowdot2_bf16(const uint16_t *row, const float *x0, const float *x1,
+                                int in, double *r0, double *r1)
+{
+#if defined(__AVX2__)
+    __m256d a0 = _mm256_setzero_pd(), a1 = _mm256_setzero_pd();
+    __m256d a2 = _mm256_setzero_pd(), a3 = _mm256_setzero_pd();
+    __m256d b0 = _mm256_setzero_pd(), b1 = _mm256_setzero_pd();
+    __m256d b2 = _mm256_setzero_pd(), b3 = _mm256_setzero_pd();
+    int i = 0;
+    for (; i + 15 < in; i += 16) {
+        const __m256d w0 = _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(
+            _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(row + i))), 16)));
+        const __m256d w1 = _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(
+            _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(row + i + 4))), 16)));
+        const __m256d w2 = _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(
+            _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(row + i + 8))), 16)));
+        const __m256d w3 = _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(
+            _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(row + i + 12))), 16)));
+        a0 = _mm256_fmadd_pd(w0, _mm256_cvtps_pd(_mm_loadu_ps(x0 + i)),      a0);
+        a1 = _mm256_fmadd_pd(w1, _mm256_cvtps_pd(_mm_loadu_ps(x0 + i + 4)),  a1);
+        a2 = _mm256_fmadd_pd(w2, _mm256_cvtps_pd(_mm_loadu_ps(x0 + i + 8)),  a2);
+        a3 = _mm256_fmadd_pd(w3, _mm256_cvtps_pd(_mm_loadu_ps(x0 + i + 12)), a3);
+        b0 = _mm256_fmadd_pd(w0, _mm256_cvtps_pd(_mm_loadu_ps(x1 + i)),      b0);
+        b1 = _mm256_fmadd_pd(w1, _mm256_cvtps_pd(_mm_loadu_ps(x1 + i + 4)),  b1);
+        b2 = _mm256_fmadd_pd(w2, _mm256_cvtps_pd(_mm_loadu_ps(x1 + i + 8)),  b2);
+        b3 = _mm256_fmadd_pd(w3, _mm256_cvtps_pd(_mm_loadu_ps(x1 + i + 12)), b3);
+    }
+    double t[4];
+    _mm256_storeu_pd(t, _mm256_add_pd(_mm256_add_pd(a0, a1), _mm256_add_pd(a2, a3)));
+    double acc0 = (t[0] + t[1]) + (t[2] + t[3]);
+    _mm256_storeu_pd(t, _mm256_add_pd(_mm256_add_pd(b0, b1), _mm256_add_pd(b2, b3)));
+    double acc1 = (t[0] + t[1]) + (t[2] + t[3]);
+    for (; i < in; i++) {
+        const double wi = (double)k3_bf16f(row[i]);
+        acc0 = fma(wi, (double)x0[i], acc0);
+        acc1 = fma(wi, (double)x1[i], acc1);
+    }
+    *r0 = acc0; *r1 = acc1;
+#else
+    *r0 = rowdot_bf16(row, x0, in);
+    *r1 = rowdot_bf16(row, x1, in);
+#endif
+}
+
 /* One row of k3_matmul_q8: [f32 scale][int8 * in]. */
 static inline float rowdot_q8(const unsigned char *row, const float *x, int in)
 {
@@ -1966,7 +2016,17 @@ void k3_mmw_strided(float *y, size_t ldy, const float *x, size_t ldx,
 #endif
         for (int o = 0; o < out; o++) {
             const unsigned char *row = base + (size_t)o * rb;
-            for (int t = t0; t < t1; t++) {
+            int t = t0;
+            if (wdt == K3_WBF16)                   /* pairs share the row conversion */
+                for (; t + 1 < t1; t += 2) {
+                    double r0, r1;
+                    rowdot2_bf16((const uint16_t *)(const void *)row,
+                                 x + (size_t)t * ldx, x + (size_t)(t + 1) * ldx, in,
+                                 &r0, &r1);
+                    y[(size_t)t * ldy + o]       = (float)r0;
+                    y[(size_t)(t + 1) * ldy + o] = (float)r1;
+                }
+            for (; t < t1; t++) {
                 const float *xt = x + (size_t)t * ldx;
                 float r;
                 if (wdt == K3_WBF16)
