@@ -60,6 +60,25 @@ static const float K3_E2M1[16] = {
    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
 };
 
+/* OCP MX E8M0: a bare biased exponent, 2^(b-127), built from its bits rather than by
+ * ldexpf. Bytes 1..254 are normal floats whose exponent field IS the byte; byte 0 is
+ * 2^-127 = 2^22 * 2^-149, the subnormal with only mantissa bit 22 set. Both are exact,
+ * so this equals ldexpf(1.0f, b - 127) bit for bit; test_ops checks all 256 bytes
+ * through k3_mxfp4_dequant, and caught an off-by-one in the subnormal bit while this
+ * was being written. 255 is NaN by spec; callers skip it, and this maps it to zero.
+ *
+ * Why not ldexpf: it is a library call the compiler will not inline, and
+ * k3_matmul_tr's MXFP4 sweep made one PER ELEMENT. Why not a table: a lazily-filled
+ * table needs an init that is racy when the first caller is already inside a parallel
+ * region, which k3_matmul_tr's caller is. */
+static inline float k3_e8m0f(unsigned char b)
+{
+    const uint32_t u = (b == 255) ? 0u : (b == 0) ? (uint32_t)1u << 22 : (uint32_t)b << 23;
+    float f;
+    memcpy(&f, &u, sizeof f);
+    return f;
+}
+
 static void k3_fatal_oom(const char *what, size_t bytes)
 {
     fprintf(stderr,
@@ -791,7 +810,7 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
                 const unsigned char sb = row[pn + grp];
                 if (sb == 255) continue;              /* NaN scale: contributes nothing */
                 const unsigned char nib = odd ? (row[byte] >> 4) : (row[byte] & 0x0F);
-                acc += (double)x[r] * (double)K3_E2M1[nib] * (double)ldexpf(1.0f, (int)sb - 127);
+                acc += (double)x[r] * (double)K3_E2M1[nib] * (double)k3_e8m0f(sb);
             }
             y[j] = (float)acc;
         }
@@ -1684,17 +1703,6 @@ static void k3_pair_init(void)
     k3_pair_ready = 1;
 }
 
-/* E8M0 byte to its power of two. 255 is NaN by spec and maps to zero. Precomputed
- * because ldexpf in the group loop is a function call the compiler will not inline
- * into a vectorised body. */
-static float K3_E8M0[256];
-static int   k3_e8m0_ready = 0;
-
-static void k3_e8m0_init(void)
-{
-    for (int b = 0; b < 256; b++) K3_E8M0[b] = (b == 255) ? 0.0f : ldexpf(1.0f, b - 127);
-    k3_e8m0_ready = 1;
-}
 
 /* y[rows] = W[rows][in] . x[in], with W read straight out of packed MXFP4 and never
  * materialised as floats. This is not an optimisation; it is what makes streaming
@@ -1807,7 +1815,7 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
             }
 #endif
             for (; i < n; i++) sub = fma((double)wf[i], (double)xg[i], sub);
-            acc += sub * (double)K3_E8M0[sb];
+            acc += sub * (double)k3_e8m0f(sb);
         }
     }
     return acc;
@@ -1820,7 +1828,6 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
     const int ngrp  = (in + group - 1) / group;
 
     if (!k3_pair_ready)  k3_pair_init();
-    if (!k3_e8m0_ready)  k3_e8m0_init();
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (rows > 64)
@@ -1841,7 +1848,6 @@ void k3_matmul_mx4(float *y, const float *x, const void *W, int in, int out)
     const unsigned char *base = (const unsigned char *)W;
 
     if (!k3_pair_ready)  k3_pair_init();
-    if (!k3_e8m0_ready)  k3_e8m0_init();
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
@@ -1865,9 +1871,8 @@ void k3_mxfp4_dequant(float *out, const unsigned char *packed,
 
         for (int g = 0; g < ngrp; g++) {
             /* E8M0: a bare biased exponent. 255 is NaN by spec; map it to zero so one
-             * bad byte cannot poison the row. ldexpf is exact for powers of two. */
-            const unsigned char sb = sr[g];
-            const float mult = (sb == 255) ? 0.0f : ldexpf(1.0f, (int)sb - 127);
+             * bad byte cannot poison the row. */
+            const float mult = k3_e8m0f(sr[g]);
 
             const int lo = g * group;
             int hi = lo + group;

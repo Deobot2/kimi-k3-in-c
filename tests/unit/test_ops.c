@@ -922,6 +922,29 @@ static void t_mxfp4(const char *dir)
                    "(got %.7f want %.7f)\n", bad, ne_, worst, at, y[at], ef[at]);
             g_fail++;
         }
+        /* ---- every E8M0 scale byte, exhaustively. The scale is built from its bits
+         * rather than by ldexpf, and byte 0 is a subnormal, which is exactly where a
+         * hand-built float goes wrong. One group per row, element 0 = E2M1 1.0. ---- */
+        {
+            unsigned char eP[256 * 16], eS[256];
+            float ey[256 * 32];
+            memset(eP, 0, sizeof eP);
+            for (int b = 0; b < 256; b++) { eP[b * 16] = 0x02; eS[b] = (unsigned char)b; }
+            k3_mxfp4_dequant(ey, eP, eS, 256, 16, 32);
+            int ebad = -1;
+            for (int b = 0; b < 256 && ebad < 0; b++) {
+                const float want = (b == 255) ? 0.0f : ldexpf(1.0f, b - 127);
+                if (memcmp(&ey[b * 32], &want, sizeof want) != 0) ebad = b;
+            }
+            if (ebad < 0) {
+                printf("  PASS  e8m0           all 256 scale bytes bit-exact vs ldexpf\n");
+                g_pass++;
+            } else {
+                printf("  FAIL  e8m0           scale byte %d decodes to %.9g\n",
+                       ebad, (double)ey[ebad * 32]);
+                g_fail++;
+            }
+        }
         /* ---- the QUANTISED TRUNK container, on the same bytes ----
          *
          * A routed expert stores its nibbles and its E8M0 scales in two separate
