@@ -866,6 +866,21 @@ static void t_layer(const char *dir, const char *file)
     }
     free(x); free(eo); free(bri);
     free((void*)ow.w1); free((void*)ow.w3); free((void*)ow.w2);
+    /* Every arr() result is heap; free(NULL) covers the family not loaded. */
+    free((void*)lw.in_norm); free((void*)lw.post_norm);
+    free((void*)lw.attn_res_norm); free((void*)lw.attn_res_proj);
+    free((void*)lw.mlp_res_norm); free((void*)lw.mlp_res_proj);
+    free((void*)mw.q_a); free((void*)mw.q_a_norm); free((void*)mw.q_b);
+    free((void*)mw.kv_a); free((void*)mw.kv_a_norm); free((void*)mw.kv_b);
+    free((void*)mw.o); free((void*)mw.g);
+    free((void*)kw.q); free((void*)kw.k); free((void*)kw.v);
+    free((void*)kw.q_conv); free((void*)kw.k_conv); free((void*)kw.v_conv);
+    free((void*)kw.f_a); free((void*)kw.f_b); free((void*)kw.A_log);
+    free((void*)kw.dt_bias); free((void*)kw.b); free((void*)kw.g);
+    free((void*)kw.o_norm); free((void*)kw.o);
+    free((void*)ow.gate); free((void*)ow.bias); free((void*)ow.down); free((void*)ow.up);
+    free((void*)ow.latent_norm); free((void*)ow.sh1); free((void*)ow.sh3);
+    free((void*)ow.sh2);
     free(txt); free(ar);
 }
 
