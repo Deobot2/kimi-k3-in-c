@@ -1138,6 +1138,90 @@ static void t_mmw_batch(void)
     }
 }
 
+/* The batched MoE prefill (k3_moe_prefill with a streamed source) against the per-token
+ * k3_moe on the same source: must agree TO THE BIT. Nothing else exercises this path
+ * without real weights, and it reorders a lot -- expert-major instead of token-major,
+ * and the trunk projections batched -- so it is exactly where a stride or an aliasing
+ * mistake would hide. The source below serves MXFP4 experts from memory. */
+typedef struct { unsigned char *buf; size_t per; int I, L; } FakeExperts;
+
+static int fake_get(K3ExpertSrc *self, int layer, int e, K3ExpertQ *q)
+{
+    (void)layer;
+    const FakeExperts *f = (const FakeExperts *)self->ctx;
+    unsigned char *b = f->buf + (size_t)e * f->per;
+    const size_t pg = (size_t)f->I * f->L / 2, sg = (size_t)f->I * f->L / 32;
+    q->p1 = b;                q->s1 = b + pg;
+    q->p3 = b + pg + sg;      q->s3 = b + 2 * pg + sg;
+    q->p2 = b + 2 * (pg + sg); q->s2 = b + 3 * pg + 2 * sg;
+    return 0;
+}
+
+static void t_moe_prefill(void)
+{
+    K3Cfg c; memset(&c, 0, sizeof c);
+    c.hidden = 64; c.latent = 32; c.moe_inter = 64; c.n_experts = 12; c.topk = 3;
+    c.n_shared = 2; c.routed_scale = 2.5f; c.moe_renorm = 1; c.latent_norm = 1;
+    c.rms_eps = 1e-5f; c.situ_b1 = 4.0f; c.situ_b2 = 25.0f;
+    const int E = c.hidden, L = c.latent, I = c.moe_inter, SI = I * c.n_shared, T = 37;
+    unsigned seed = 999u;
+#define RNDF(sc) (seed = seed * 1103515245u + 12345u, \
+                  (float)((int)(seed >> 9) % 2001 - 1000) * (sc))
+
+    FakeExperts fx;
+    fx.I = I; fx.L = L;
+    fx.per = 3 * ((size_t)I * L / 2 + (size_t)I * L / 32);
+    fx.buf = (unsigned char *)malloc(fx.per * c.n_experts);
+    for (size_t i = 0; i < fx.per * c.n_experts; i++) {
+        seed = seed * 1103515245u + 12345u;
+        fx.buf[i] = (unsigned char)(seed >> 16);
+    }
+    for (int e = 0; e < c.n_experts; e++) {                 /* scales near 2^-3..2^0 */
+        unsigned char *b = fx.buf + (size_t)e * fx.per;
+        const size_t pg = (size_t)I * L / 2, sg = (size_t)I * L / 32;
+        for (size_t i = 0; i < sg; i++) {
+            b[pg + i] = (unsigned char)(124 + i % 4);
+            b[2 * pg + sg + i] = (unsigned char)(124 + i % 4);
+            b[3 * pg + 2 * sg + i] = (unsigned char)(124 + i % 4);
+        }
+    }
+    K3ExpertSrc src; memset(&src, 0, sizeof src);
+    src.get = fake_get; src.ctx = &fx;
+
+    float *gate = (float *)malloc((size_t)c.n_experts * E * sizeof(float));
+    float *bias = (float *)malloc((size_t)c.n_experts * sizeof(float));
+    float *lnorm = (float *)malloc((size_t)L * sizeof(float));
+    float *down = (float *)malloc((size_t)L * E * sizeof(float));
+    float *up   = (float *)malloc((size_t)E * L * sizeof(float));
+    float *sh1  = (float *)malloc((size_t)SI * E * sizeof(float));
+    float *sh3  = (float *)malloc((size_t)SI * E * sizeof(float));
+    float *sh2  = (float *)malloc((size_t)E * SI * sizeof(float));
+    float *x    = (float *)malloc((size_t)T * E * sizeof(float));
+    float *y1   = (float *)malloc((size_t)T * E * sizeof(float));
+    float *y2   = (float *)malloc((size_t)T * E * sizeof(float));
+    float *scr  = (float *)malloc(k3_moe_scratch(&c) * sizeof(float));
+    for (int i = 0; i < c.n_experts * E; i++) gate[i] = RNDF(1e-2f);
+    for (int i = 0; i < c.n_experts; i++)     bias[i] = RNDF(1e-4f);
+    for (int i = 0; i < L; i++)               lnorm[i] = 1.0f + RNDF(1e-4f);
+    for (int i = 0; i < L * E; i++)  { down[i] = RNDF(1e-3f); up[i] = RNDF(1e-3f); }
+    for (int i = 0; i < SI * E; i++) { sh1[i] = RNDF(1e-3f); sh3[i] = RNDF(1e-3f);
+                                       sh2[i] = RNDF(1e-3f); }
+    for (int i = 0; i < T * E; i++)  x[i] = RNDF(1e-3f);
+#undef RNDF
+
+    K3MoeW w; memset(&w, 0, sizeof w);
+    w.gate = gate; w.bias = bias; w.latent_norm = lnorm;
+    w.down = down; w.up = up; w.sh1 = sh1; w.sh3 = sh3; w.sh2 = sh2;
+    w.src = &src;
+    int idx[K3_MAX_TOPK]; float wt[K3_MAX_TOPK];
+    k3_moe(y1, x, &w, &c, T, idx, wt, scr);
+    k3_moe_prefill(y2, x, &w, &c, T, idx, wt, scr);
+    report_bitwise("moe_prefill", y1, y2, (size_t)T * E);
+
+    free(fx.buf); free(gate); free(bias); free(lnorm); free(down); free(up);
+    free(sh1); free(sh3); free(sh2); free(x); free(y1); free(y2); free(scr);
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -1176,6 +1260,7 @@ int main(int argc, char **argv)
     t_mxfp4(dir);
     t_matmul_bf16();
     t_mmw_batch();
+    t_moe_prefill();
     t_kda_layer(dir, "kda_layer1");
     t_kda_layer(dir, "kda_layer8");
     t_layer(dir, "layer_kda");

@@ -1230,12 +1230,13 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         float *wtt = rwt + (size_t)t * K;
         k3_router(it, wtt, xt, w->gate, w->bias, E, c->n_experts, K,
                   c->moe_renorm, c->routed_scale);
-        k3_mmw(zz + (size_t)t * Ll, xt, w->down, w->wdt, E, Ll);
         for (int j = 0; j < K; j++) {
             const int e = it[j];
             if (e >= 0 && e < c->n_experts && !seen[e]) { seen[e] = 1; uniq[nu++] = e; }
         }
     }
+    /* the down-projection is a trunk matrix: batched, each row read once per block */
+    k3_mmw_batch(zz, x, w->down, w->wdt, E, Ll, T);
 
     /* 2. expert-major: fetch each unique expert ONCE, apply it to every (token, slot)
      * that selected it. gu/act/edn are reused per (expert, token). */
@@ -1267,10 +1268,10 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
     }
 
     /* 3. per token, sum contributions in the ORIGINAL top-k order, then the tail of the
-     * MoE exactly as k3_moe does it, so every float matches the per-token path. */
+     * MoE exactly as k3_moe does it, so every float matches the per-token path. The
+     * up-projection and the shared expert are trunk matrices and run batched, which is
+     * bit-identical to the per-token k3_mmw calls (see k3_mmw_strided). */
     for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
-        float *ot = out + (size_t)t * E;
         const float *wtt = rwt + (size_t)t * K;
         /* Reuse this token's now-dead down-projection slot as the aggregate. */
         float *acc = zz + (size_t)t * Ll;
@@ -1282,18 +1283,31 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         }
         if (c->latent_norm) k3_rmsnorm(acc, acc, w->latent_norm, Ll, c->rms_eps);
         if (g_cal && c->latent_norm) k3_calib_observe(K3_CAL_LAT, acc, 1, Ll);
-        k3_mmw(ot, acc, w->up, w->wdt, Ll, E);
+    }
+    k3_mmw_batch(out, zz, w->up, w->wdt, Ll, E, T);
 
-        float *sgu  = gu;                 /* [2*SI] */
-        float *sact = sgu + 2 * SI;       /* [SI]   */
-        float *sdn  = sact + SI;          /* [E]    */
-        k3_mmw(sgu,      xt, w->sh1, w->wdt, E, SI);
-        k3_mmw(sgu + SI, xt, w->sh3, w->wdt, E, SI);
-        k3_situ_glu(sact, sgu, SI, c->situ_b1, c->situ_b2);
-        k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
-        for (int i = 0; i < E; i++) ot[i] += sdn[i];
+    /* Shared expert on the ORIGINAL input, unweighted, in blocks of nb tokens. Gate and
+     * up land side by side in one [2*SI] row per token, which is the layout
+     * k3_situ_glu reads. */
+    const int nb = T < K3_MM_TBLK ? T : K3_MM_TBLK;
+    float *sgu  = (float *)malloc((size_t)nb * (3 * (size_t)SI + E) * sizeof(float));
+    if (!sgu) k3_fatal_oom("MoE prefill shared expert",
+                           (size_t)nb * (3 * (size_t)SI + E) * sizeof(float));
+    float *sact = sgu  + (size_t)nb * 2 * SI;   /* [nb][SI] */
+    float *sdn  = sact + (size_t)nb * SI;       /* [nb][E]  */
+    for (int t0 = 0; t0 < T; t0 += nb) {
+        const int n = (T - t0 < nb) ? T - t0 : nb;
+        const float *xb = x + (size_t)t0 * E;
+        k3_mmw_strided(sgu,      (size_t)2 * SI, xb, (size_t)E, w->sh1, w->wdt, E, SI, n);
+        k3_mmw_strided(sgu + SI, (size_t)2 * SI, xb, (size_t)E, w->sh3, w->wdt, E, SI, n);
+        for (int i = 0; i < n; i++)
+            k3_situ_glu(sact + (size_t)i * SI, sgu + (size_t)i * 2 * SI, SI,
+                        c->situ_b1, c->situ_b2);
+        k3_mmw_batch(sdn, sact, w->sh2, w->wdt, SI, E, n);
+        for (size_t i = 0; i < (size_t)n * E; i++) out[(size_t)t0 * E + i] += sdn[i];
     }
 
+    free(sgu);
     free(ridx); free(rwt); free(zz); free(contrib); free(uniq); free(seen);
 }
 
