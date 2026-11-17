@@ -413,6 +413,10 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
  * is capped at the lane count, so omp_get_thread_num() always indexes a reserved row. */
 #define K3_ATTN_LANES 16
 
+/* Tokens per block in k3_mmw_strided, and the row count of the per-block MLA scratch.
+ * 16 x a 28 KB activation row stays in L2 while one weight row sits in L1. */
+#define K3_MM_TBLK 16
+
 static int k3_attn_lanes(int H)
 {
 #ifdef _OPENMP
@@ -480,12 +484,15 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
      * safe only while H*vh < H*qh holds, but that is an accident of the released
      * dimensions, not an invariant, and it breaks silently the moment v_head grows.
      * Size the buffer with k3_mla_scratch_cached(); do not compute it by hand. */
+    /* nb: tokens per block. The projections and the gate/o_proj run batched over a
+     * block (k3_mmw_strided), so their transients hold nb rows, not one. */
+    const int nb = T < K3_MM_TBLK ? T : K3_MM_TBLK;
     float *q    = scratch;                          /* [T][H][qh]     */
-    float *ct   = q    + (size_t)T * H * qh;        /* [kvw] transient, one token */
-    float *ql   = ct   + (size_t)kvw;               /* [q_lora]       */
-    float *acc  = ql   + (size_t)c->q_lora;         /* [H][vh]        */
-    float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate   */
-    float *sc   = gbuf + (size_t)H * vh;            /* [lanes][last+1] scores */
+    float *ct   = q    + (size_t)T * H * qh;        /* [nb][kvw] transient */
+    float *ql   = ct   + (size_t)nb * kvw;          /* [nb][q_lora]   */
+    float *acc  = ql   + (size_t)nb * c->q_lora;    /* [nb][H][vh]    */
+    float *gbuf = acc  + (size_t)nb * H * vh;       /* [nb][H][vh] gate */
+    float *sc   = gbuf + (size_t)nb * H * vh;       /* [lanes][last+1] scores */
     const int    nl  = k3_attn_lanes(H);
     const size_t scw = (size_t)(last + 1);          /* one lane's score row */
     /* Without a cache the keys/values live in scratch and cover only this call. */
@@ -495,27 +502,40 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     #define K3_KV_AT(p)   (kvc   ? kvc   + (size_t)(p) * H * kvd : kvs + (size_t)(p) * H * kvd)
     #define K3_ROPE_AT(p) (ropec ? ropec + (size_t)(p) * qr      : rps + (size_t)(p) * qr)
 
-    /* ---- per-token projections ---- */
-    for (int t = 0; t < T; t++) {
-        const int p = cached + t;
-        const float *xt = x + (size_t)t * E;
-        k3_mmw(ql, xt, w->q_a, w->wdt, E, c->q_lora);
-        k3_rmsnorm(ql, ql, w->q_a_norm, c->q_lora, c->rms_eps);
-        if (g_cal) k3_calib_observe(K3_CAL_QA, ql, 1, c->q_lora);
-        k3_mmw(q + (size_t)t * H * qh, ql, w->q_b, w->wdt, c->q_lora, H * qh);
+    /* ---- projections, batched over blocks of nb tokens ---- */
+    for (int t0 = 0; t0 < T; t0 += nb) {
+        const int n = (T - t0 < nb) ? T - t0 : nb;
+        const float *xb = x + (size_t)t0 * E;
+        k3_mmw_batch(ql, xb, w->q_a, w->wdt, E, c->q_lora, n);
+        for (int i = 0; i < n; i++) {
+            float *qli = ql + (size_t)i * c->q_lora;
+            k3_rmsnorm(qli, qli, w->q_a_norm, c->q_lora, c->rms_eps);
+            if (g_cal) k3_calib_observe(K3_CAL_QA, qli, 1, c->q_lora);
+        }
+        k3_mmw_batch(q + (size_t)t0 * H * qh, ql, w->q_b, w->wdt, c->q_lora, H * qh, n);
 
         /* ONE projection emits the compressed latent AND the shared rope slot */
-        k3_mmw(ct, xt, w->kv_a, w->wdt, E, kvw);
-        /* the norm covers the latent only, never the rope slot */
-        k3_rmsnorm(ct, ct, w->kv_a_norm, c->kv_lora, c->rms_eps);
-        if (g_cal) k3_calib_observe(K3_CAL_KVA, ct, 1, c->kv_lora);
-        memcpy(K3_ROPE_AT(p), ct + c->kv_lora, (size_t)qr * sizeof(float));
-        k3_mmw(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, H * kvd);
+        k3_mmw_batch(ct, xb, w->kv_a, w->wdt, E, kvw, n);
+        for (int i = 0; i < n; i++) {
+            float *cti = ct + (size_t)i * kvw;
+            /* the norm covers the latent only, never the rope slot */
+            k3_rmsnorm(cti, cti, w->kv_a_norm, c->kv_lora, c->rms_eps);
+            if (g_cal) k3_calib_observe(K3_CAL_KVA, cti, 1, c->kv_lora);
+            memcpy(K3_ROPE_AT(cached + t0 + i), cti + c->kv_lora, (size_t)qr * sizeof(float));
+        }
+        /* kv_b reads the leading kv_lora floats of each kvw-wide row; positions are
+         * contiguous in both the cache and the scratch layout, so one strided call
+         * writes all n of them */
+        k3_mmw_strided(K3_KV_AT(cached + t0), (size_t)H * kvd, ct, (size_t)kvw,
+                       w->kv_b, w->wdt, c->kv_lora, H * kvd, n);
     }
 
-    /* ---- attention, per head, causal ---- */
-    for (int t = 0; t < T; t++) {
+    /* ---- attention, per head, causal; then gate and o_proj per block ---- */
+    for (int t0 = 0; t0 < T; t0 += nb) {
+      const int nt = (T - t0 < nb) ? T - t0 : nb;
+      for (int t = t0; t < t0 + nt; t++) {
         const int p = cached + t;
+        float *acc_t = acc + (size_t)(t - t0) * H * vh;
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) num_threads(nl) if (nl > 1)
 #endif
@@ -537,7 +557,7 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
             double z = 0.0;
             for (int s = 0; s <= p; s++) { sc_h[s] = expf(sc_h[s] - m); z += sc_h[s]; }
 
-            float *o = acc + (size_t)h * vh;
+            float *o = acc_t + (size_t)h * vh;
             for (int j = 0; j < vh; j++) o[j] = 0.0f;
             for (int s = 0; s <= p; s++) {
                 const float pr = (float)(sc_h[s] / z);
@@ -546,14 +566,16 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
             }
         }
 
-        /* ---- output gate then projection. Gate BEFORE o_proj, and no norm on it,
-         * unlike KDA which norms first. :470-473 ---- */
-        if (w->g) {
-            k3_mmw(gbuf, x + (size_t)t * E, w->g, w->wdt, E, H * vh);
-            for (int i = 0; i < H * vh; i++)
-                acc[i] *= 1.0f / (1.0f + expf(-gbuf[i]));
-        }
-        k3_mmw(out + (size_t)t * E, acc, w->o, w->wdt, H * vh, E);
+      }
+
+      /* ---- output gate then projection. Gate BEFORE o_proj, and no norm on it,
+       * unlike KDA which norms first. :470-473 ---- */
+      if (w->g) {
+          k3_mmw_batch(gbuf, x + (size_t)t0 * E, w->g, w->wdt, E, H * vh, nt);
+          for (size_t i = 0; i < (size_t)nt * H * vh; i++)
+              acc[i] *= 1.0f / (1.0f + expf(-gbuf[i]));
+      }
+      k3_mmw_batch(out + (size_t)t0 * E, acc, w->o, w->wdt, H * vh, E, nt);
     }
     #undef K3_KV_AT
     #undef K3_ROPE_AT
@@ -598,14 +620,16 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     if (!kv->window && last >= kv->cap)
         k3_fatal_bound("MLA latent cache position", (long)last, (long)kv->cap - 1);
 
+    /* nb: tokens per block; see k3_mla_cached. */
+    const int nb = T < K3_MM_TBLK ? T : K3_MM_TBLK;
     float *q    = scratch;                          /* [T][H][qh]      */
-    float *ct   = q    + (size_t)T * H * qh;        /* [kvw] transient */
-    float *ql   = ct   + (size_t)kvw;               /* [q_lora]        */
-    float *qa   = ql   + (size_t)c->q_lora;         /* [H][kl] absorbed queries */
+    float *ct   = q    + (size_t)T * H * qh;        /* [nb][kvw] transient */
+    float *ql   = ct   + (size_t)nb * kvw;          /* [nb][q_lora]    */
+    float *qa   = ql   + (size_t)nb * c->q_lora;    /* [H][kl] absorbed queries */
     float *al   = qa   + (size_t)H * kl;            /* [H][kl] latent attention sums */
-    float *acc  = al   + (size_t)H * kl;            /* [H][vh]         */
-    float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate    */
-    float *sc   = gbuf + (size_t)H * vh;            /* [lanes][scw] scores */
+    float *acc  = al   + (size_t)H * kl;            /* [nb][H][vh]     */
+    float *gbuf = acc  + (size_t)nb * H * vh;       /* [nb][H][vh] gate */
+    float *sc   = gbuf + (size_t)nb * H * vh;       /* [lanes][scw] scores */
     const int nl = k3_attn_lanes(H);
     (void)nl;                                       /* unused in a serial build */
     /* A lane's score row must hold every position one head attends to: at most p+1,
@@ -615,28 +639,42 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
 
     const size_t kvb_row = k3_row_bytes(w->wdt, kl);
 
-    for (int t = 0; t < T; t++) {
+    for (int t0 = 0; t0 < T; t0 += nb) {
+      const int nt = (T - t0 < nb) ? T - t0 : nb;
+      const float *xb = x + (size_t)t0 * E;
+
+      /* ---- projections for the block. Identical to the expanded path up to the point
+       * where it would have called kv_b, which is exactly the call absorption removes. */
+      k3_mmw_batch(ql, xb, w->q_a, w->wdt, E, c->q_lora, nt);
+      for (int i = 0; i < nt; i++) {
+          float *qli = ql + (size_t)i * c->q_lora;
+          k3_rmsnorm(qli, qli, w->q_a_norm, c->q_lora, c->rms_eps);
+          if (g_cal) k3_calib_observe(K3_CAL_QA, qli, 1, c->q_lora);
+      }
+      k3_mmw_batch(q + (size_t)t0 * H * qh, ql, w->q_b, w->wdt, c->q_lora, H * qh, nt);
+
+      k3_mmw_batch(ct, xb, w->kv_a, w->wdt, E, kvw, nt);
+      /* the norm covers the latent only, never the rope slot -- so the 576 floats
+       * stored below are byte-for-byte what the expanded path fed to kv_b and to the
+       * rope row, and a cache written by one layout means the same thing to the other */
+      for (int i = 0; i < nt; i++) {
+          float *cti = ct + (size_t)i * kvw;
+          k3_rmsnorm(cti, cti, w->kv_a_norm, c->kv_lora, c->rms_eps);
+          if (g_cal) k3_calib_observe(K3_CAL_KVA, cti, 1, c->kv_lora);
+      }
+
+      for (int t = t0; t < t0 + nt; t++) {
         const int p = cached + t;
-        const float *xt = x + (size_t)t * E;
-
-        /* ---- projections. Identical to the expanded path up to the point where it
-         * would have called kv_b, which is exactly the call absorption removes. ---- */
-        k3_mmw(ql, xt, w->q_a, w->wdt, E, c->q_lora);
-        k3_rmsnorm(ql, ql, w->q_a_norm, c->q_lora, c->rms_eps);
-        if (g_cal) k3_calib_observe(K3_CAL_QA, ql, 1, c->q_lora);
-        k3_mmw(q + (size_t)t * H * qh, ql, w->q_b, w->wdt, c->q_lora, H * qh);
-
-        k3_mmw(ct, xt, w->kv_a, w->wdt, E, kvw);
-        /* the norm covers the latent only, never the rope slot -- so the 576 floats
-         * stored below are byte-for-byte what the expanded path fed to kv_b and to the
-         * rope row, and a cache written by one layout means the same thing to the other */
-        k3_rmsnorm(ct, ct, w->kv_a_norm, c->kv_lora, c->rms_eps);
-        if (g_cal) k3_calib_observe(K3_CAL_KVA, ct, 1, c->kv_lora);
+        float *acc_t = acc + (size_t)(t - t0) * H * vh;
+        /* The cache write stays PER TOKEN, immediately before that token attends. With a
+         * window the slots wrap, so writing position p+1 early would overwrite the slot
+         * of p+1-R, which position p still attends to. */
         {
             const int slot = k3_kv_slot(kv, p);
             if (slot < 0)
                 k3_fatal_bound("MLA latent slot for the position being written", (long)p, 0);
-            memcpy(kv->lat + (size_t)slot * kvw, ct, (size_t)kvw * sizeof(float));
+            memcpy(kv->lat + (size_t)slot * kvw, ct + (size_t)(t - t0) * kvw,
+                   (size_t)kvw * sizeof(float));
         }
 
         /* ---- absorb W_UK into the query, once per head per token ---- */
@@ -714,17 +752,18 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         for (int h = 0; h < H; h++) {
             const unsigned char *wuv =
                 (const unsigned char *)w->kv_b + (size_t)(h * kvd + qn) * kvb_row;
-            k3_mmw(acc + (size_t)h * vh, al + (size_t)h * kl, wuv, w->wdt, kl, vh);
+            k3_mmw(acc_t + (size_t)h * vh, al + (size_t)h * kl, wuv, w->wdt, kl, vh);
         }
+      }
 
-        /* ---- gate then projection, unchanged: the gate is why W_UV could not be
-         * folded into o_proj in the first place ---- */
-        if (w->g) {
-            k3_mmw(gbuf, xt, w->g, w->wdt, E, H * vh);
-            for (int i = 0; i < H * vh; i++)
-                acc[i] *= 1.0f / (1.0f + expf(-gbuf[i]));
-        }
-        k3_mmw(out + (size_t)t * E, acc, w->o, w->wdt, H * vh, E);
+      /* ---- gate then projection, unchanged: the gate is why W_UV could not be
+       * folded into o_proj in the first place ---- */
+      if (w->g) {
+          k3_mmw_batch(gbuf, xb, w->g, w->wdt, E, H * vh, nt);
+          for (size_t i = 0; i < (size_t)nt * H * vh; i++)
+              acc[i] *= 1.0f / (1.0f + expf(-gbuf[i]));
+      }
+      k3_mmw_batch(out + (size_t)t0 * E, acc, w->o, w->wdt, H * vh, E, nt);
     }
 }
 
@@ -758,12 +797,13 @@ int k3_kv_first(const K3KvCache *kv, int p)
 size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span)
 {
     const int H = c->n_heads, qh = c->qk_nope + c->qk_rope, vh = c->v_head;
+    const size_t nb = (size_t)(T < K3_MM_TBLK ? T : K3_MM_TBLK);   /* block rows */
     return (size_t)T * H * qh                          /* q                   */
-         + (size_t)(c->kv_lora + c->qk_rope)           /* ct transient        */
-         + (size_t)c->q_lora
+         + nb * (size_t)(c->kv_lora + c->qk_rope)      /* ct transient        */
+         + nb * (size_t)c->q_lora
          + (size_t)H * c->kv_lora                      /* absorbed queries    */
          + (size_t)H * c->kv_lora                      /* latent attn sums    */
-         + (size_t)2 * H * vh                          /* acc, gbuf           */
+         + nb * (size_t)2 * H * vh                     /* acc, gbuf           */
          + (size_t)k3_attn_lanes(H) * (size_t)(span > T ? span : T);  /* scores  */
 }
 
@@ -956,10 +996,11 @@ size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode)
 {
     const int H = c->n_heads, qh = c->qk_nope + c->qk_rope, vh = c->v_head;
     const size_t kvd = (size_t)(c->qk_nope + vh);
+    const size_t nb = (size_t)(T < K3_MM_TBLK ? T : K3_MM_TBLK);   /* block rows */
     size_t n = (size_t)T * H * qh                      /* q            */
-             + (size_t)(c->kv_lora + c->qk_rope)       /* ct transient */
-             + (size_t)c->q_lora
-             + (size_t)2 * H * vh                      /* acc, gbuf    */
+             + nb * (size_t)(c->kv_lora + c->qk_rope)  /* ct transient */
+             + nb * (size_t)c->q_lora
+             + nb * (size_t)2 * H * vh                 /* acc, gbuf    */
              + (size_t)k3_attn_lanes(H) * (size_t)(cap > T ? cap : T);  /* scores */
     if (!cached_mode) n += (size_t)T * H * kvd + (size_t)T * c->qk_rope;
     return n;
@@ -1890,11 +1931,13 @@ void k3_matmul_mx4(float *y, const float *x, const void *W, int in, int out)
  * BIT-IDENTICAL to the per-token form: every (row, token) result comes from the same
  * rowdot_* function k3_mmw uses, with the same arithmetic and reduction order; only the
  * order in which the independent results are produced changes. test_ops gates this for
- * every format. */
-#define K3_MM_TBLK 16
-
-void k3_mmw_batch(float *y, const float *x, const void *W, int wdt, int in, int out,
-                  int T)
+ * every format.
+ *
+ * Row i of x starts at x + i*ldx and row i of y at y + i*ldy, so a projection can read
+ * the leading `in` columns of a wider row (MLA's kv_b reads the 512-float latent out of
+ * each 576-float latent+rope row). */
+void k3_mmw_strided(float *y, size_t ldy, const float *x, size_t ldx,
+                    const void *W, int wdt, int in, int out, int T)
 {
     if (T == 1) { k3_mmw(y, x, W, wdt, in, out); return; }
     if (wdt == K3_WMX4 && !k3_pair_ready) k3_pair_init();
@@ -1910,7 +1953,7 @@ void k3_mmw_batch(float *y, const float *x, const void *W, int wdt, int in, int 
         for (int o = 0; o < out; o++) {
             const unsigned char *row = base + (size_t)o * rb;
             for (int t = t0; t < t1; t++) {
-                const float *xt = x + (size_t)t * in;
+                const float *xt = x + (size_t)t * ldx;
                 float r;
                 if (wdt == K3_WBF16)
                     r = (float)rowdot_bf16((const uint16_t *)(const void *)row, xt, in);
@@ -1920,10 +1963,16 @@ void k3_mmw_batch(float *y, const float *x, const void *W, int wdt, int in, int 
                     r = (float)mxfp4_rowdot(xt, row, row + pn, in, K3_MXFP4_GROUP);
                 else
                     r = (float)rowdot_f32((const float *)(const void *)row, xt, in);
-                y[(size_t)t * out + o] = r;
+                y[(size_t)t * ldy + o] = r;
             }
         }
     }
+}
+
+void k3_mmw_batch(float *y, const float *x, const void *W, int wdt, int in, int out,
+                  int T)
+{
+    k3_mmw_strided(y, (size_t)out, x, (size_t)in, W, wdt, in, out, T);
 }
 
 void k3_mxfp4_dequant(float *out, const unsigned char *packed,

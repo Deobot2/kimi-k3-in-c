@@ -238,11 +238,13 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out);
  * scratch must hold at least
  *     T*H*(qk_nope+qk_rope)      q
  *   + T*H*(qk_nope+v_head)       kv
- *   + T*(kv_lora+qk_rope)        compressed latent plus the shared rope slot
- *   + q_lora                     transient
- *   + 2*H*v_head                 attention accumulator and gate buffer
+ *   + T*qk_rope                  the shared rope slot
+ *   + nb*(kv_lora+qk_rope)       compressed latent plus rope, per token of a block
+ *   + nb*q_lora                  transient
+ *   + nb*2*H*v_head              attention accumulator and gate buffer
  *   + lanes*T                    scores, one row per attention lane (up to 16)
- * floats. Use k3_mla_scratch() rather than recomputing this.
+ * floats, where nb = min(T, 16) is the projection block (k3_mmw_strided). Use
+ * k3_mla_scratch() rather than recomputing this.
  */
 typedef struct {
     /* Tagged by wdt: fp32 when zero (every fixture), bf16 for the real checkpoint. */
@@ -460,6 +462,9 @@ static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
  * token, which is what makes a prefill chunk cheaper than the same tokens decoded. */
 void k3_mmw_batch(float *y, const float *x, const void *W, int wdt, int in, int out,
                   int T);
+/* The same with explicit row strides: row t of x is x + t*ldx, of y is y + t*ldy. */
+void k3_mmw_strided(float *y, size_t ldy, const float *x, size_t ldx,
+                    const void *W, int wdt, int in, int out, int T);
 
 /* Byte stride of one row for a per-row int8 matrix: the f32 scale plus `in` int8 weights.
  * bf16 and fp32 are per-element and take the element form. */
