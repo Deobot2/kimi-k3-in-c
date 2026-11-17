@@ -455,6 +455,12 @@ static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
     else                      k3_matmul(y, x, (const float *)W, in, out);
 }
 
+/* k3_mmw over T tokens at once: y is [T][out], x is [T][in]. Bit-identical to T calls
+ * of k3_mmw, but reads each weight row once per block of tokens instead of once per
+ * token, which is what makes a prefill chunk cheaper than the same tokens decoded. */
+void k3_mmw_batch(float *y, const float *x, const void *W, int wdt, int in, int out,
+                  int T);
+
 /* Byte stride of one row for a per-row int8 matrix: the f32 scale plus `in` int8 weights.
  * bf16 and fp32 are per-element and take the element form. */
 static inline size_t k3_wsz(int wdt) { return wdt == K3_WBF16 ? 2u : 4u; }

@@ -154,14 +154,14 @@ static void report_x(const char *name, const float *got, const float *want, int 
 }
 
 /* ----------------------------------------------------------------- tests ---- */
-/* The same call at one thread and at the default count must agree TO THE BIT. Every
+/* Two computations that must agree TO THE BIT, e.g. one thread versus many. Every
  * parallel loop in the kernels splits only independent work (rows, heads), so any
  * difference here is a race or a scratch row shared between threads -- which a
  * tolerance would hide, since a race usually perturbs only a few ulps. */
 static void report_bitwise(const char *name, const float *a, const float *b, size_t n)
 {
     if (memcmp(a, b, n * sizeof(float)) == 0) {
-        printf("  PASS  %-14s n=%-6zu bit-identical at 1 and N threads\n", name, n);
+        printf("  PASS  %-14s n=%-6zu bit-identical\n", name, n);
         g_pass++;
     } else {
         size_t i = 0;
@@ -1084,6 +1084,60 @@ static void t_matmul_bf16(void)
     free(Wb); free(Wf); free(x); free(ya); free(yb);
 }
 
+/* k3_mmw_batch must equal T calls of k3_mmw TO THE BIT, in every weight format. The
+ * shapes are chosen to be awkward: T spans more than one token block with a remainder,
+ * out is past the OpenMP threshold, and `in` leaves a scalar tail in the formats that
+ * allow one (MXFP4 requires whole 32-element groups, so it gets a multiple of 32). */
+static void t_mmw_batch(void)
+{
+    const int fmts[4] = { K3_WF32, K3_WBF16, K3_WI8, K3_WMX4 };
+    const char *names[4] = { "mmw_batch_f32", "mmw_batch_bf16", "mmw_batch_i8",
+                             "mmw_batch_mx4" };
+    const int T = 37, out = 100;
+    unsigned seed = 12345u;
+    for (int f = 0; f < 4; f++) {
+        const int wdt = fmts[f];
+        const int in = (wdt == K3_WMX4) ? 160 : 167;
+        const size_t rb = k3_row_bytes(wdt, in);
+        unsigned char *W = (unsigned char *)malloc(rb * out);
+        float *x  = (float *)malloc((size_t)T * in * sizeof(float));
+        float *y1 = (float *)malloc((size_t)T * out * sizeof(float));
+        float *y2 = (float *)malloc((size_t)T * out * sizeof(float));
+        if (!W || !x || !y1 || !y2) { g_fail++; free(W); free(x); free(y1); free(y2); continue; }
+        for (size_t i = 0; i < (size_t)T * in; i++) {
+            seed = seed * 1103515245u + 12345u;
+            x[i] = (float)((int)(seed >> 9) % 2001 - 1000) * 1e-3f;
+        }
+        for (int o = 0; o < out; o++) {
+            unsigned char *row = W + (size_t)o * rb;
+            for (size_t b = 0; b < rb; b++) {
+                seed = seed * 1103515245u + 12345u;
+                row[b] = (unsigned char)(seed >> 16);
+            }
+            if (wdt == K3_WF32) {
+                float *wf = (float *)(void *)row;
+                for (int i = 0; i < in; i++) {
+                    seed = seed * 1103515245u + 12345u;
+                    wf[i] = (float)((int)(seed >> 9) % 2001 - 1000) * 1e-3f;
+                }
+            } else if (wdt == K3_WBF16) {
+                uint16_t *wh = (uint16_t *)(void *)row;   /* finite, moderate exponents */
+                for (int i = 0; i < in; i++) wh[i] = (uint16_t)((wh[i] & 0x807F) | 0x3C00);
+            } else if (wdt == K3_WI8) {
+                const float sc = 0.01f;
+                memcpy(row, &sc, sizeof sc);
+            } else {                                      /* scales near 2^0 */
+                for (int g = 0; g < in / 32; g++) row[in / 2 + g] = (unsigned char)(120 + g);
+            }
+        }
+        k3_mmw_batch(y2, x, W, wdt, in, out, T);
+        for (int t = 0; t < T; t++)
+            k3_mmw(y1 + (size_t)t * out, x + (size_t)t * in, W, wdt, in, out);
+        report_bitwise(names[f], y1, y2, (size_t)T * out);
+        free(W); free(x); free(y1); free(y2);
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -1121,6 +1175,7 @@ int main(int argc, char **argv)
     t_moe(dir);
     t_mxfp4(dir);
     t_matmul_bf16();
+    t_mmw_batch();
     t_kda_layer(dir, "kda_layer1");
     t_kda_layer(dir, "kda_layer8");
     t_layer(dir, "layer_kda");
