@@ -892,41 +892,65 @@ void k3_matmul_tr(float *y, const float *x, const void *W, int wdt, int in, int 
 }
 
 /* ---------------------------------------------------------------- router ---- */
-void k3_router(int *idx, float *w, const float *x, const float *W,
-               const float *bias, int hidden, int n_experts, int topk,
-               int renorm, float routed_scale)
+/* Sigmoid router scores for T tokens: score[t][e] = sigmoid(W[e] . x_t).
+ *
+ * Logits in float32 with no bias, then an independent sigmoid per expert. The reference
+ * upcasts both operands explicitly; a double accumulator here matches it and costs
+ * nothing at this width. Each (expert, token) logit is ONE sequential double sum over
+ * i = 0..hidden-1, and that order is the contract: the routing decision is a top-k over
+ * these values, so moving one by an ulp can swap an expert.
+ *
+ * PARALLEL over experts, and bit-identical because of it. This is 896 dot products of
+ * length 7168 = 6.4M multiply-adds per token per MoE layer; serial, it sat on the
+ * critical path with no I/O to hide behind. Each iteration writes only its own
+ * score[t][e] and the accumulation order inside a logit is untouched.
+ *
+ * Tokens are taken FOUR AT A TIME per row. Each token keeps its own accumulator summed
+ * in the same sequential order, so each logit is unchanged bit for bit; but four
+ * independent chains hide the add latency a single chain serialises on, and the row is
+ * read once for four tokens instead of four times. T == 1 is the decode case and takes
+ * the single-chain loop exactly as before. */
+static void router_scores(float *score, const float *x, size_t ldx, const float *W,
+                          int hidden, int n_experts, int T)
 {
-    /* Returning early here would leave idx[] and w[] untouched, and k3_moe forms
-     * `w->w1 + idx[j]*I*L` from them one line later -- an arbitrary pointer built from
-     * uninitialised stack. */
-    float *score  = (float *)malloc((size_t)n_experts * sizeof(float));
-    float *choice = (float *)malloc((size_t)n_experts * sizeof(float));
-    if (!score || !choice) k3_fatal_oom("router scores", (size_t)n_experts * sizeof(float) * 2);
-
-    /* logits in float32 with no bias, then an independent sigmoid per expert. The
-     * reference upcasts both operands explicitly; a double accumulator here matches
-     * it and costs nothing at this width. */
-    /* PARALLEL over experts, and bit-identical because of it.
-     *
-     * This is 896 dot products of length 7168 = 6.4M multiply-adds, per token, per MoE
-     * layer, so 590M across the 92 of them -- and it ran on ONE core while every other
-     * matmul in the engine was already threaded. It is pure arithmetic with no I/O to
-     * hide behind, so it sat squarely on the critical path.
-     *
-     * Each iteration writes only its own score[e] and choice[e], and the ACCUMULATION
-     * ORDER INSIDE an expert is untouched: thread t still sums i = 0..hidden-1 in
-     * sequence into its own double. Splitting the outer loop therefore cannot change a
-     * single bit, which is why this needs no tolerance and no re-gating. */
 #ifdef _OPENMP
 #   pragma omp parallel for schedule(static)
 #endif
     for (int e = 0; e < n_experts; e++) {
         const float *row = W + (size_t)e * hidden;
-        double acc = 0.0;
-        for (int i = 0; i < hidden; i++) acc += (double)row[i] * (double)x[i];
-        score[e]  = 1.0f / (1.0f + expf(-(float)acc));
-        choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
+        int t = 0;
+        for (; t + 3 < T; t += 4) {
+            const float *x0 = x + (size_t)t * ldx,       *x1 = x0 + ldx;
+            const float *x2 = x0 + 2 * ldx,              *x3 = x0 + 3 * ldx;
+            double a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+            for (int i = 0; i < hidden; i++) {
+                const double r = (double)row[i];
+                a0 += r * (double)x0[i];
+                a1 += r * (double)x1[i];
+                a2 += r * (double)x2[i];
+                a3 += r * (double)x3[i];
+            }
+            score[(size_t)t * n_experts + e]       = 1.0f / (1.0f + expf(-(float)a0));
+            score[(size_t)(t + 1) * n_experts + e] = 1.0f / (1.0f + expf(-(float)a1));
+            score[(size_t)(t + 2) * n_experts + e] = 1.0f / (1.0f + expf(-(float)a2));
+            score[(size_t)(t + 3) * n_experts + e] = 1.0f / (1.0f + expf(-(float)a3));
+        }
+        for (; t < T; t++) {
+            const float *xt = x + (size_t)t * ldx;
+            double acc = 0.0;
+            for (int i = 0; i < hidden; i++) acc += (double)row[i] * (double)xt[i];
+            score[(size_t)t * n_experts + e] = 1.0f / (1.0f + expf(-(float)acc));
+        }
     }
+}
+
+/* Top-k selection over one token's scores. `choice` is caller scratch [n_experts]. */
+static void router_select(int *idx, float *w, const float *score, float *choice,
+                          const float *bias, int n_experts, int topk,
+                          int renorm, float routed_scale)
+{
+    for (int e = 0; e < n_experts; e++)
+        choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
 
     /* top-k by repeated max. n_experts is 896 and topk is 16, so this is 14k
      * comparisons per token per layer: cheap next to an 18 MB expert read, and it
@@ -949,7 +973,37 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
         for (int j = 0; j < topk; j++) w[j] *= inv;
     }
     for (int j = 0; j < topk; j++) w[j] *= routed_scale;
+}
 
+void k3_router(int *idx, float *w, const float *x, const float *W,
+               const float *bias, int hidden, int n_experts, int topk,
+               int renorm, float routed_scale)
+{
+    /* Returning early here would leave idx[] and w[] untouched, and k3_moe forms
+     * `w->w1 + idx[j]*I*L` from them one line later -- an arbitrary pointer built from
+     * uninitialised stack. */
+    float *score  = (float *)malloc((size_t)n_experts * sizeof(float));
+    float *choice = (float *)malloc((size_t)n_experts * sizeof(float));
+    if (!score || !choice) k3_fatal_oom("router scores", (size_t)n_experts * sizeof(float) * 2);
+    router_scores(score, x, (size_t)hidden, W, hidden, n_experts, 1);
+    router_select(idx, w, score, choice, bias, n_experts, topk, renorm, routed_scale);
+    free(score); free(choice);
+}
+
+/* k3_router for T tokens: idx and w are [T][topk]. Bit-identical to T calls. */
+static void router_batch(int *idx, float *w, const float *x, const float *W,
+                         const float *bias, int hidden, int n_experts, int topk,
+                         int renorm, float routed_scale, int T)
+{
+    float *score  = (float *)malloc((size_t)T * n_experts * sizeof(float));
+    float *choice = (float *)malloc((size_t)n_experts * sizeof(float));
+    if (!score || !choice)
+        k3_fatal_oom("router scores", (size_t)(T + 1) * n_experts * sizeof(float));
+    router_scores(score, x, (size_t)hidden, W, hidden, n_experts, T);
+    for (int t = 0; t < T; t++)
+        router_select(idx + (size_t)t * topk, w + (size_t)t * topk,
+                      score + (size_t)t * n_experts, choice, bias, n_experts, topk,
+                      renorm, routed_scale);
     free(score); free(choice);
 }
 
@@ -1224,12 +1278,10 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
     /* Same hint as the per-token path: routing has not happened yet and the source may
      * have a guess worth starting now. */
     if (w->src->speculate) w->src->speculate(w->src, w->layer);
+    router_batch(ridx, rwt, x, w->gate, w->bias, E, c->n_experts, K,
+                 c->moe_renorm, c->routed_scale, T);
     for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
-        int   *it = ridx + (size_t)t * K;
-        float *wtt = rwt + (size_t)t * K;
-        k3_router(it, wtt, xt, w->gate, w->bias, E, c->n_experts, K,
-                  c->moe_renorm, c->routed_scale);
+        const int *it = ridx + (size_t)t * K;
         for (int j = 0; j < K; j++) {
             const int e = it[j];
             if (e >= 0 && e < c->n_experts && !seen[e]) { seen[e] = 1; uniq[nu++] = e; }
