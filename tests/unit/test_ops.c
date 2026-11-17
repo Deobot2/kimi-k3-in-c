@@ -17,6 +17,9 @@
 
 #include "json.h"
 #include "k3.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* FALLBACKS ONLY. The authority is the tolerance block in MANIFEST.json, loaded by main
  * and applied to every comparison. These values are used only if the manifest cannot be
@@ -151,6 +154,24 @@ static void report_x(const char *name, const float *got, const float *want, int 
 }
 
 /* ----------------------------------------------------------------- tests ---- */
+/* The same call at one thread and at the default count must agree TO THE BIT. Every
+ * parallel loop in the kernels splits only independent work (rows, heads), so any
+ * difference here is a race or a scratch row shared between threads -- which a
+ * tolerance would hide, since a race usually perturbs only a few ulps. */
+static void report_bitwise(const char *name, const float *a, const float *b, size_t n)
+{
+    if (memcmp(a, b, n * sizeof(float)) == 0) {
+        printf("  PASS  %-14s n=%-6zu bit-identical at 1 and N threads\n", name, n);
+        g_pass++;
+    } else {
+        size_t i = 0;
+        while (i < n && memcmp(a + i, b + i, sizeof(float)) == 0) i++;
+        printf("  FAIL  %-14s n=%-6zu first difference at i=%zu: %.9g vs %.9g\n",
+               name, n, i, (double)a[i], (double)b[i]);
+        g_fail++;
+    }
+}
+
 static void t_rmsnorm(const char *dir)
 {
     char p[512]; snprintf(p, sizeof(p), "%s/rmsnorm.json", dir);
@@ -529,6 +550,34 @@ static void t_mla(const char *dir)
                     kv.cached = t + 1;
                 }
                 report_x("mla_lat_window", y2, eo, n_out, 8.0);
+
+#ifdef _OPENMP
+                /* Thread invariance of the head-parallel attention loops: rerun both
+                 * the expanded and the latent path serially and compare bits. */
+                {
+                    float *ys = (float *)malloc((size_t)T * c.hidden * sizeof(float));
+                    if (ys) {
+                        const int nt = omp_get_max_threads();
+                        const size_t ny = (size_t)T * c.hidden;
+                        omp_set_num_threads(1);
+                        k3_mla(ys, x, &w, &c, T, scratch);
+                        omp_set_num_threads(nt);
+                        k3_mla(y, x, &w, &c, T, scratch);
+                        report_bitwise("mla_threads", ys, y, ny);
+
+                        memset(lat, 0, (size_t)T * kvw * sizeof(float));
+                        memset(&kv, 0, sizeof kv);
+                        kv.mode = K3_KV_LATENT; kv.lat = lat; kv.cap = T;
+                        omp_set_num_threads(1);
+                        k3_mla_latent(ys, x, &w, &c, T, sc2, &kv);
+                        omp_set_num_threads(nt);
+                        memset(lat, 0, (size_t)T * kvw * sizeof(float));
+                        k3_mla_latent(y2, x, &w, &c, T, sc2, &kv);
+                        report_bitwise("mla_lat_thr", ys, y2, ny);
+                        free(ys);
+                    }
+                }
+#endif
             }
             free(lat); free(y2); free(sc2);
         }

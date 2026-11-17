@@ -30,6 +30,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
@@ -371,6 +374,39 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
     }
 }
 
+/* ------------------------------------------------- attention head lanes ---- */
+/* Softmax attention is the one O(context) loop per token, and it used to run one head at
+ * a time on one core while every projection around it was threaded. Heads are
+ * independent -- each reads its own query slice and the shared cache, and writes its own
+ * output slice -- so the head loop is split across threads. What each thread needs of
+ * its own is a score row (as wide as the attended span), so scratch carries one row per
+ * LANE rather than one per head: at a 128k context, 96 per-head rows would be 48 MB per
+ * call, sixteen lanes are 8 MB.
+ *
+ * Bit-identical at any thread count: a head's arithmetic, including its reduction
+ * order, is untouched; only which row of scratch holds its scores changes. num_threads
+ * is capped at the lane count, so omp_get_thread_num() always indexes a reserved row. */
+#define K3_ATTN_LANES 16
+
+static int k3_attn_lanes(int H)
+{
+#ifdef _OPENMP
+    return H < 1 ? 1 : (H < K3_ATTN_LANES ? H : K3_ATTN_LANES);
+#else
+    (void)H;
+    return 1;
+#endif
+}
+
+static inline int k3_lane_id(void)
+{
+#ifdef _OPENMP
+    return omp_get_thread_num();
+#else
+    return 0;
+#endif
+}
+
 /* ------------------------------------------------------------- Gated MLA ---- */
 /* MLA with an optional KV cache, which is what makes incremental decode possible.
  *
@@ -424,9 +460,11 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     float *ql   = ct   + (size_t)kvw;               /* [q_lora]       */
     float *acc  = ql   + (size_t)c->q_lora;         /* [H][vh]        */
     float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate   */
-    float *sc   = gbuf + (size_t)H * vh;            /* [last+1] scores */
+    float *sc   = gbuf + (size_t)H * vh;            /* [lanes][last+1] scores */
+    const int    nl  = k3_attn_lanes(H);
+    const size_t scw = (size_t)(last + 1);          /* one lane's score row */
     /* Without a cache the keys/values live in scratch and cover only this call. */
-    float *kvs  = sc   + (size_t)(last + 1);        /* [T][H][kvd]    */
+    float *kvs  = sc   + (size_t)nl * scw;          /* [T][H][kvd]    */
     float *rps  = kvs  + (kvc ? 0 : (size_t)T * H * kvd);   /* [T][qr] */
 
     #define K3_KV_AT(p)   (kvc   ? kvc   + (size_t)(p) * H * kvd : kvs + (size_t)(p) * H * kvd)
@@ -453,8 +491,12 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     /* ---- attention, per head, causal ---- */
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static) num_threads(nl) if (nl > 1)
+#endif
         for (int h = 0; h < H; h++) {
             const float *qt = q + ((size_t)t * H + h) * qh;
+            float *sc_h = sc + (size_t)k3_lane_id() * scw;
             float m = -INFINITY;
             for (int s = 0; s <= p; s++) {                 /* causal: s <= p */
                 const float *ks = K3_KV_AT(s) + (size_t)h * kvd;
@@ -464,16 +506,16 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                 /* the rope slot is UNROTATED but still scored, and the SAME 64
                  * values serve every head. Dropping this term is the silent bug. */
                 for (int i = 0; i < qr; i++) d += (double)qt[qn + i] * (double)kr[i];
-                sc[s] = (float)d * scale;
-                if (sc[s] > m) m = sc[s];
+                sc_h[s] = (float)d * scale;
+                if (sc_h[s] > m) m = sc_h[s];
             }
             double z = 0.0;
-            for (int s = 0; s <= p; s++) { sc[s] = expf(sc[s] - m); z += sc[s]; }
+            for (int s = 0; s <= p; s++) { sc_h[s] = expf(sc_h[s] - m); z += sc_h[s]; }
 
             float *o = acc + (size_t)h * vh;
             for (int j = 0; j < vh; j++) o[j] = 0.0f;
             for (int s = 0; s <= p; s++) {
-                const float pr = (float)(sc[s] / z);
+                const float pr = (float)(sc_h[s] / z);
                 const float *vs = K3_KV_AT(s) + (size_t)h * kvd + qn;
                 for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
             }
@@ -535,10 +577,16 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     float *ct   = q    + (size_t)T * H * qh;        /* [kvw] transient */
     float *ql   = ct   + (size_t)kvw;               /* [q_lora]        */
     float *qa   = ql   + (size_t)c->q_lora;         /* [H][kl] absorbed queries */
-    float *al   = qa   + (size_t)H * kl;            /* [kl] latent attention sum */
-    float *acc  = al   + (size_t)kl;                /* [H][vh]         */
+    float *al   = qa   + (size_t)H * kl;            /* [H][kl] latent attention sums */
+    float *acc  = al   + (size_t)H * kl;            /* [H][vh]         */
     float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate    */
-    float *sc   = gbuf + (size_t)H * vh;            /* [span] scores   */
+    float *sc   = gbuf + (size_t)H * vh;            /* [lanes][scw] scores */
+    const int nl = k3_attn_lanes(H);
+    (void)nl;                                       /* unused in a serial build */
+    /* A lane's score row must hold every position one head attends to: at most p+1,
+     * and with a window at most the window. Scratch reserves max(span, T) per lane. */
+    size_t scw = (size_t)(last + 1);
+    if (kv->window > 0 && (size_t)kv->window < scw) scw = (size_t)kv->window;
 
     const size_t kvb_row = k3_row_bytes(w->wdt, kl);
 
@@ -587,7 +635,15 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         const int s0 = k3_kv_first(kv, p);
         int nsink = kv->window ? kv->sinks : 0;
         if (nsink > p + 1) nsink = p + 1;
+        /* Heads in parallel: see k3_attn_lanes. W_UV is applied after the loop rather
+         * than inside it, so the threaded projection is not nested in a threaded loop;
+         * that is what the per-head al rows are for. */
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static) num_threads(nl) if (nl > 1)
+#endif
         for (int h = 0; h < H; h++) {
+            float *sc_h = sc + (size_t)k3_lane_id() * scw;
+            float *al_h = al + (size_t)h * kl;
             const float *qah = qa + (size_t)h * kl;
             const float *qrh = qt + (size_t)h * qh + qn;   /* the unrotated rope slots */
             float m = -INFINITY;
@@ -606,32 +662,34 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                      * values serve every head -- here they are simply the tail of the
                      * cached latent rather than a separate array */
                     for (int i = 0; i < qr; i++) d += (double)qrh[i] * (double)cs[kl + i];
-                    sc[n] = (float)d * scale;
-                    if (sc[n] > m) m = sc[n];
+                    sc_h[n] = (float)d * scale;
+                    if (sc_h[n] > m) m = sc_h[n];
                     n++;
                 }
             }
             double z = 0.0;
-            for (int i = 0; i < n; i++) { sc[i] = expf(sc[i] - m); z += sc[i]; }
+            for (int i = 0; i < n; i++) { sc_h[i] = expf(sc_h[i] - m); z += sc_h[i]; }
 
             /* weighted sum IN LATENT SPACE, then one W_UV per head. This is the second
              * half of the absorption: the 512-wide sum happens once, the 24576x512
              * expansion never happens at all. */
-            for (int i = 0; i < kl; i++) al[i] = 0.0f;
+            for (int i = 0; i < kl; i++) al_h[i] = 0.0f;
             n = 0;
             for (int pass = 0; pass < 2; pass++) {
                 const int a = pass ? s0 : 0;
                 const int b = pass ? p : nsink - 1;
                 for (int s = a; s <= b; s++) {
                     const int slot = k3_kv_slot(kv, s);
-                    const float pr = (float)(sc[n++] / z);
+                    const float pr = (float)(sc_h[n++] / z);
                     const float *cs = kv->lat + (size_t)slot * kvw;
-                    for (int i = 0; i < kl; i++) al[i] += pr * cs[i];
+                    for (int i = 0; i < kl; i++) al_h[i] += pr * cs[i];
                 }
             }
+        }
+        for (int h = 0; h < H; h++) {
             const unsigned char *wuv =
                 (const unsigned char *)w->kv_b + (size_t)(h * kvd + qn) * kvb_row;
-            k3_mmw(acc + (size_t)h * vh, al, wuv, w->wdt, kl, vh);
+            k3_mmw(acc + (size_t)h * vh, al + (size_t)h * kl, wuv, w->wdt, kl, vh);
         }
 
         /* ---- gate then projection, unchanged: the gate is why W_UV could not be
@@ -679,9 +737,9 @@ size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span)
          + (size_t)(c->kv_lora + c->qk_rope)           /* ct transient        */
          + (size_t)c->q_lora
          + (size_t)H * c->kv_lora                      /* absorbed queries    */
-         + (size_t)c->kv_lora                          /* latent attn sum     */
+         + (size_t)H * c->kv_lora                      /* latent attn sums    */
          + (size_t)2 * H * vh                          /* acc, gbuf           */
-         + (size_t)(span > T ? span : T);              /* scores              */
+         + (size_t)k3_attn_lanes(H) * (size_t)(span > T ? span : T);  /* scores  */
 }
 
 /* The transposed product, W row-major and never moved.
@@ -877,7 +935,7 @@ size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode)
              + (size_t)(c->kv_lora + c->qk_rope)       /* ct transient */
              + (size_t)c->q_lora
              + (size_t)2 * H * vh                      /* acc, gbuf    */
-             + (size_t)(cap > T ? cap : T);            /* scores       */
+             + (size_t)k3_attn_lanes(H) * (size_t)(cap > T ? cap : T);  /* scores */
     if (!cached_mode) n += (size_t)T * H * kvd + (size_t)T * c->qk_rope;
     return n;
 }
