@@ -1694,6 +1694,52 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
             int n = in - g * group;
             if (n > group) n = group;
 
+#if defined(__AVX2__)
+            /* FULL 32-ELEMENT GROUP, EXPANDED IN REGISTERS. This is every group of
+             * every K3 matrix (in is a multiple of 32), and it replaces the table walk
+             * below -- sixteen byte loads, thirty-two scalar stores, then reloads of
+             * the same floats through a store-forwarding stall -- with two shuffles.
+             *
+             * E2M1 is sign-magnitude: bit 3 is the sign and bits 0-2 index the eight
+             * magnitudes, and K3_E2M1[8] is -0.0f, so the 16-entry table is exactly
+             * "magnitude from the low three bits, then copy bit 3 into the IEEE sign
+             * bit". _mm256_permutevar8x32_ps reads only the low three bits of each
+             * index, and the sign is an XOR. Every expanded weight is therefore the
+             * SAME float the table walk produces, bit for bit, and the products,
+             * accumulators and reduction are untouched, so the output hash in
+             * bench_kernels and the mx4 == mxfp4 identity in test_ops both hold. */
+            if (n == 32) {
+                const __m256 mag = _mm256_setr_ps(0.0f, 0.5f, 1.0f, 1.5f,
+                                                  2.0f, 3.0f, 4.0f, 6.0f);
+                const __m256i sgn = _mm256_set1_epi32((int)0x80000000u);
+                const __m128i m4  = _mm_set1_epi8(0x0F);
+                const __m128i raw = _mm_loadu_si128((const __m128i *)pb);
+                const __m128i lo  = _mm_and_si128(raw, m4);                  /* even */
+                const __m128i hi  = _mm_and_si128(_mm_srli_epi16(raw, 4), m4); /* odd */
+                const __m128i e0  = _mm_unpacklo_epi8(lo, hi);   /* elements  0..15 */
+                const __m128i e1  = _mm_unpackhi_epi8(lo, hi);   /* elements 16..31 */
+                const __m128i src[4] = { e0, _mm_srli_si128(e0, 8),
+                                         e1, _mm_srli_si128(e1, 8) };
+                __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
+                for (int c = 0; c < 4; c++) {
+                    const __m256i idx = _mm256_cvtepu8_epi32(src[c]);
+                    const __m256 w8 = _mm256_xor_ps(
+                        _mm256_permutevar8x32_ps(mag, idx),
+                        _mm256_castsi256_ps(
+                            _mm256_and_si256(_mm256_slli_epi32(idx, 28), sgn)));
+                    v0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_castps256_ps128(w8)),
+                                         _mm256_cvtps_pd(_mm_loadu_ps(xg + 8 * c)), v0);
+                    v1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(w8, 1)),
+                                         _mm256_cvtps_pd(_mm_loadu_ps(xg + 8 * c + 4)),
+                                         v1);
+                }
+                double a[4];
+                _mm256_storeu_pd(a, _mm256_add_pd(v0, v1));
+                acc += ((a[0] + a[1]) + (a[2] + a[3])) * (double)K3_E8M0[sb];
+                continue;
+            }
+#endif
+
             /* Expand the group to floats first, then take a plain dot product. The
              * split exists so the second loop can vectorise, which it cannot do while
              * a table lookup sits in the middle of the accumulation. */
