@@ -71,6 +71,21 @@ not needing the bytes at all.
 
 ### Changed
 
+- **Compute kernels, all bit-identical to what they replace** (output hashes unchanged in
+  `bench_kernels` and in the oracle's per-step logit fingerprint):
+  - MXFP4 full groups are expanded in registers (shuffle + 8-entry permute + sign XOR)
+    instead of through a scalar table walk: **5.67 → 2.66 ms** mean for one 3072×3584
+    expert matrix, single thread, three runs per arm.
+  - bf16 and MXFP4 matmuls widen the shared activation to double once per call rather
+    than once per output row: bf16 12288×7168 **46.8 → 31.6 ms** mean, single thread.
+  - MLA attention (both cache layouts) scores positions and forms the weighted sum in
+    parallel instead of on one core. One latent-mode layer at real dimensions, bf16,
+    4 threads, best of 5: span 512 **45.2 → 31.7 ms**, span 4096 **233.6 → 90.4 ms**,
+    span 16384 **780.5 → 299.7 ms**.
+  - The KDA recurrence makes two passes over the state instead of four and no longer
+    allocates per head per token.
+- **GATE 5 compares logits bitwise against GATE 4**, not just decoded ids. Ids alone
+  missed a sink-region position attending to nothing.
 - **Expert cache replacement is S3-FIFO, not LRU.** The project's own simulator put 25.5
   points between LRU and Belady at 64 GB, and its own conclusion was that the lever is the
   policy rather than the size. Small FIFO, main FIFO, ghost queue; uniform object size
