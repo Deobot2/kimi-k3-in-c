@@ -236,9 +236,23 @@ static int argmax_(const float *v, int n)
  * K3KvCache they hand to the decoder, so they must not differ in anything else; two
  * near-identical copies of a decode loop is exactly how a gate ends up testing its own
  * copy of the bug. */
-static int decode_inc(Model *m, const K3Cfg *c, const int *full, int np, int T,
-                      int mode, int window, int sinks)
+/* FNV-1a over raw float bytes: a fingerprint of every logit a decode produced, so two
+ * runs that must agree BITWISE can be checked for it, not just for the same argmax. */
+static uint64_t fnv_logits(uint64_t h, const float *v, int n)
 {
+    const unsigned char *b = (const unsigned char *)v;
+    for (size_t i = 0; i < (size_t)n * sizeof(float); i++) {
+        h ^= b[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+/* *lhash (nullable) receives fnv_logits over every step's logits, in order. */
+static int decode_inc(Model *m, const K3Cfg *c, const int *full, int np, int T,
+                      int mode, int window, int sinks, uint64_t *lhash)
+{
+    uint64_t hh = 1469598103934665603ull;
     const int E = c->hidden;
     const int maxb = c->n_layers / c->attn_res_block + 2;
     const int P = c->kda_heads * c->kda_head_dim;
@@ -309,6 +323,7 @@ static int decode_inc(Model *m, const K3Cfg *c, const int *full, int np, int T,
             float *nrm = sc;
             k3_rmsnorm(nrm, h + (size_t)lastt * E, m->final_norm, E, c->rms_eps);
             k3_matmul(lg, nrm, m->lm_head, E, c->vocab);
+            hh = fnv_logits(hh, lg, c->vocab);
 
             cached = base + nT;
             if (cached >= T) break;
@@ -318,6 +333,7 @@ static int decode_inc(Model *m, const K3Cfg *c, const int *full, int np, int T,
     }
     free(kvc); free(rpc); free(lat); free(sc); free(h); free(br); free(ks);
     free(lg); free(gi);
+    if (lhash) *lhash = hh;
     return ok;
 }
 
@@ -439,7 +455,7 @@ int main(int argc, char **argv)
      * happens, not what is computed, so anything other than an exact match is a bug in
      * the state carrying, and that is exactly the failure this gate exists to catch. */
     {
-        const int iok = decode_inc(m, &c, full, np, T, K3_KV_EXPANDED, 0, 0);
+        const int iok = decode_inc(m, &c, full, np, T, K3_KV_EXPANDED, 0, 0, NULL);
         printf("GATE 3  incremental    : %d/%d generated tokens match full_ids"
                "  <- KV cache + carried KDA state\n", iok, T - np);
         gok = (iok == T - np) ? gok : -1;   /* fail the verdict if incremental diverged */
@@ -463,18 +479,26 @@ int main(int argc, char **argv)
      * at full width it must not bite at all, which is what makes the modular slot
      * arithmetic testable without asserting anything false about approximate decoding. */
     {
-        const int lok = decode_inc(m, &c, full, np, T, K3_KV_LATENT, 0, 0);
+        uint64_t lh = 0, wh = 1;
+        const int lok = decode_inc(m, &c, full, np, T, K3_KV_LATENT, 0, 0, &lh);
         printf("GATE 4  latent KV      : %d/%d generated tokens match full_ids"
                "  <- absorbed W_UK/W_UV, %.1fx smaller cache\n", lok, T - np,
                (double)(c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope)
                    / (double)(c.kv_lora + c.qk_rope));
         if (lok != T - np) gok = -1;
 
-        const int wok = decode_inc(m, &c, full, np, T, K3_KV_LATENT, T, 2);
+        /* Tokens alone are too weak here: the tiny model's logit gaps are wide enough
+         * that a sink-region position attending to NOTHING (an empty span where one
+         * sink was due) still decodes the same integers. At this width the windowed
+         * sweep visits the same positions in the same order as the unwindowed one, so
+         * every logit of every step must match gate 4 BITWISE. */
+        const int wok = decode_inc(m, &c, full, np, T, K3_KV_LATENT, T, 2, &wh);
         printf("GATE 5  latent window  : %d/%d generated tokens match full_ids"
                "  <- window %d + 2 sinks, wide enough to bind nothing\n",
                wok, T - np, T);
-        if (wok != T - np) gok = -1;
+        printf("        logits vs gate 4: %s  <- every step, every logit, bitwise\n",
+               wh == lh ? "identical" : "DIFFER");
+        if (wok != T - np || wh != lh) gok = -1;
     }
 
     const int pass = (tf_gen_ok == tf_gen) && (gok == T - np);
