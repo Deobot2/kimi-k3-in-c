@@ -278,6 +278,17 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
     }
 }
 
+/* Attention sweeps go parallel only past this many positions: below it the fork
+ * costs more than the O(span) work it splits. Column blocks of K3_ATTN_COLS floats
+ * (two cache lines) keep each thread's slice of a cached row contiguous. Neither
+ * value affects any result, only which thread computes it. */
+#ifndef K3_ATTN_PAR_MIN
+#define K3_ATTN_PAR_MIN 256
+#endif
+#ifndef K3_ATTN_COLS
+#define K3_ATTN_COLS    32
+#endif
+
 /* -------------------------------------------------------- KDA recurrence ---- */
 /* Four logical steps, two passes over S. Step 1 (decay) and step 2 (u = S^T k) both
  * walk the rows of S in order, as do step 3 (delta write) and step 4 (o = S^T q); each
@@ -467,7 +478,14 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         const int p = cached + t;
         for (int h = 0; h < H; h++) {
             const float *qt = q + ((size_t)t * H + h) * qh;
-            float m = -INFINITY;
+            /* Scores are independent per position (one accumulator each), so the
+             * sweep parallelises with no change to any result; the max, the
+             * normaliser and the per-column weighted sums stay in position order.
+             * Long contexts are where this matters: the sweep is O(p) per head and
+             * was the one serial O(context) loop left in decode. */
+#ifdef _OPENMP
+#           pragma omp parallel for schedule(static) if (p >= K3_ATTN_PAR_MIN)
+#endif
             for (int s = 0; s <= p; s++) {                 /* causal: s <= p */
                 const float *ks = K3_KV_AT(s) + (size_t)h * kvd;
                 const float *kr = K3_ROPE_AT(s);           /* shared slot */
@@ -477,17 +495,27 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                  * values serve every head. Dropping this term is the silent bug. */
                 for (int i = 0; i < qr; i++) d += (double)qt[qn + i] * (double)kr[i];
                 sc[s] = (float)d * scale;
-                if (sc[s] > m) m = sc[s];
             }
+            float m = -INFINITY;
+            for (int s = 0; s <= p; s++) if (sc[s] > m) m = sc[s];
             double z = 0.0;
             for (int s = 0; s <= p; s++) { sc[s] = expf(sc[s] - m); z += sc[s]; }
+            for (int s = 0; s <= p; s++) sc[s] = (float)(sc[s] / z);
 
+            /* Each output column accumulates over s in order inside one thread, so
+             * splitting the columns into blocks changes nothing but who sums them. */
             float *o = acc + (size_t)h * vh;
-            for (int j = 0; j < vh; j++) o[j] = 0.0f;
-            for (int s = 0; s <= p; s++) {
-                const float pr = (float)(sc[s] / z);
-                const float *vs = K3_KV_AT(s) + (size_t)h * kvd + qn;
-                for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
+#ifdef _OPENMP
+#           pragma omp parallel for schedule(static) if (p >= K3_ATTN_PAR_MIN)
+#endif
+            for (int j0 = 0; j0 < vh; j0 += K3_ATTN_COLS) {
+                const int j1 = j0 + K3_ATTN_COLS < vh ? j0 + K3_ATTN_COLS : vh;
+                for (int j = j0; j < j1; j++) o[j] = 0.0f;
+                for (int s = 0; s <= p; s++) {
+                    const float pr = sc[s];
+                    const float *vs = K3_KV_AT(s) + (size_t)h * kvd + qn;
+                    for (int j = j0; j < j1; j++) o[j] += pr * vs[j];
+                }
             }
         }
 
@@ -602,43 +630,50 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         for (int h = 0; h < H; h++) {
             const float *qah = qa + (size_t)h * kl;
             const float *qrh = qt + (size_t)h * qh + qn;   /* the unrotated rope slots */
-            float m = -INFINITY;
-            int n = 0;
-            /* sinks first, then the rolling span: ascending in absolute position, so
-             * the reduction order matches the contiguous case wherever they coincide */
-            for (int pass = 0; pass < 2; pass++) {
-                const int a = pass ? s0 : 0;
-                const int b = pass ? p : nsink - 1;
-                for (int s = a; s <= b; s++) {
-                    const int slot = k3_kv_slot(kv, s);
-                    const float *cs = kv->lat + (size_t)slot * kvw;
-                    double d = 0.0;
-                    for (int i = 0; i < kl; i++) d += (double)qah[i] * (double)cs[i];
-                    /* the rope slot is UNROTATED but still scored, and the SAME 64
-                     * values serve every head -- here they are simply the tail of the
-                     * cached latent rather than a separate array */
-                    for (int i = 0; i < qr; i++) d += (double)qrh[i] * (double)cs[kl + i];
-                    sc[n] = (float)d * scale;
-                    if (sc[n] > m) m = sc[n];
-                    n++;
-                }
+            /* Flatten the (at most two) ascending spans into one index range:
+             * j < nsink is sink j, the rest is s0 + (j - nsink). The spans never
+             * overlap (s0 >= sinks >= nsink), and the rolling span is EMPTY, not
+             * negative, while p is still inside the sink region (s0 = sinks > p).
+             * Each score has its own accumulator, so the sweep parallelises with no
+             * change to any result; it is O(context) per head and was the one serial
+             * O(context) loop left in decode. */
+            const int nroll = p >= s0 ? p - s0 + 1 : 0;
+            const int n = nsink + nroll;
+#ifdef _OPENMP
+#           pragma omp parallel for schedule(static) if (n >= K3_ATTN_PAR_MIN)
+#endif
+            for (int j = 0; j < n; j++) {
+                const int s = j < nsink ? j : s0 + (j - nsink);
+                const float *cs = kv->lat + (size_t)k3_kv_slot(kv, s) * kvw;
+                double d = 0.0;
+                for (int i = 0; i < kl; i++) d += (double)qah[i] * (double)cs[i];
+                /* the rope slot is UNROTATED but still scored, and the SAME 64
+                 * values serve every head -- here they are simply the tail of the
+                 * cached latent rather than a separate array */
+                for (int i = 0; i < qr; i++) d += (double)qrh[i] * (double)cs[kl + i];
+                sc[j] = (float)d * scale;
             }
+            float m = -INFINITY;
+            for (int j = 0; j < n; j++) if (sc[j] > m) m = sc[j];
             double z = 0.0;
             for (int i = 0; i < n; i++) { sc[i] = expf(sc[i] - m); z += sc[i]; }
+            for (int i = 0; i < n; i++) sc[i] = (float)(sc[i] / z);
 
             /* weighted sum IN LATENT SPACE, then one W_UV per head. This is the second
              * half of the absorption: the 512-wide sum happens once, the 24576x512
-             * expansion never happens at all. */
-            for (int i = 0; i < kl; i++) al[i] = 0.0f;
-            n = 0;
-            for (int pass = 0; pass < 2; pass++) {
-                const int a = pass ? s0 : 0;
-                const int b = pass ? p : nsink - 1;
-                for (int s = a; s <= b; s++) {
-                    const int slot = k3_kv_slot(kv, s);
-                    const float pr = (float)(sc[n++] / z);
-                    const float *cs = kv->lat + (size_t)slot * kvw;
-                    for (int i = 0; i < kl; i++) al[i] += pr * cs[i];
+             * expansion never happens at all. Each latent column sums over positions
+             * in order inside one thread; blocking the columns only splits the work. */
+#ifdef _OPENMP
+#           pragma omp parallel for schedule(static) if (n >= K3_ATTN_PAR_MIN)
+#endif
+            for (int i0 = 0; i0 < kl; i0 += K3_ATTN_COLS) {
+                const int i1 = i0 + K3_ATTN_COLS < kl ? i0 + K3_ATTN_COLS : kl;
+                for (int i = i0; i < i1; i++) al[i] = 0.0f;
+                for (int j = 0; j < n; j++) {
+                    const int s = j < nsink ? j : s0 + (j - nsink);
+                    const float pr = sc[j];
+                    const float *cs = kv->lat + (size_t)k3_kv_slot(kv, s) * kvw;
+                    for (int i = i0; i < i1; i++) al[i] += pr * cs[i];
                 }
             }
             const unsigned char *wuv =

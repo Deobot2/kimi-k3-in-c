@@ -103,7 +103,7 @@ CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
 UNIT_TESTS := test_ops test_cache test_st test_cfg test_tok scale_test k3_model \
-              test_trunk
+              k3_model_par test_trunk
 # Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
@@ -169,6 +169,12 @@ $(BIN)/scale_test: tests/unit/scale_test.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 $(BIN)/k3_model: tests/unit/k3_model.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
+# The same oracle with the attention sweeps forced parallel at every span and split into
+# ragged column blocks. The fixture model's context (32) is far below the production
+# threshold, so without this build the parallel attention path would never run in CI.
+$(BIN)/k3_model_par: tests/unit/k3_model.c src/core/k3_ops.c | $(BIN)
+	$(CC) $(CFLAGS) -DK3_ATTN_PAR_MIN=1 -DK3_ATTN_COLS=24 $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
 $(BIN)/bench_kernels: benchmarks/bench_kernels.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
@@ -195,6 +201,10 @@ test: $(TEST_BINS)
 	  fi
 	@echo "== real dimensions ==";   ./$(BIN)/scale_test
 	@echo "== full-model oracle =="; ./$(BIN)/k3_model $(FIXTURES)
+	@echo "== oracle, attention forced parallel =="; \
+	  OMP_NUM_THREADS=3 ./$(BIN)/k3_model_par $(FIXTURES) > $(BUILD)/oracle_par.log \
+	    || { cat $(BUILD)/oracle_par.log; exit 1; }; \
+	  grep -E 'GATE|logits|VERDICT' $(BUILD)/oracle_par.log
 	@echo "== eval metrics =="; \
 	  if python3 -c "import numpy" 2>/dev/null; then \
 	      python3 benchmarks/eval/run_eval.py --self-test || exit 1; \
