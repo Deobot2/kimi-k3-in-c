@@ -279,48 +279,60 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 }
 
 /* -------------------------------------------------------- KDA recurrence ---- */
+/* Four logical steps, two passes over S. Step 1 (decay) and step 2 (u = S^T k) both
+ * walk the rows of S in order, as do step 3 (delta write) and step 4 (o = S^T q); each
+ * pair is fused so a row is touched while it is still in L1. The fusion changes no
+ * arithmetic: within each pair, row i is final for the first operation before the
+ * second reads it, and u and o are still accumulated over i in increasing order with
+ * the same zero skips. S is D*D floats per head (64 KB at D=128), so four passes was
+ * four sweeps of L2 per head per token. */
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
-    /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
-     *    channel, not a scalar, which is what "channel-wise forget gate" means. */
+    /* u and then the prediction error d = v - u. Stack for every real head width;
+     * heap only beyond it. Allocated BEFORE S is touched: failing after the decay
+     * would leave the recurrent state permanently scaled but never updated -- silent,
+     * unrecoverable corruption of every subsequent token. */
+    float ubuf[256];
+    float *u = ubuf;
+    if (dv > 256) {
+        u = (float *)malloc((size_t)dv * sizeof(float));
+        if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    }
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
+
+    /* 1+2. channel-wise decay, scaling ROW i of S by alpha[i] (the gate is per key
+     *      channel, not a scalar: that is what "channel-wise forget gate" means), then
+     *      read the decayed row along k:  u = S^T k */
     for (int i = 0; i < dk; i++) {
         float *row = S + (size_t)i * dv;
         const float a = alpha[i];
         for (int j = 0; j < dv; j++) row[j] *= a;
-    }
-
-    /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
-     * would leave the recurrent state permanently scaled but never updated -- silent,
-     * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
-    for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) u[j] += ki * row[j];
     }
 
-    /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
-     *    it a DELTA rule rather than plain accumulation. */
-    for (int i = 0; i < dk; i++) {
-        const float ki = k[i];
-        if (ki == 0.0f) continue;
-        float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
-    }
+    /* (v - u) is the prediction error: this is what makes it a DELTA rule rather than
+     * plain accumulation. Formed once rather than per row; u is dead afterwards. */
+    for (int j = 0; j < dv; j++) u[j] = v[j] - u[j];
 
-    /* 4. output from the ALREADY UPDATED state: o = S^T q */
+    /* 3+4. rank-one delta write, then output from the ALREADY UPDATED row:
+     *      o = S^T q. ki * beta * d parses as (ki * beta) * d, so hoisting kb is the
+     *      same operation sequence. */
     for (int j = 0; j < dv; j++) o[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
+        float *row = S + (size_t)i * dv;
+        const float ki = k[i];
+        if (ki != 0.0f) {
+            const float kb = ki * beta;
+            for (int j = 0; j < dv; j++) row[j] += kb * u[j];
+        }
         const float qi = q[i];
         if (qi == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
+    if (u != ubuf) free(u);
 }
 
 /* ---------------------------------------------------------------- matmul ---- */
