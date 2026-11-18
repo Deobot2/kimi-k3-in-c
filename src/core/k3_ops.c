@@ -1460,6 +1460,16 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
 
 #if defined(__AVX2__)
 #include <immintrin.h>
+
+/* The activation widened to double, for kernels that would otherwise convert the
+ * same x once per output row. Exact, so it changes no result. */
+static double *k3_widen_x(const float *x, int n)
+{
+    double *xd = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
+    if (!xd) k3_fatal_oom("widened activation", (size_t)n * sizeof(double));
+    for (int i = 0; i < n; i++) xd[i] = (double)x[i];
+    return xd;
+}
 #endif
 
 /* y[out] = W[out][in] . x[in], with W stored as bf16 and widened on read.
@@ -1494,6 +1504,12 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
  */
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
 {
+#if defined(__AVX2__)
+    /* x is shared by every row, so widen it to double ONCE here rather than four
+     * cvtps_pd per sixteen elements per row. float -> double is exact, so the values
+     * the FMAs see are identical and the kernel stays bitwise equal to k3_matmul. */
+    double *xd = k3_widen_x(x, in);
+#endif
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
 #endif
@@ -1520,16 +1536,16 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
                 const __m128i h3 = _mm_loadl_epi64((const __m128i *)(row + i + 12));
                 v0 = _mm256_fmadd_pd(
                     _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h0), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i)), v0);
+                    _mm256_loadu_pd(xd + i), v0);
                 v1 = _mm256_fmadd_pd(
                     _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h1), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 4)), v1);
+                    _mm256_loadu_pd(xd + i + 4), v1);
                 v2 = _mm256_fmadd_pd(
                     _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h2), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 8)), v2);
+                    _mm256_loadu_pd(xd + i + 8), v2);
                 v3 = _mm256_fmadd_pd(
                     _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h3), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 12)), v3);
+                    _mm256_loadu_pd(xd + i + 12), v3);
             }
             /* (v0+v1)+(v2+v3) lanewise, then the same cross-lane pairing as scalar */
             const __m256d vt = _mm256_add_pd(_mm256_add_pd(v0, v1),
@@ -1554,6 +1570,9 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
         for (; i < in; i++) acc = fma((double)k3_bf16f(row[i]), (double)x[i], acc);
         y[o] = (float)acc;
     }
+#if defined(__AVX2__)
+    free(xd);
+#endif
 }
 
 /* Per-row int8 matmul for the draft model: each row is [f32 scale][int8 * in]. The int8
@@ -1678,7 +1697,15 @@ static void k3_e8m0_init(void)
  * two byte pointers come from. Two copies of this loop would be two chances to get the
  * nibble order right in one and wrong in the other, which is the failure mode the
  * mxfp4 fixture exists for and which no statistic would reveal. */
-static double mxfp4_rowdot(const float *x, const unsigned char *pr,
+#if defined(__AVX2__)
+#define MXFP4_WIDEN(x, n) k3_widen_x((x), (n))
+#else
+#define MXFP4_WIDEN(x, n) ((double *)NULL)
+#endif
+
+/* xd is x widened to double (k3_widen_x), used by the AVX2 full-group path; it may be
+ * NULL in a scalar build. */
+static double mxfp4_rowdot(const float *x, const double *xd, const unsigned char *pr,
                            const unsigned char *sr, int in, int group)
 {
     const int ngrp  = (in + group - 1) / group;
@@ -1708,7 +1735,8 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
              * SAME float the table walk produces, bit for bit, and the products,
              * accumulators and reduction are untouched, so the output hash in
              * bench_kernels and the mx4 == mxfp4 identity in test_ops both hold. */
-            if (n == 32) {
+            if (n == 32 && xd) {
+                const double *xdg = xd + (size_t)g * group;
                 const __m256 mag = _mm256_setr_ps(0.0f, 0.5f, 1.0f, 1.5f,
                                                   2.0f, 3.0f, 4.0f, 6.0f);
                 const __m256i sgn = _mm256_set1_epi32((int)0x80000000u);
@@ -1728,10 +1756,9 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
                         _mm256_castsi256_ps(
                             _mm256_and_si256(_mm256_slli_epi32(idx, 28), sgn)));
                     v0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_castps256_ps128(w8)),
-                                         _mm256_cvtps_pd(_mm_loadu_ps(xg + 8 * c)), v0);
+                                         _mm256_loadu_pd(xdg + 8 * c), v0);
                     v1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(w8, 1)),
-                                         _mm256_cvtps_pd(_mm_loadu_ps(xg + 8 * c + 4)),
-                                         v1);
+                                         _mm256_loadu_pd(xdg + 8 * c + 4), v1);
                 }
                 double a[4];
                 _mm256_storeu_pd(a, _mm256_add_pd(v0, v1));
@@ -1809,13 +1836,15 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
 
     if (!k3_pair_ready)  k3_pair_init();
     if (!k3_e8m0_ready)  k3_e8m0_init();
+    double *xd = MXFP4_WIDEN(x, in);
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (rows > 64)
 #endif
     for (int r = 0; r < rows; r++)
-        y[r] = (float)mxfp4_rowdot(x, packed + (size_t)r * pcols,
+        y[r] = (float)mxfp4_rowdot(x, xd, packed + (size_t)r * pcols,
                                    scales + (size_t)r * ngrp, in, group);
+    free(xd);
 }
 
 /* A quantised trunk matrix: `out` rows of [packed nibbles][E8M0 scales], each row
@@ -1830,14 +1859,16 @@ void k3_matmul_mx4(float *y, const float *x, const void *W, int in, int out)
 
     if (!k3_pair_ready)  k3_pair_init();
     if (!k3_e8m0_ready)  k3_e8m0_init();
+    double *xd = MXFP4_WIDEN(x, in);
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
 #endif
     for (int r = 0; r < out; r++) {
         const unsigned char *row = base + (size_t)r * rb;
-        y[r] = (float)mxfp4_rowdot(x, row, row + pn, in, K3_MXFP4_GROUP);
+        y[r] = (float)mxfp4_rowdot(x, xd, row, row + pn, in, K3_MXFP4_GROUP);
     }
+    free(xd);
 }
 
 void k3_mxfp4_dequant(float *out, const unsigned char *packed,
