@@ -1642,19 +1642,30 @@ void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
 }
 
 /* A whole BYTE to its two E2M1 values, so the inner loop does one 8-byte load instead
- * of masking, shifting and two separate lookups. 2 KB, built once, shared by all
- * threads after initialisation. */
-static float K3_E2M1_PAIR[256][2];
-static int   k3_pair_ready = 0;
-
-static void k3_pair_init(void)
-{
-    for (int b = 0; b < 256; b++) {
-        K3_E2M1_PAIR[b][0] = K3_E2M1[b & 0x0F];   /* low nibble  = EVEN element */
-        K3_E2M1_PAIR[b][1] = K3_E2M1[b >> 4];     /* high nibble = ODD element  */
-    }
-    k3_pair_ready = 1;
-}
+ * of masking, shifting and two separate lookups. 2 KB.
+ *
+ * A compile-time constant rather than a table filled on first use: no init flag to
+ * check on every call, and no window in which a caller inside a parallel region could
+ * read it half built. K3_E2M1_V(n) is the E2M1 table above as a constant expression
+ * (magnitude codes 0-3 step 0.5, 4-5 step 1, 6-7 step 2; bit 3 the sign, so code 8 is
+ * -0.0), and t_mxfp4 checks the result against the released checkpoint bytes. */
+#define K3_E2M1_M(m) ((m) < 4 ? (float)(m) * 0.5f : (m) < 6 ? (float)((m) - 2) \
+                                                            : (float)((m) - 4) * 2.0f)
+#define K3_E2M1_V(n) (((n) & 8) ? -K3_E2M1_M((n) & 7) : K3_E2M1_M((n) & 7))
+/* low nibble = EVEN element, high nibble = ODD element */
+#define K3_P1(b)  { K3_E2M1_V((b) & 15), K3_E2M1_V((b) >> 4) }
+#define K3_P4(b)  K3_P1(b), K3_P1((b) + 1), K3_P1((b) + 2), K3_P1((b) + 3)
+#define K3_P16(b) K3_P4(b), K3_P4((b) + 4), K3_P4((b) + 8), K3_P4((b) + 12)
+#define K3_P64(b) K3_P16(b), K3_P16((b) + 16), K3_P16((b) + 32), K3_P16((b) + 48)
+static const float K3_E2M1_PAIR[256][2] = {
+    K3_P64(0), K3_P64(64), K3_P64(128), K3_P64(192)
+};
+#undef K3_P64
+#undef K3_P16
+#undef K3_P4
+#undef K3_P1
+#undef K3_E2M1_V
+#undef K3_E2M1_M
 
 /* y[rows] = W[rows][in] . x[in], with W read straight out of packed MXFP4 and never
  * materialised as floats. This is not an optimisation; it is what makes streaming
@@ -1779,7 +1790,6 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
     const int pcols = in / 2;                     /* two elements per byte */
     const int ngrp  = (in + group - 1) / group;
 
-    if (!k3_pair_ready)  k3_pair_init();
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (rows > 64)
@@ -1799,7 +1809,6 @@ void k3_matmul_mx4(float *y, const float *x, const void *W, int in, int out)
     const size_t pn = (size_t)in / 2u;
     const unsigned char *base = (const unsigned char *)W;
 
-    if (!k3_pair_ready)  k3_pair_init();
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
