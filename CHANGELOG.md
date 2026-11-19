@@ -71,6 +71,25 @@ not needing the bytes at all.
 
 ### Changed
 
+- **CPU kernels, all bit-identical to what they replace.** None of these changes a
+  single output bit, which was checked against the previous object code on every weight
+  type and pinned with new order-sensitive tests (`matmul_tr`, `router_exact` in
+  `test_ops`; their fixtures carry cancelling ±2^70 pairs so a reordered double sum is
+  visible after the float round). Measured on 4 cores, three runs each; see the commits.
+  - **Router**: eight experts' dot products share one loop, so 896 serial add chains
+    overlap. ~4.2x on one thread, ~2.4x on four (7168 x 896): ~150 ms/token over 92
+    MoE layers.
+  - **Latent MLA attention**: the 96 heads run in parallel, each with its own scores.
+    2.2x per decode step at 512 context, 3.3x at 4096. The expanded-cache path gets
+    the same treatment, 1.4x / 1.8x. Scratch grows by one score row per head (+1.7 MB at
+    span 4096).
+  - **`k3_matmul_tr`** (the absorbed query under `--mla-latent`): column blocks with
+    rows outer, so each row is a contiguous read. 3.7-5x for fp32/bf16/int8; for MXFP4,
+    3.2x from decoding E8M0 scales from bits instead of `ldexpf` per element, then 1.4x more.
+  - **KDA delta rule**: two sweeps over the state instead of four, ~20%.
+  - **MXFP4 tables** are compile-time constants; no lazily initialised globals remain in
+    `k3_ops.c`.
+
 - **Expert cache replacement is S3-FIFO, not LRU.** The project's own simulator put 25.5
   points between LRU and Belady at 64 GB, and its own conclusion was that the lever is the
   policy rather than the size. Small FIFO, main FIFO, ghost queue; uniform object size
