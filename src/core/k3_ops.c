@@ -554,10 +554,23 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     float *ct   = q    + (size_t)T * H * qh;        /* [kvw] transient */
     float *ql   = ct   + (size_t)kvw;               /* [q_lora]        */
     float *qa   = ql   + (size_t)c->q_lora;         /* [H][kl] absorbed queries */
-    float *al   = qa   + (size_t)H * kl;            /* [kl] latent attention sum */
-    float *acc  = al   + (size_t)kl;                /* [H][vh]         */
+    float *al   = qa   + (size_t)H * kl;            /* [H][kl] latent attention sums */
+    float *acc  = al   + (size_t)H * kl;            /* [H][vh]         */
     float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate    */
-    float *sc   = gbuf + (size_t)H * vh;            /* [span] scores   */
+    float *sc   = gbuf + (size_t)H * vh;            /* [H][nmax] scores */
+
+    /* Heads attend in PARALLEL, so each owns its scores and its latent sum. nmax is
+     * the most positions any head attends to in this call: the count of sinks plus
+     * the rolling span, which never shrinks as p grows, so the last position bounds
+     * it. The caller sized the scores for `span` per head (k3_mla_scratch_latent), and
+     * a position can never attend to more than span. */
+    int nmax;
+    {
+        const int s0 = k3_kv_first(kv, last);
+        int ns = kv->window ? kv->sinks : 0;
+        if (ns > last + 1) ns = last + 1;
+        nmax = ns + (last >= s0 ? last - s0 + 1 : 0);
+    }
 
     const size_t kvb_row = k3_row_bytes(w->wdt, kl);
 
@@ -606,7 +619,17 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         const int s0 = k3_kv_first(kv, p);
         int nsink = kv->window ? kv->sinks : 0;
         if (nsink > p + 1) nsink = p + 1;
+        /* Each head is an independent softmax over the same cached latents, so the
+         * split across threads changes no arithmetic: every reduction below runs
+         * entirely inside one head, in the same order as the serial loop. k3_mmw
+         * inside is then a nested region and runs on this head's thread, and its
+         * rows are independent too, so that is bit-identical as well. */
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static)
+#endif
         for (int h = 0; h < H; h++) {
+            float *sch = sc + (size_t)h * nmax;
+            float *alh = al + (size_t)h * kl;
             const float *qah = qa + (size_t)h * kl;
             const float *qrh = qt + (size_t)h * qh + qn;   /* the unrotated rope slots */
             float m = -INFINITY;
@@ -625,32 +648,32 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                      * values serve every head -- here they are simply the tail of the
                      * cached latent rather than a separate array */
                     for (int i = 0; i < qr; i++) d += (double)qrh[i] * (double)cs[kl + i];
-                    sc[n] = (float)d * scale;
-                    if (sc[n] > m) m = sc[n];
+                    sch[n] = (float)d * scale;
+                    if (sch[n] > m) m = sch[n];
                     n++;
                 }
             }
             double z = 0.0;
-            for (int i = 0; i < n; i++) { sc[i] = expf(sc[i] - m); z += sc[i]; }
+            for (int i = 0; i < n; i++) { sch[i] = expf(sch[i] - m); z += sch[i]; }
 
             /* weighted sum IN LATENT SPACE, then one W_UV per head. This is the second
              * half of the absorption: the 512-wide sum happens once, the 24576x512
              * expansion never happens at all. */
-            for (int i = 0; i < kl; i++) al[i] = 0.0f;
+            for (int i = 0; i < kl; i++) alh[i] = 0.0f;
             n = 0;
             for (int pass = 0; pass < 2; pass++) {
                 const int a = pass ? s0 : 0;
                 const int b = pass ? p : nsink - 1;
                 for (int s = a; s <= b; s++) {
                     const int slot = k3_kv_slot(kv, s);
-                    const float pr = (float)(sc[n++] / z);
+                    const float pr = (float)(sch[n++] / z);
                     const float *cs = kv->lat + (size_t)slot * kvw;
-                    for (int i = 0; i < kl; i++) al[i] += pr * cs[i];
+                    for (int i = 0; i < kl; i++) alh[i] += pr * cs[i];
                 }
             }
             const unsigned char *wuv =
                 (const unsigned char *)w->kv_b + (size_t)(h * kvd + qn) * kvb_row;
-            k3_mmw(acc + (size_t)h * vh, al, wuv, w->wdt, kl, vh);
+            k3_mmw(acc + (size_t)h * vh, alh, wuv, w->wdt, kl, vh);
         }
 
         /* ---- gate then projection, unchanged: the gate is why W_UV could not be
@@ -698,9 +721,9 @@ size_t k3_mla_scratch_latent(const K3Cfg *c, int T, int span)
          + (size_t)(c->kv_lora + c->qk_rope)           /* ct transient        */
          + (size_t)c->q_lora
          + (size_t)H * c->kv_lora                      /* absorbed queries    */
-         + (size_t)c->kv_lora                          /* latent attn sum     */
+         + (size_t)H * c->kv_lora                      /* latent attn sums    */
          + (size_t)2 * H * vh                          /* acc, gbuf           */
-         + (size_t)(span > T ? span : T);              /* scores              */
+         + (size_t)H * (span > T ? span : T);          /* scores, per head    */
 }
 
 /* The transposed product, W row-major and never moved.
