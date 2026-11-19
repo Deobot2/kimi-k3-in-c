@@ -301,42 +301,42 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
-    /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
-     *    channel, not a scalar, which is what "channel-wise forget gate" means. */
-    for (int i = 0; i < dk; i++) {
-        float *row = S + (size_t)i * dv;
-        const float a = alpha[i];
-        for (int j = 0; j < dv; j++) row[j] *= a;
-    }
+    /* TWO sweeps over S, not four. Steps 1+2 and steps 3+4 below each touch row i
+     * of S once: every element sees exactly the operations it saw when each step was
+     * its own pass over the whole matrix, and each accumulator (u[j], o[j]) still sums
+     * i = 0..dk-1 in order, so the result is bit-identical. The fusion is legal only
+     * in these pairs: step 3 needs ALL of u, so it cannot start until step 2 has seen
+     * every row, and step 4 must read the row step 3 just wrote. */
 
-    /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
-     * would leave the recurrent state permanently scaled but never updated -- silent,
+    /* Allocated BEFORE S is touched. Failing here after the decay had run would
+     * leave the recurrent state permanently scaled but never updated -- silent,
      * unrecoverable corruption of every subsequent token. */
     float *u = (float *)calloc((size_t)dv, sizeof(float));
     if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+
     for (int i = 0; i < dk; i++) {
+        float *row = S + (size_t)i * dv;
+        /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
+         *    channel, not a scalar, which is what "channel-wise forget gate" means. */
+        const float a = alpha[i];
+        for (int j = 0; j < dv; j++) row[j] *= a;
+        /* 2. read the DECAYED state along k:  u = S^T k */
         const float ki = k[i];
         if (ki == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) u[j] += ki * row[j];
     }
 
-    /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
-     *    it a DELTA rule rather than plain accumulation. */
-    for (int i = 0; i < dk; i++) {
-        const float ki = k[i];
-        if (ki == 0.0f) continue;
-        float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
-    }
-
-    /* 4. output from the ALREADY UPDATED state: o = S^T q */
     for (int j = 0; j < dv; j++) o[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
+        float *row = S + (size_t)i * dv;
+        /* 3. rank-one delta write. (v - u) is the prediction error: this is what
+         *    makes it a DELTA rule rather than plain accumulation. */
+        const float ki = k[i];
+        if (ki != 0.0f)
+            for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
+        /* 4. output from the ALREADY UPDATED row: o = S^T q */
         const float qi = q[i];
         if (qi == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
     free(u);
