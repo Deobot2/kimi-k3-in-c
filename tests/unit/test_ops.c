@@ -1020,8 +1020,8 @@ static void t_matmul_bf16(void)
  * bit equality against the obvious implementation can tell the two apart. The tolerance
  * check in t_mxfp4 cannot: a reordered sum is ~1e-16 away, far inside any tolerance.
  *
- * Adversarial on purpose: `in` is not a multiple of the 32-column block (a full block,
- * then a partial one), there is an odd width for the types that allow it, and some
+ * Adversarial on purpose: for the types that allow it `in` is not a multiple of the
+ * 32-column block (a full block, then a partial one) and one width is odd; and some
  * MXFP4 scales are the NaN byte. A NaN-scale group must SKIP the add, not add zero; the
  * two differ only when x is not finite (inf * w * 0 is NaN), so for MXFP4 one row has
  * x = +inf and every one of its scales NaN. Skipping leaves the output finite; adding a
@@ -1054,14 +1054,17 @@ static void t_matmul_tr_exact(void)
 {
     static const int   types[4] = { K3_WF32, K3_WBF16, K3_WI8, K3_WMX4 };
     static const char *names[4] = { "f32", "bf16", "i8", "mx4" };
-    static const int   widths[2] = { 72, 41 };
+    /* MXFP4 rows carry in/32 scale bytes, so its widths must be multiples of 32 (the
+     * packer enforces it); the other types take a ragged final block and an odd width */
+    static const int   widths[2]    = { 72, 41 };
+    static const int   widths_mx[2] = { 96, 64 };
     const int rows = 37;
     int bad = 0, cases = 0;
     unsigned s = 0xA11CEu;
 
     for (int t = 0; t < 4; t++) for (int wi = 0; wi < 2; wi++) {
-        const int wdt = types[t], in = widths[wi];
-        if (wdt == K3_WMX4 && (in & 1)) continue;      /* two elements per byte */
+        const int wdt = types[t];
+        const int in  = (wdt == K3_WMX4) ? widths_mx[wi] : widths[wi];
         const size_t rb = k3_row_bytes(wdt, in);
         unsigned char *W = (unsigned char *)malloc(rb * rows);
         float *x = (float *)malloc((size_t)rows * sizeof(float));
