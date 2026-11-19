@@ -1135,6 +1135,65 @@ static void t_matmul_tr_exact(void)
                   cases); g_pass++; }
 }
 
+/* k3_router must equal a naive one-expert-at-a-time router EXACTLY.
+ *
+ * The kernel interleaves several experts' dot products for throughput; each expert's
+ * accumulator must still sum i = 0..hidden-1 in order. As in t_matmul_tr_exact, random
+ * data cannot see a reordered double sum after the float round, so columns 0,1 and
+ * 40,41 of every row are equal and x carries +2^70, -2^70 there: in order the first pair
+ * cancels exactly and the second absorbs the partial sum before it, so any split or
+ * reordering of one expert's sum moves its score. n_experts = 13 leaves a ragged block. */
+static void t_router_exact(void)
+{
+    const int hidden = 67, E = 13, K = 4;
+    float W[13 * 67], x[67], bias[13], wa[4], wb[4];
+    int ia[4], ib[4];
+    unsigned s = 0xB0B5u;
+    for (int i = 0; i < E * hidden; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        W[i] = (float)(s >> 8) / 8388608.0f - 1.0f;
+    }
+    for (int i = 0; i < hidden; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        x[i] = ((float)(s >> 8) / 8388608.0f - 1.0f) * 1e-3f;
+    }
+    for (int e = 0; e < E; e++) {
+        W[e * hidden + 1]  = W[e * hidden + 0];
+        W[e * hidden + 41] = W[e * hidden + 40];
+        bias[e] = 0.01f * (float)(e % 5);
+    }
+    x[0] = x[40] = ldexpf(1.0f, 70);
+    x[1] = x[41] = -ldexpf(1.0f, 70);
+
+    k3_router(ia, wa, x, W, bias, hidden, E, K, 1, 2.5f);
+
+    /* the reference: serial, one accumulator per expert, same selection rules */
+    float score[13], choice[13];
+    for (int e = 0; e < E; e++) {
+        double acc = 0.0;
+        for (int i = 0; i < hidden; i++) acc += (double)W[e * hidden + i] * (double)x[i];
+        score[e]  = 1.0f / (1.0f + expf(-(float)acc));
+        choice[e] = score[e] + bias[e];
+    }
+    for (int j = 0; j < K; j++) {
+        int best = -1; float bv = -INFINITY;
+        for (int e = 0; e < E; e++) if (choice[e] > bv) { bv = choice[e]; best = e; }
+        ib[j] = best; wb[j] = score[best]; choice[best] = -INFINITY;
+    }
+    double sum = 0.0;
+    for (int j = 0; j < K; j++) sum += (double)wb[j];
+    const float inv = (float)(1.0 / (sum + 1e-20));
+    for (int j = 0; j < K; j++) wb[j] = wb[j] * inv * 2.5f;
+
+    if (memcmp(ia, ib, sizeof ia) || memcmp(wa, wb, sizeof wa)) {
+        printf("  FAIL  router_exact  differs from the serial per-expert router\n");
+        g_fail++;
+    } else {
+        printf("  PASS  router_exact  E=%d k=%d  bit-identical to a serial router\n", E, K);
+        g_pass++;
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -1168,6 +1227,7 @@ int main(int argc, char **argv)
     t_recur(dir, "kda_recur1");
     t_recur(dir, "kda_recur8");
     t_router(dir);
+    t_router_exact();
     t_mla(dir);
     t_moe(dir);
     t_mxfp4(dir);

@@ -824,15 +824,33 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
      * ORDER INSIDE an expert is untouched: thread t still sums i = 0..hidden-1 in
      * sequence into its own double. Splitting the outer loop therefore cannot change a
      * single bit, which is why this needs no tolerance and no re-gating. */
+    /* EIGHT EXPERTS AT A TIME, still bit-identical. One expert's sum is a single chain
+     * of dependent double adds, so a lone dot product runs at add LATENCY, not
+     * throughput. Interleaving eight experts gives eight independent chains the core
+     * overlaps, while each expert's own accumulator still sums i = 0..hidden-1 in order
+     * with the same mul-then-add -- the lanes are experts, never pieces of one sum. A
+     * ragged tail of fewer than eight runs the same loop with fewer live lanes. */
+    enum { RB = 8 };
+    const int nblk = (n_experts + RB - 1) / RB;
 #ifdef _OPENMP
 #   pragma omp parallel for schedule(static)
 #endif
-    for (int e = 0; e < n_experts; e++) {
-        const float *row = W + (size_t)e * hidden;
-        double acc = 0.0;
-        for (int i = 0; i < hidden; i++) acc += (double)row[i] * (double)x[i];
-        score[e]  = 1.0f / (1.0f + expf(-(float)acc));
-        choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
+    for (int b = 0; b < nblk; b++) {
+        const int e0 = b * RB;
+        const int ne = n_experts - e0 < RB ? n_experts - e0 : RB;
+        const float *rows[RB];
+        double acc[RB] = {0};
+        for (int k = 0; k < RB; k++)              /* dead lanes re-read the last row */
+            rows[k] = W + (size_t)(e0 + (k < ne ? k : ne - 1)) * hidden;
+        for (int i = 0; i < hidden; i++) {
+            const double xi = (double)x[i];
+            for (int k = 0; k < RB; k++) acc[k] += (double)rows[k][i] * xi;
+        }
+        for (int k = 0; k < ne; k++) {
+            const int e = e0 + k;
+            score[e]  = 1.0f / (1.0f + expf(-(float)acc[k]));
+            choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
+        }
     }
 
     /* top-k by repeated max. n_experts is 896 and topk is 16, so this is 14k
