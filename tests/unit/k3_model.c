@@ -33,6 +33,7 @@
 /* ------------------------------------------------------------ weight store ---- */
 typedef struct {
     float *blob;
+    jval  *root;         /* the parsed manifest, kept so it can be freed      */
     jval  *man;          /* the "tensors" object: name -> {offset, shape} */
     char  *arena;
     char  *raw;
@@ -55,8 +56,8 @@ static int store_open(Store *s, const char *dir)
     snprintf(p, sizeof p, "%s/tiny_k3.json", dir);
     s->raw = slurp_(p, NULL);
     if (!s->raw) return 0;
-    jval *root = json_parse(s->raw, &s->arena);
-    s->man = json_get(root, "tensors");
+    s->root = json_parse(s->raw, &s->arena);
+    s->man  = json_get(s->root, "tensors");
 
     snprintf(p, sizeof p, "%s/tiny_k3.bin", dir);
     long n = 0;
@@ -492,6 +493,7 @@ int main(int argc, char **argv)
     for (int L = 0; L < c.n_layers; L++) { free(m->w1[L]); free(m->w3[L]); free(m->w2[L]); }
     free(m);
 
+    json_free(ref); json_free(st.root);
     free(rtxt); free(rar); free(st.raw); free(st.arena); free(st.blob);
     /* Return the VERDICT, not 0.
      * Propagate the gate result as the exit status so the top-level

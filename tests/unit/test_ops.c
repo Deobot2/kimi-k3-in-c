@@ -166,7 +166,7 @@ static void t_rmsnorm(const char *dir)
         report("rmsnorm", y, e, no);
         free(y);
     }
-    free(w); free(x); free(e); free(txt); free(ar);
+    free(w); free(x); free(e); json_free(r); free(txt); free(ar);
 }
 
 static void t_situ(const char *dir)
@@ -186,7 +186,7 @@ static void t_situ(const char *dir)
             printf("  FAIL  situ_glu       shape mismatch: in=[%d,%d] out=[%d,%d], "
                    "expected in=[%d,%d]\n", din[0], din[1], R, W, R, 2 * W);
             g_fail++;
-            free(x); free(e); free(txt); free(ar);
+            free(x); free(e); json_free(r); free(txt); free(ar);
             return;
         }
         float *y = (float *)malloc((size_t)no * sizeof(float));
@@ -208,7 +208,7 @@ static void t_situ(const char *dir)
         }
         free(y);
     }
-    free(x); free(e); free(txt); free(ar);
+    free(x); free(e); json_free(r); free(txt); free(ar);
 }
 
 static void t_shortconv(const char *dir)
@@ -249,7 +249,7 @@ static void t_shortconv(const char *dir)
         }
         free(y); free(s);
     }
-    free(w); free(x); free(e); free(st); free(xn); free(en); free(txt); free(ar);
+    free(w); free(x); free(e); free(st); free(xn); free(en); json_free(r); free(txt); free(ar);
 }
 
 static void t_decay(const char *dir)
@@ -295,7 +295,7 @@ static void t_decay(const char *dir)
                z ? "" : " (z absent: regenerate with tools/emit_fixtures.py)");
         g_fail++;
     }
-    free(A); free(dt); free(eg); free(ea); free(z); free(txt); free(ar);
+    free(A); free(dt); free(eg); free(ea); free(z); json_free(r); free(txt); free(ar);
 }
 
 static void t_attnres(const char *dir)
@@ -322,7 +322,7 @@ static void t_attnres(const char *dir)
         report("attn_res", y, e, no);
         free(src); free(y);
     }
-    free(px); free(br); free(fold); free(e); free(txt); free(ar);
+    free(px); free(br); free(fold); free(e); json_free(r); free(txt); free(ar);
 }
 
 /* The isolated recurrence. This is where the ordering bug lives: decay, then the
@@ -364,7 +364,7 @@ static void t_recur(const char *dir, const char *file)
         free(S); free(out); free(qs_);
     }
     free(q); free(k); free(v); free(al); free(bt); free(eo); free(es);
-    free(txt); free(ar);
+    json_free(r); free(txt); free(ar);
 }
 
 /* Router. The fixture's frozen bias reorders the top-k in 5 of 6 rows, so an engine
@@ -421,7 +421,7 @@ static void t_router(const char *dir)
         }
         free(gi); free(gw);
     }
-    free(W); free(bias); free(x); free(eidx); free(ewt); free(txt); free(ar);
+    free(W); free(bias); free(x); free(eidx); free(ewt); json_free(r); free(txt); free(ar);
 }
 
 /* Gated MLA. The fixture now ships all eight weight tensors, so this is genuinely
@@ -538,7 +538,7 @@ static void t_mla(const char *dir)
     free((void *)w.q_a); free((void *)w.q_a_norm); free((void *)w.q_b);
     free((void *)w.kv_a); free((void *)w.kv_a_norm); free((void *)w.kv_b);
     free((void *)w.o); free((void *)w.g);
-    free(txt); free(ar);
+    json_free(r); free(txt); free(ar);
 }
 
 /* Stable LatentMoE. The fixture drives SiTU into its caps and uses a routing bias
@@ -624,7 +624,7 @@ static void t_moe(const char *dir)
     free(x); free(eo); free(W1); free(W3); free(W2);
     free((void *)w.gate); free((void *)w.bias); free((void *)w.down); free((void *)w.up);
     free((void *)w.latent_norm); free((void *)w.sh1); free((void *)w.sh3); free((void *)w.sh2);
-    free(txt); free(ar);
+    json_free(r); free(txt); free(ar);
 }
 
 /* The full KDA layer. This is the last and hardest component before the decoder
@@ -683,7 +683,7 @@ static void t_kda_layer(const char *dir, const char *file)
     free((void*)w.f_a); free((void*)w.f_b); free((void*)w.A_log);
     free((void*)w.dt_bias); free((void*)w.b); free((void*)w.g);
     free((void*)w.o_norm); free((void*)w.o);
-    free(txt); free(ar);
+    json_free(r); free(txt); free(ar);
 }
 
 /* A whole decoder layer: the AttnRes wiring plus attention plus the MoE. This is the
@@ -816,8 +816,23 @@ static void t_layer(const char *dir, const char *file)
         free(h); free(br); free(sc); free(st);
     }
     free(x); free(eo); free(bri);
+    /* every array arr() handed out above; free(NULL) covers the branch not taken */
+    free((void*)lw.in_norm); free((void*)lw.post_norm);
+    free((void*)lw.attn_res_norm); free((void*)lw.attn_res_proj);
+    free((void*)lw.mlp_res_norm);  free((void*)lw.mlp_res_proj);
+    free((void*)mw.q_a); free((void*)mw.q_a_norm); free((void*)mw.q_b);
+    free((void*)mw.kv_a); free((void*)mw.kv_a_norm); free((void*)mw.kv_b);
+    free((void*)mw.o); free((void*)mw.g);
+    free((void*)kw.q); free((void*)kw.k); free((void*)kw.v);
+    free((void*)kw.q_conv); free((void*)kw.k_conv); free((void*)kw.v_conv);
+    free((void*)kw.f_a); free((void*)kw.f_b); free((void*)kw.A_log);
+    free((void*)kw.dt_bias); free((void*)kw.b); free((void*)kw.g);
+    free((void*)kw.o_norm); free((void*)kw.o);
+    free((void*)ow.gate); free((void*)ow.bias); free((void*)ow.down); free((void*)ow.up);
+    free((void*)ow.latent_norm);
+    free((void*)ow.sh1); free((void*)ow.sh3); free((void*)ow.sh2);
     free((void*)ow.w1); free((void*)ow.w3); free((void*)ow.w2);
-    free(txt); free(ar);
+    json_free(r); free(txt); free(ar);
 }
 
 /* MXFP4 dequant, checked against REAL Kimi K3 checkpoint bytes. Every other fixture
@@ -957,7 +972,7 @@ static void t_mxfp4(const char *dir)
         }
         free(P); free(S); free(y);
     }
-    free(pf); free(sf); free(ef); free(txt); free(ar);
+    free(pf); free(sf); free(ef); json_free(r); free(txt); free(ar);
 }
 
 /* k3_matmul_bf16 must equal k3_matmul EXACTLY, not approximately.
@@ -1219,7 +1234,7 @@ int main(int argc, char **argv)
             const double fr = tolo ? num(tolo, "fp32_rel", RTOL) : RTOL;
             ATOL = (float)fa; RTOL = (float)fr;
             printf("tolerance: atol=%.1e rtol=%.1e  (from MANIFEST.json)\n\n", fa, fr);
-            free(mtxt); free(mar);
+            json_free(m); free(mtxt); free(mar);
         }
     }
 
