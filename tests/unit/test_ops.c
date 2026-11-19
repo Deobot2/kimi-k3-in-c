@@ -1012,6 +1012,129 @@ static void t_matmul_bf16(void)
     free(Wb); free(Wf); free(x); free(ya); free(yb);
 }
 
+/* k3_matmul_tr must equal a NAIVE column-outer sweep EXACTLY, for every weight type.
+ *
+ * The kernel's contract is the summation order: y[j] is one double accumulator over
+ * rows r = 0..rows-1, ascending, with the product associated as (x * w) * scale. The
+ * kernel is free to block and reorder its LOOPS for speed, but not that order, and only
+ * bit equality against the obvious implementation can tell the two apart. The tolerance
+ * check in t_mxfp4 cannot: a reordered sum is ~1e-16 away, far inside any tolerance.
+ *
+ * Adversarial on purpose: `in` is not a multiple of the 32-column block (a full block,
+ * then a partial one), there is an odd width for the types that allow it, and some
+ * MXFP4 scales are the NaN byte. A NaN-scale group must SKIP the add, not add zero; the
+ * two differ only when x is not finite (inf * w * 0 is NaN), so for MXFP4 one row has
+ * x = +inf and every one of its scales NaN. Skipping leaves the output finite; adding a
+ * zero-scaled term turns every column NaN.
+ *
+ * Random data alone cannot see the ORDER: a reordered double sum differs by ~1e-16 and
+ * the float result rounds that away. So two pairs of identical rows carry x = +2^70
+ * then -2^70. In order, the first pair cancels exactly before anything else is added,
+ * and the second absorbs the partial sum before it; any reordering -- reversed rows, or
+ * partial sums over row ranges, which is what a row-parallel kernel would do -- loses
+ * or keeps different terms and changes the result by far more than a float ULP. */
+static float tr_w(int wdt, const unsigned char *W, int in, int r, int j, int *skip)
+{
+    const unsigned char *row = W + (size_t)r * k3_row_bytes(wdt, in);
+    *skip = 0;
+    if (wdt == K3_WBF16) return k3_bf16f(((const uint16_t *)W)[(size_t)r * in + j]);
+    if (wdt == K3_WI8)   return (float)((const int8_t *)(row + 4))[j];
+    if (wdt == K3_WMX4) {
+        static const float e2m1[16] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                                       -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f };
+        const unsigned char sb = row[(size_t)in / 2 + (size_t)j / K3_MXFP4_GROUP];
+        if (sb == 255) { *skip = 1; return 0.0f; }
+        const unsigned char b = row[j >> 1];
+        return e2m1[(j & 1) ? (b >> 4) : (b & 0x0F)];
+    }
+    return ((const float *)W)[(size_t)r * in + j];
+}
+
+static void t_matmul_tr_exact(void)
+{
+    static const int   types[4] = { K3_WF32, K3_WBF16, K3_WI8, K3_WMX4 };
+    static const char *names[4] = { "f32", "bf16", "i8", "mx4" };
+    static const int   widths[2] = { 72, 41 };
+    const int rows = 37;
+    int bad = 0, cases = 0;
+    unsigned s = 0xA11CEu;
+
+    for (int t = 0; t < 4; t++) for (int wi = 0; wi < 2; wi++) {
+        const int wdt = types[t], in = widths[wi];
+        if (wdt == K3_WMX4 && (in & 1)) continue;      /* two elements per byte */
+        const size_t rb = k3_row_bytes(wdt, in);
+        unsigned char *W = (unsigned char *)malloc(rb * rows);
+        float *x = (float *)malloc((size_t)rows * sizeof(float));
+        float *y = (float *)malloc((size_t)in * sizeof(float));
+        if (!W || !x || !y) { printf("  FAIL  matmul_tr (alloc)\n"); g_fail++; return; }
+
+        for (int r = 0; r < rows; r++) {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            x[r] = (float)(s >> 8) / 8388608.0f - 1.0f;
+            unsigned char *row = W + (size_t)r * rb;
+            for (size_t b = 0; b < rb; b++) { s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                                              row[b] = (unsigned char)(s >> 24); }
+            if (wdt == K3_WF32) {
+                for (int j = 0; j < in; j++) { s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                    const float v = (float)(s >> 8) / 8388608.0f - 1.0f;
+                    memcpy(row + (size_t)j * 4, &v, 4); }
+            } else if (wdt == K3_WBF16) {
+                uint16_t *h = (uint16_t *)row;          /* no NaN/Inf exponents */
+                for (int j = 0; j < in; j++) if (((h[j] >> 7) & 0xFF) == 0xFF) h[j] &= 0x7F7Fu;
+            } else if (wdt == K3_WI8) {
+                const float sc = 0.003f * (float)(r + 1);
+                memcpy(row, &sc, 4);
+            } else {
+                for (int g = 0; g < (in + K3_MXFP4_GROUP - 1) / K3_MXFP4_GROUP; g++) {
+                    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                    row[in / 2 + g] = ((s >> 24) % 5 == 0) ? 255 : (unsigned char)(118 + (s >> 24) % 18);
+                }
+            }
+        }
+        /* order probes: rows 0,1 and 17,18 identical, with x = +2^70, -2^70 */
+        memcpy(W + rb, W, rb);
+        memcpy(W + 18 * rb, W + 17 * rb, rb);
+        x[0] = x[17] = ldexpf(1.0f, 70);
+        x[1] = x[18] = -ldexpf(1.0f, 70);
+        if (wdt == K3_WMX4) {                          /* NaN-skip probe, see above */
+            unsigned char *row5 = W + 5 * rb;
+            for (int g = 0; g < (in + K3_MXFP4_GROUP - 1) / K3_MXFP4_GROUP; g++)
+                row5[in / 2 + g] = 255;
+            x[5] = INFINITY;
+        }
+
+        k3_matmul_tr(y, x, W, wdt, in, rows);
+        int diff = 0;
+        for (int j = 0; j < in; j++) {
+            double acc = 0.0;
+            for (int r = 0; r < rows; r++) {
+                int skip;
+                const float wv = tr_w(wdt, W, in, r, j, &skip);
+                if (skip) continue;
+                const unsigned char *row = W + (size_t)r * rb;
+                if (wdt == K3_WI8) {
+                    float sc; memcpy(&sc, row, 4);
+                    acc += (double)x[r] * (double)sc * (double)wv;
+                } else if (wdt == K3_WMX4) {
+                    const unsigned char sb = row[(size_t)in / 2 + (size_t)j / K3_MXFP4_GROUP];
+                    acc += (double)x[r] * (double)wv * (double)ldexpf(1.0f, (int)sb - 127);
+                } else {
+                    acc += (double)x[r] * (double)wv;
+                }
+            }
+            const float want = (float)acc;
+            if (memcmp(&want, &y[j], sizeof want) != 0) diff++;
+        }
+        if (diff) { printf("  FAIL  matmul_tr     %s in=%d: %d/%d columns differ\n",
+                           names[t], in, diff, in); bad++; }
+        cases++;
+        free(W); free(x); free(y);
+    }
+    if (bad) g_fail++;
+    else { printf("  PASS  matmul_tr     %d cases, bit-identical to a naive column sweep\n",
+                  cases); g_pass++; }
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -1049,6 +1172,7 @@ int main(int argc, char **argv)
     t_moe(dir);
     t_mxfp4(dir);
     t_matmul_bf16();
+    t_matmul_tr_exact();
     t_kda_layer(dir, "kda_layer1");
     t_kda_layer(dir, "kda_layer8");
     t_layer(dir, "layer_kda");
