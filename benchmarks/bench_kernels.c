@@ -40,11 +40,19 @@ static double now_s(void)
 static void fnv(const char *label, const float *v, int n)
 {
     unsigned long long h = 1469598103934665603ull;
+    int nonfinite = 0;
     for (int k = 0; k < n; k++) {
+        if (!isfinite(v[k])) nonfinite++;
         union { float f; unsigned u; } b; b.f = v[k];
         for (int t = 0; t < 4; t++) { h ^= (b.u >> (8 * t)) & 0xFFu; h *= 1099511628211ull; }
     }
     printf("             %s OUTPUT FNV1a = %016llx\n", label, h);
+    /* A NaN output hashes its payload, and payload propagation is NOT specified the
+     * same way for scalar and vector code, so a hash over NaNs proves nothing about
+     * the arithmetic. Say so loudly instead of printing a hash that looks meaningful. */
+    if (nonfinite)
+        printf("             WARNING: %d of %d outputs non-finite; this hash is NOT a "
+               "determinism check\n", nonfinite, n);
 }
 
 static void fillf(float *p, size_t n, unsigned s)
@@ -78,7 +86,22 @@ int main(void)
         float *x = (float *)malloc((size_t)in * sizeof(float));
         float *y = (float *)malloc((size_t)out * sizeof(float));
         if (!W || !x || !y) { printf("alloc failed\n"); return 1; }
-        fillb((unsigned char *)W, (size_t)in * out * 2, 12345u);
+        /* Real bf16 weights, i.e. the top half of finite floats. Raw random bytes
+         * would make ~1 in 256 weights NaN/Inf, every output row NaN, and the hash
+         * below a hash of NaN payloads that differs between scalar and AVX2 builds
+         * for reasons that have nothing to do with the kernel. */
+        {
+            float *tmp = (float *)malloc((size_t)in * sizeof(float));
+            if (!tmp) { printf("alloc failed\n"); return 1; }
+            for (int o = 0; o < out; o++) {
+                fillf(tmp, in, 12345u + (unsigned)o);
+                for (int i = 0; i < in; i++) {
+                    union { float f; uint32_t u; } b; b.f = tmp[i];
+                    W[(size_t)o * in + i] = (uint16_t)(b.u >> 16);
+                }
+            }
+            free(tmp);
+        }
         fillf(x, in, 999u);
 
         k3_matmul_bf16(y, x, W, in, out);              /* warm */
