@@ -1694,6 +1694,50 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
             int n = in - g * group;
             if (n > group) n = group;
 
+#if defined(__AVX2__)
+            if (n == 32) {
+                /* Full group: decode the 16 packed bytes in registers instead of
+                 * through the wf[] table walk below (which the compiler cannot
+                 * vectorise and which cost more than the FMAs). pshufb maps each
+                 * nibble to 2*E2M1 as an int8, which is exact (0..12), and the 0.5
+                 * multiply back is exact too, so every weight reaches the FMA with
+                 * the SAME double value as the table path, through the same lane
+                 * partition: the output is bit-identical. Signed zero is the only
+                 * value this does not reproduce, and it cannot matter: both
+                 * accumulators start at +0, and +0 + -0 is +0. */
+                const __m128i lut  = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12,
+                                                   0, -1, -2, -3, -4, -6, -8, -12);
+                const __m128i m4   = _mm_set1_epi8(0x0F);
+                const __m128i raw  = _mm_loadu_si128((const __m128i *)pb);
+                const __m128i lo   = _mm_shuffle_epi8(lut, _mm_and_si128(raw, m4));
+                const __m128i hi   = _mm_shuffle_epi8(lut,
+                                         _mm_and_si128(_mm_srli_epi16(raw, 4), m4));
+                /* low nibble = EVEN element: interleave lo,hi back into order */
+                const __m128i e0   = _mm_unpacklo_epi8(lo, hi);   /* elements  0..15 */
+                const __m128i e1   = _mm_unpackhi_epi8(lo, hi);   /* elements 16..31 */
+                const __m256d half = _mm256_set1_pd(0.5);
+                __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
+#define K3_MX_W(e, k) _mm256_mul_pd(half, _mm256_cvtepi32_pd( \
+                          _mm_cvtepi8_epi32(_mm_srli_si128((e), 4 * (k)))))
+#define K3_MX_X(off)  _mm256_cvtps_pd(_mm_loadu_ps(xg + (off)))
+                v0 = _mm256_fmadd_pd(K3_MX_W(e0, 0), K3_MX_X(0),  v0);
+                v1 = _mm256_fmadd_pd(K3_MX_W(e0, 1), K3_MX_X(4),  v1);
+                v0 = _mm256_fmadd_pd(K3_MX_W(e0, 2), K3_MX_X(8),  v0);
+                v1 = _mm256_fmadd_pd(K3_MX_W(e0, 3), K3_MX_X(12), v1);
+                v0 = _mm256_fmadd_pd(K3_MX_W(e1, 0), K3_MX_X(16), v0);
+                v1 = _mm256_fmadd_pd(K3_MX_W(e1, 1), K3_MX_X(20), v1);
+                v0 = _mm256_fmadd_pd(K3_MX_W(e1, 2), K3_MX_X(24), v0);
+                v1 = _mm256_fmadd_pd(K3_MX_W(e1, 3), K3_MX_X(28), v1);
+#undef K3_MX_W
+#undef K3_MX_X
+                double a[4];
+                _mm256_storeu_pd(a, _mm256_add_pd(v0, v1));
+                const double sub = (a[0] + a[1]) + (a[2] + a[3]);
+                acc += sub * (double)K3_E8M0[sb];
+                continue;
+            }
+#endif
+
             /* Expand the group to floats first, then take a plain dot product. The
              * split exists so the second loop can vectorise, which it cannot do while
              * a table lookup sits in the middle of the accumulation. */
