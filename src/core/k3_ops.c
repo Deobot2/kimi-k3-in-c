@@ -425,9 +425,11 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     float *ql   = ct   + (size_t)kvw;               /* [q_lora]       */
     float *acc  = ql   + (size_t)c->q_lora;         /* [H][vh]        */
     float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate   */
-    float *sc   = gbuf + (size_t)H * vh;            /* [last+1] scores */
+    /* [last+1] after gbuf was the score row; scores are per thread now (see the
+     * attention loop), but the region is kept so k3_mla_scratch_cached's size and
+     * every offset below stay what callers were built against. */
     /* Without a cache the keys/values live in scratch and cover only this call. */
-    float *kvs  = sc   + (size_t)(last + 1);        /* [T][H][kvd]    */
+    float *kvs  = gbuf + (size_t)H * vh + (size_t)(last + 1);   /* [T][H][kvd] */
     float *rps  = kvs  + (kvc ? 0 : (size_t)T * H * kvd);   /* [T][qr] */
 
     #define K3_KV_AT(p)   (kvc   ? kvc   + (size_t)(p) * H * kvd : kvs + (size_t)(p) * H * kvd)
@@ -451,9 +453,22 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         k3_mmw(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, H * kvd);
     }
 
-    /* ---- attention, per head, causal ---- */
+    /* ---- attention, per head, causal ----
+     * Heads are independent, so they run in parallel. Each thread scores into a
+     * private buffer (the shared `sc` region would be a race) and every per-head
+     * operation is unchanged, so the result is bit-identical at any thread count.
+     * This is the O(T^2) part of a prefill, and it used to run on one core. */
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
+#ifdef _OPENMP
+#       pragma omp parallel if (H > 1)
+#endif
+        {
+        float *sc = (float *)malloc((size_t)(p + 1) * sizeof(float));
+        if (!sc) k3_fatal_oom("MLA per-thread attention scores", (size_t)(p + 1) * sizeof(float));
+#ifdef _OPENMP
+#       pragma omp for schedule(static)
+#endif
         for (int h = 0; h < H; h++) {
             const float *qt = q + ((size_t)t * H + h) * qh;
             float m = -INFINITY;
@@ -478,6 +493,8 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                 const float *vs = K3_KV_AT(s) + (size_t)h * kvd + qn;
                 for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
             }
+        }
+        free(sc);
         }
 
         /* ---- output gate then projection. Gate BEFORE o_proj, and no norm on it,
@@ -536,10 +553,11 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     float *ct   = q    + (size_t)T * H * qh;        /* [kvw] transient */
     float *ql   = ct   + (size_t)kvw;               /* [q_lora]        */
     float *qa   = ql   + (size_t)c->q_lora;         /* [H][kl] absorbed queries */
-    float *al   = qa   + (size_t)H * kl;            /* [kl] latent attention sum */
-    float *acc  = al   + (size_t)kl;                /* [H][vh]         */
+    /* [kl] after qa was the latent attention sum, and [span] after gbuf the scores.
+     * Both are per thread now (see the attention loop); the regions are kept so
+     * k3_mla_scratch_latent's size and these offsets are unchanged. */
+    float *acc  = qa   + (size_t)H * kl + (size_t)kl;   /* [H][vh]     */
     float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate    */
-    float *sc   = gbuf + (size_t)H * vh;            /* [span] scores   */
 
     const size_t kvb_row = k3_row_bytes(w->wdt, kl);
 
@@ -588,6 +606,25 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         const int s0 = k3_kv_first(kv, p);
         int nsink = kv->window ? kv->sinks : 0;
         if (nsink > p + 1) nsink = p + 1;
+        /* Heads in parallel, as in k3_mla_cached: private scores and latent sum per
+         * thread, every per-head operation unchanged, so bit-identical at any thread
+         * count. The W_UV matmul inside runs serially per head (nested regions are
+         * off), which replaces 96 tiny parallel regions per token with one. */
+        /* The rolling span [s0, p] is EMPTY, not negative, while p is still inside
+         * the sinks (s0 is then sinks > p), exactly as the loops below treat it. */
+        const int nroll = (p >= s0) ? p - s0 + 1 : 0;
+        const int nspan = nsink + nroll;
+#ifdef _OPENMP
+#       pragma omp parallel if (H > 1)
+#endif
+        {
+        const size_t pbytes = ((size_t)nspan + (size_t)kl) * sizeof(float);
+        float *sc = (float *)malloc(pbytes);
+        if (!sc) k3_fatal_oom("MLA latent per-thread attention buffers", pbytes);
+        float *al = sc + nspan;
+#ifdef _OPENMP
+#       pragma omp for schedule(static)
+#endif
         for (int h = 0; h < H; h++) {
             const float *qah = qa + (size_t)h * kl;
             const float *qrh = qt + (size_t)h * qh + qn;   /* the unrotated rope slots */
@@ -633,6 +670,8 @@ void k3_mla_latent(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
             const unsigned char *wuv =
                 (const unsigned char *)w->kv_b + (size_t)(h * kvd + qn) * kvb_row;
             k3_mmw(acc + (size_t)h * vh, al, wuv, w->wdt, kl, vh);
+        }
+        free(sc);
         }
 
         /* ---- gate then projection, unchanged: the gate is why W_UV could not be

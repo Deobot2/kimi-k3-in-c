@@ -519,16 +519,23 @@ static void t_mla(const char *dir)
                 }
                 report_x("mla_lat_inc", y2, eo, n_out, 8.0);
 
-                memset(lat, 0, (size_t)T * kvw * sizeof(float));
-                memset(&kv, 0, sizeof kv);
-                kv.mode = K3_KV_LATENT; kv.lat = lat; kv.cap = T;
-                kv.window = T; kv.sinks = 1;
-                for (int t = 0; t < T; t++) {
-                    k3_mla_latent(y2 + (size_t)t * c.hidden, x + (size_t)t * c.hidden,
-                                  &w, &c, 1, sc2, &kv);
-                    kv.cached = t + 1;
+                /* Twice: one sink, and three. With more than one sink the first
+                 * positions sit INSIDE the sink region, where the rolling span is
+                 * empty (k3_kv_first returns sinks > p), and that is the case a
+                 * miscounted span gets wrong. */
+                for (int ns = 1; ns <= 3; ns += 2) {
+                    memset(lat, 0, (size_t)T * kvw * sizeof(float));
+                    memset(&kv, 0, sizeof kv);
+                    kv.mode = K3_KV_LATENT; kv.lat = lat; kv.cap = T;
+                    kv.window = T; kv.sinks = ns;
+                    for (int t = 0; t < T; t++) {
+                        k3_mla_latent(y2 + (size_t)t * c.hidden, x + (size_t)t * c.hidden,
+                                      &w, &c, 1, sc2, &kv);
+                        kv.cached = t + 1;
+                    }
+                    report_x(ns == 1 ? "mla_lat_window" : "mla_lat_window3",
+                             y2, eo, n_out, 8.0);
                 }
-                report_x("mla_lat_window", y2, eo, n_out, 8.0);
             }
             free(lat); free(y2); free(sc2);
         }
