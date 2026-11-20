@@ -433,6 +433,10 @@ static inline float k3_bf16f(uint16_t h)
 }
 
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out);
+/* The same product for T tokens: Y[t][out] = W . X[t][in]. Bit-identical to T calls
+ * of k3_matmul_bf16, and faster for T > 1 because each weight row is widened once per
+ * tile of tokens instead of once per token. */
+void k3_matmul_bf16_batch(float *Y, const float *X, const uint16_t *W, int in, int out, int T);
 
 /* Per-row int8 matmul for the draft model. W is `out` rows of [f32 scale][int8 * in].
  * No determinism contract (see K3_WI8): uses the fastest AVX2 form available. */
@@ -453,6 +457,20 @@ static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
     else if (wdt == K3_WI8)   k3_matmul_q8(y, x, W, in, out);
     else if (wdt == K3_WMX4)  k3_matmul_mx4(y, x, W, in, out);
     else                      k3_matmul(y, x, (const float *)W, in, out);
+}
+
+/* k3_mmw for T tokens: Y[t][out] = W . X[t][in]. bf16 goes through the batched kernel,
+ * which is bit-identical to per-token calls and faster for T > 1; every other format
+ * is per-token calls, so this is always safe to use where a loop over t would be. */
+static inline void k3_mmw_batch(float *Y, const float *X, const void *W, int wdt,
+                                int in, int out, int T)
+{
+    if (wdt == K3_WBF16) {
+        k3_matmul_bf16_batch(Y, X, (const uint16_t *)W, in, out, T);
+        return;
+    }
+    for (int t = 0; t < T; t++)
+        k3_mmw(Y + (size_t)t * out, X + (size_t)t * in, W, wdt, in, out);
 }
 
 /* Byte stride of one row for a per-row int8 matrix: the f32 scale plus `in` int8 weights.

@@ -1137,13 +1137,13 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
     /* Same hint as the per-token path: routing has not happened yet and the source may
      * have a guess worth starting now. */
     if (w->src->speculate) w->src->speculate(w->src, w->layer);
+    k3_mmw_batch(zz, x, w->down, w->wdt, E, Ll, T);   /* all tokens, one batched product */
     for (int t = 0; t < T; t++) {
         const float *xt = x + (size_t)t * E;
         int   *it = ridx + (size_t)t * K;
         float *wtt = rwt + (size_t)t * K;
         k3_router(it, wtt, xt, w->gate, w->bias, E, c->n_experts, K,
                   c->moe_renorm, c->routed_scale);
-        k3_mmw(zz + (size_t)t * Ll, xt, w->down, w->wdt, E, Ll);
         for (int j = 0; j < K; j++) {
             const int e = it[j];
             if (e >= 0 && e < c->n_experts && !seen[e]) { seen[e] = 1; uniq[nu++] = e; }
@@ -1245,13 +1245,15 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
     float *o  = bt + (size_t)T * H;      float *gb = o + (size_t)T * P;
     float *wr = gb + P;                  float *fa = wr + P;
 
-    /* 1. projections */
+    /* 1. projections. q, k, v and beta read only x, so a prefill does each as one
+     * batched product (each weight row widened once per tile of tokens, not once per
+     * token); bit-identical to the per-token calls. */
+    k3_mmw_batch(q,  x, w->q, w->wdt, E, P, T);
+    k3_mmw_batch(k,  x, w->k, w->wdt, E, P, T);
+    k3_mmw_batch(v,  x, w->v, w->wdt, E, P, T);
+    k3_mmw_batch(bt, x, w->b, w->wdt, E, H, T);
     for (int t = 0; t < T; t++) {
         const float *xt = x + (size_t)t * E;
-        k3_mmw(q + (size_t)t * P, xt, w->q, w->wdt, E, P);
-        k3_mmw(k + (size_t)t * P, xt, w->k, w->wdt, E, P);
-        k3_mmw(v + (size_t)t * P, xt, w->v, w->wdt, E, P);
-        k3_mmw(bt + (size_t)t * H, xt, w->b, w->wdt, E, H);
         /* ONE shared low-rank pair feeds every head: [E->D] then [D->H*D] */
         k3_mmw(fa, xt, w->f_a, w->wdt, E, D);
         k3_mmw(z + (size_t)t * P, fa, w->f_b, w->wdt, D, P);
@@ -1616,6 +1618,135 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
 #if defined(__AVX2__)
     free(xd);
 #endif
+}
+
+/* Y[t] = W . X[t] for T tokens at once, W bf16: the prefill form of k3_matmul_bf16.
+ *
+ * Called once per token, a prefill re-reads every weight row T times and re-widens it
+ * bf16 -> double T times, and the widening is what bounds the kernel. Here each row is
+ * widened ONCE into a per-thread double buffer and then dotted against a tile of
+ * tokens, the inner loop doing nothing but loads and FMAs.
+ *
+ * BIT-IDENTICAL to T calls of k3_matmul_bf16: every (t, o) dot product has the same
+ * sixteen lanes (element i to lane i%16), the same fused operation per element, the
+ * same reduction tree and the same scalar tail; only which (t, o) is computed when
+ * changes, and no two of them share an accumulator. */
+#if defined(__AVX2__)
+/* The double x double analogue of bf16_rowdot_simd, for K3_BB_TOK tokens at once so
+ * each weight load feeds several FMAs. Same lanes, same tree, per token. */
+#define K3_BB_TOK 4
+static inline void dd_rowdot_tok(double *res, const double *wd, const double *const *xd,
+                                 int nt, int n16)
+{
+#if defined(__AVX512F__)
+    /* Always K3_BB_TOK tokens, missing ones aliased to token 0 and discarded: a
+     * constant trip count is what lets the eight accumulators live in registers. */
+    const double *xp[K3_BB_TOK];
+    for (int u = 0; u < K3_BB_TOK; u++) xp[u] = xd[u < nt ? u : 0];
+    __m512d z0[K3_BB_TOK], z1[K3_BB_TOK];
+    for (int u = 0; u < K3_BB_TOK; u++) { z0[u] = _mm512_setzero_pd(); z1[u] = _mm512_setzero_pd(); }
+    for (int i = 0; i < n16; i += 16) {
+        const __m512d w0 = _mm512_loadu_pd(wd + i), w1 = _mm512_loadu_pd(wd + i + 8);
+        for (int u = 0; u < K3_BB_TOK; u++) {
+            z0[u] = _mm512_fmadd_pd(w0, _mm512_loadu_pd(xp[u] + i),     z0[u]);
+            z1[u] = _mm512_fmadd_pd(w1, _mm512_loadu_pd(xp[u] + i + 8), z1[u]);
+        }
+    }
+    for (int u = 0; u < nt; u++) {
+        const __m256d v01 = _mm256_add_pd(_mm512_castpd512_pd256(z0[u]), _mm512_extractf64x4_pd(z0[u], 1));
+        const __m256d v23 = _mm256_add_pd(_mm512_castpd512_pd256(z1[u]), _mm512_extractf64x4_pd(z1[u], 1));
+        double a[4];
+        _mm256_storeu_pd(a, _mm256_add_pd(v01, v23));
+        res[u] = (a[0] + a[1]) + (a[2] + a[3]);
+    }
+#else
+    /* AVX2 has 16 ymm registers: four accumulators per token, so two tokens per pass
+     * keeps everything in registers. */
+    for (int u0 = 0; u0 < nt; u0 += 2) {
+        const int two = (nt - u0) >= 2;
+        const double *xa = xd[u0], *xb = two ? xd[u0 + 1] : xd[u0];
+        __m256d a0 = _mm256_setzero_pd(), a1 = _mm256_setzero_pd();
+        __m256d a2 = _mm256_setzero_pd(), a3 = _mm256_setzero_pd();
+        __m256d b0 = _mm256_setzero_pd(), b1 = _mm256_setzero_pd();
+        __m256d b2 = _mm256_setzero_pd(), b3 = _mm256_setzero_pd();
+        for (int i = 0; i < n16; i += 16) {
+            const __m256d w0 = _mm256_loadu_pd(wd + i),     w1 = _mm256_loadu_pd(wd + i + 4);
+            const __m256d w2 = _mm256_loadu_pd(wd + i + 8), w3 = _mm256_loadu_pd(wd + i + 12);
+            a0 = _mm256_fmadd_pd(w0, _mm256_loadu_pd(xa + i),      a0);
+            a1 = _mm256_fmadd_pd(w1, _mm256_loadu_pd(xa + i + 4),  a1);
+            a2 = _mm256_fmadd_pd(w2, _mm256_loadu_pd(xa + i + 8),  a2);
+            a3 = _mm256_fmadd_pd(w3, _mm256_loadu_pd(xa + i + 12), a3);
+            b0 = _mm256_fmadd_pd(w0, _mm256_loadu_pd(xb + i),      b0);
+            b1 = _mm256_fmadd_pd(w1, _mm256_loadu_pd(xb + i + 4),  b1);
+            b2 = _mm256_fmadd_pd(w2, _mm256_loadu_pd(xb + i + 8),  b2);
+            b3 = _mm256_fmadd_pd(w3, _mm256_loadu_pd(xb + i + 12), b3);
+        }
+        double a[4];
+        _mm256_storeu_pd(a, _mm256_add_pd(_mm256_add_pd(a0, a1), _mm256_add_pd(a2, a3)));
+        res[u0] = (a[0] + a[1]) + (a[2] + a[3]);
+        if (two) {
+            _mm256_storeu_pd(a, _mm256_add_pd(_mm256_add_pd(b0, b1), _mm256_add_pd(b2, b3)));
+            res[u0 + 1] = (a[0] + a[1]) + (a[2] + a[3]);
+        }
+    }
+#endif
+}
+#endif
+
+/* Tokens per tile: the tile's widened x (TILE * in doubles, 1.8 MB at in = 7168) is
+ * what every row of the matrix is dotted against, so it must stay cache resident
+ * while the rows stream past. */
+#define K3_BB_TILE 32
+
+void k3_matmul_bf16_batch(float *Y, const float *X, const uint16_t *W, int in, int out, int T)
+{
+#if defined(__AVX2__)
+    const int n16 = in & ~15;
+    if (T > 1 && n16 > 0) {
+        const int tile = T < K3_BB_TILE ? T : K3_BB_TILE;
+        double *xd = (double *)malloc((size_t)tile * n16 * sizeof(double));
+        int ok = xd != NULL;
+        for (int t0 = 0; ok && t0 < T; t0 += tile) {
+            const int nt = (T - t0) < tile ? T - t0 : tile;
+            for (int u = 0; u < nt; u++)
+                for (int i = 0; i < n16; i++)
+                    xd[(size_t)u * n16 + i] = (double)X[(size_t)(t0 + u) * in + i];
+#ifdef _OPENMP
+#           pragma omp parallel if (out > 64)
+#endif
+            {
+                double *wd = (double *)malloc((size_t)n16 * sizeof(double));
+                if (!wd) k3_fatal_oom("bf16 batch row buffer", (size_t)n16 * sizeof(double));
+#ifdef _OPENMP
+#               pragma omp for schedule(static)
+#endif
+                for (int o = 0; o < out; o++) {
+                    const uint16_t *row = W + (size_t)o * in;
+                    for (int i = 0; i < n16; i++) wd[i] = (double)k3_bf16f(row[i]);
+                    for (int u0 = 0; u0 < nt; u0 += K3_BB_TOK) {
+                        const int nu = (nt - u0) < K3_BB_TOK ? nt - u0 : K3_BB_TOK;
+                        const double *xp[K3_BB_TOK];
+                        double res[K3_BB_TOK];
+                        for (int u = 0; u < nu; u++) xp[u] = xd + (size_t)(u0 + u) * n16;
+                        dd_rowdot_tok(res, wd, xp, nu, n16);
+                        for (int u = 0; u < nu; u++) {
+                            const float *xt = X + (size_t)(t0 + u0 + u) * in;
+                            double acc = res[u];
+                            for (int i = n16; i < in; i++)
+                                acc = fma((double)k3_bf16f(row[i]), (double)xt[i], acc);
+                            Y[(size_t)(t0 + u0 + u) * out + o] = (float)acc;
+                        }
+                    }
+                }
+                free(wd);
+            }
+        }
+        free(xd);
+        if (ok) return;
+    }
+#endif
+    for (int t = 0; t < T; t++)
+        k3_matmul_bf16(Y + (size_t)t * out, X + (size_t)t * in, W, in, out);
 }
 
 /* Per-row int8 matmul for the draft model: each row is [f32 scale][int8 * in]. The int8

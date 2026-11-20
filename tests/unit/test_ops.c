@@ -1019,6 +1019,47 @@ static void t_matmul_bf16(void)
     free(Wb); free(Wf); free(x); free(ya); free(yb);
 }
 
+/* The batched bf16 kernel must equal per-token calls BIT FOR BIT, on shapes chosen to
+ * hit every edge: widths with and without a %16 tail, token counts that are not a
+ * multiple of the 4-token register block or the 32-token tile, and a single row. A
+ * prefill goes through the batch and a decode step does not, so any difference here
+ * would make the same prompt mean different things depending on how it was fed. */
+static void t_matmul_bf16_batch(void)
+{
+    static const int ins[]  = {16, 40, 1029};
+    static const int outs[] = {1, 67};
+    static const int Ts[]   = {2, 3, 5, 33, 70};
+    unsigned s = 0x9e3779b9u;
+    int bad = 0, cases = 0;
+    for (unsigned a = 0; a < sizeof ins / sizeof *ins; a++)
+    for (unsigned b = 0; b < sizeof outs / sizeof *outs; b++)
+    for (unsigned c = 0; c < sizeof Ts / sizeof *Ts; c++) {
+        const int in = ins[a], out = outs[b], T = Ts[c];
+        uint16_t *W  = (uint16_t *)malloc((size_t)in * out * sizeof(uint16_t));
+        float *X  = (float *)malloc((size_t)T * in * sizeof(float));
+        float *Y0 = (float *)malloc((size_t)T * out * sizeof(float));
+        float *Y1 = (float *)malloc((size_t)T * out * sizeof(float));
+        if (!W || !X || !Y0 || !Y1) { printf("  FAIL  matmul_bf16_batch (alloc)\n"); g_fail++; return; }
+        for (size_t i = 0; i < (size_t)in * out; i++) {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            union { float f; uint32_t u; } v; v.f = ((float)(s >> 8) / 8388608.0f - 1.0f);
+            W[i] = (uint16_t)(v.u >> 16);                 /* a finite bf16, always */
+        }
+        for (size_t i = 0; i < (size_t)T * in; i++) {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            X[i] = (float)(s >> 8) / 8388608.0f - 1.0f;
+        }
+        for (int t = 0; t < T; t++)
+            k3_matmul_bf16(Y0 + (size_t)t * out, X + (size_t)t * in, W, in, out);
+        k3_matmul_bf16_batch(Y1, X, W, in, out, T);
+        if (memcmp(Y0, Y1, (size_t)T * out * sizeof(float))) bad++;
+        cases++;
+        free(W); free(X); free(Y0); free(Y1);
+    }
+    if (bad) { printf("  FAIL  matmul_bf16_batch %d/%d shapes differ from per-token calls\n", bad, cases); g_fail++; }
+    else     { printf("  PASS  matmul_bf16_batch %d shapes bit-identical to per-token calls\n", cases); g_pass++; }
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -1056,6 +1097,7 @@ int main(int argc, char **argv)
     t_moe(dir);
     t_mxfp4(dir);
     t_matmul_bf16();
+    t_matmul_bf16_batch();
     t_kda_layer(dir, "kda_layer1");
     t_kda_layer(dir, "kda_layer8");
     t_layer(dir, "layer_kda");
