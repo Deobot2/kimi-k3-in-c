@@ -92,9 +92,29 @@ not needing the bytes at all.
 - Saved state records the KV layout and window geometry and refuses a mismatch: the two
   caches hold different tensors of the same float count, so restoring one as the other
   would be fluent and wrong. State version 1 → 2.
+- **Compute kernels, all bit-identical to what they replace** (bench hashes, `make test`
+  and raw-byte comparisons against the previous code at 1–7 threads all unchanged):
+  - MXFP4 decodes full 32-element groups in registers (`pshufb` to `2·E2M1`, 0.5 folded
+    into the group scale) and widens `x` once per matmul: about **2.4×** on the expert
+    matmul.
+  - bf16 widens `x` once per call, and uses AVX-512 where the build has it: about **2×**.
+  - `k3_matmul_bf16_batch` / `k3_mmw_batch`: prefill widens each bf16 weight row once per
+    tile of tokens instead of once per token, about **2×** on those projections (KDA
+    q/k/v/beta, MoE-prefill down for now).
+  - `k3_matmul_tr` (absorbed `W_UK`, `--mla-latent`) walks rows over a column block
+    instead of striding down columns: about **3×**.
+  - MLA attention runs its heads in parallel in both cache layouts. That loop is the
+    O(T²) part of a prefill and it used to run on one core: about **3×** on 4 cores.
 
 ### Fixed
 
+- The MXFP4 lookup tables were built lazily behind plain `int` flags, a data race between
+  the decode thread, the cache's speculative thread and the trunk I/O thread (and on
+  arm64 a real one). They are now built under `pthread_once`.
+- `bench_kernels` filled the bf16 weights with raw random bytes, so nearly every output was
+  NaN and the "determinism" hash hashed NaN payloads, which made scalar and AVX2 builds
+  look like they disagreed. With finite weights the two builds print the same hash, and
+  the bench warns if any output is non-finite.
 - The trunk reader's `hits`/`misses` are classified once per bind rather than incremented
   by whichever thread performed the read, so they sum to the bind count instead of double
   counting every prefetched layer.
