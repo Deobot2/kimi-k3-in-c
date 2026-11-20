@@ -1703,12 +1703,15 @@ static void k3_e8m0_init(void)
  * two byte pointers come from. Two copies of this loop would be two chances to get the
  * nibble order right in one and wrong in the other, which is the failure mode the
  * mxfp4 fixture exists for and which no statistic would reveal. */
-static double mxfp4_rowdot(const float *x, const unsigned char *pr,
+static double mxfp4_rowdot(const float *x, const double *xd, const unsigned char *pr,
                            const unsigned char *sr, int in, int group)
 {
     const int ngrp  = (in + group - 1) / group;
     const int gbyte = group / 2;
     double acc = 0.0;
+#if !defined(__AVX2__)
+    (void)xd;                                     /* only the AVX2 full-group path */
+#endif
     {
         for (int g = 0; g < ngrp; g++) {
             const unsigned char sb = sr[g];
@@ -1720,16 +1723,15 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
             if (n > group) n = group;
 
 #if defined(__AVX2__)
-            if (n == 32) {
+            if (n == 32 && xd) {
                 /* Full group: decode the 16 packed bytes in registers instead of
                  * through the wf[] table walk below (which the compiler cannot
                  * vectorise and which cost more than the FMAs). pshufb maps each
-                 * nibble to 2*E2M1 as an int8, which is exact (0..12), and the 0.5
-                 * multiply back is exact too, so every weight reaches the FMA with
-                 * the SAME double value as the table path, through the same lane
-                 * partition: the output is bit-identical. Signed zero is the only
-                 * value this does not reproduce, and it cannot matter: both
-                 * accumulators start at +0, and +0 + -0 is +0. */
+                 * nibble to 2*E2M1 as an int8, which is exact (0..12), and the
+                 * lanes, order and reduction are the table path's, so the output
+                 * is bit-identical (the 2x is taken back below, exactly). Signed
+                 * zero is the only value this does not reproduce, and it cannot
+                 * matter: every accumulator starts at +0, and +0 + -0 is +0. */
                 const __m128i lut  = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12,
                                                    0, -1, -2, -3, -4, -6, -8, -12);
                 const __m128i m4   = _mm_set1_epi8(0x0F);
@@ -1740,11 +1742,15 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
                 /* low nibble = EVEN element: interleave lo,hi back into order */
                 const __m128i e0   = _mm_unpacklo_epi8(lo, hi);   /* elements  0..15 */
                 const __m128i e1   = _mm_unpackhi_epi8(lo, hi);   /* elements 16..31 */
-                const __m256d half = _mm256_set1_pd(0.5);
+                const double *xdg = xd + (size_t)g * group;
+                /* The FMAs run on the integers 2*w, not on w. Doubling every
+                 * product doubles every exactly-rounded partial sum exactly (no
+                 * over- or underflow is reachable from float inputs in double), so
+                 * halving once at the end gives the same bits as halving each
+                 * weight first, at one multiply per group instead of eight. */
                 __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
-#define K3_MX_W(e, k) _mm256_mul_pd(half, _mm256_cvtepi32_pd( \
-                          _mm_cvtepi8_epi32(_mm_srli_si128((e), 4 * (k)))))
-#define K3_MX_X(off)  _mm256_cvtps_pd(_mm_loadu_ps(xg + (off)))
+#define K3_MX_W(e, k) _mm256_cvtepi32_pd(_mm_cvtepi8_epi32(_mm_srli_si128((e), 4 * (k))))
+#define K3_MX_X(off)  _mm256_loadu_pd(xdg + (off))
                 v0 = _mm256_fmadd_pd(K3_MX_W(e0, 0), K3_MX_X(0),  v0);
                 v1 = _mm256_fmadd_pd(K3_MX_W(e0, 1), K3_MX_X(4),  v1);
                 v0 = _mm256_fmadd_pd(K3_MX_W(e0, 2), K3_MX_X(8),  v0);
@@ -1755,10 +1761,11 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
                 v1 = _mm256_fmadd_pd(K3_MX_W(e1, 3), K3_MX_X(28), v1);
 #undef K3_MX_W
 #undef K3_MX_X
+                const __m256d vs = _mm256_add_pd(v0, v1);
                 double a[4];
-                _mm256_storeu_pd(a, _mm256_add_pd(v0, v1));
-                const double sub = (a[0] + a[1]) + (a[2] + a[3]);
-                acc += sub * (double)K3_E8M0[sb];
+                _mm256_storeu_pd(a, vs);
+                const double sub2 = (a[0] + a[1]) + (a[2] + a[3]);
+                acc += (sub2 * 0.5) * (double)K3_E8M0[sb];
                 continue;
             }
 #endif
@@ -1824,6 +1831,22 @@ static double mxfp4_rowdot(const float *x, const unsigned char *pr,
     return acc;
 }
 
+/* x as doubles, once per matmul, for the AVX2 full-group path, which otherwise widens
+ * the same 32 floats again for every row. Exact, so it changes no bits. NULL (no
+ * AVX2, or no memory) just selects the table path, which is equally correct. */
+static double *mxfp4_widen_x(const float *x, int in)
+{
+#if defined(__AVX2__)
+    double *xd = (double *)malloc((size_t)in * sizeof(double));
+    if (xd)
+        for (int i = 0; i < in; i++) xd[i] = (double)x[i];
+    return xd;
+#else
+    (void)x; (void)in;
+    return NULL;
+#endif
+}
+
 void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
                      const unsigned char *scales, int in, int rows, int group)
 {
@@ -1833,12 +1856,14 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
     if (!k3_pair_ready)  k3_pair_init();
     if (!k3_e8m0_ready)  k3_e8m0_init();
 
+    double *xd = mxfp4_widen_x(x, in);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (rows > 64)
 #endif
     for (int r = 0; r < rows; r++)
-        y[r] = (float)mxfp4_rowdot(x, packed + (size_t)r * pcols,
+        y[r] = (float)mxfp4_rowdot(x, xd, packed + (size_t)r * pcols,
                                    scales + (size_t)r * ngrp, in, group);
+    free(xd);
 }
 
 /* A quantised trunk matrix: `out` rows of [packed nibbles][E8M0 scales], each row
@@ -1854,13 +1879,15 @@ void k3_matmul_mx4(float *y, const float *x, const void *W, int in, int out)
     if (!k3_pair_ready)  k3_pair_init();
     if (!k3_e8m0_ready)  k3_e8m0_init();
 
+    double *xd = mxfp4_widen_x(x, in);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
 #endif
     for (int r = 0; r < out; r++) {
         const unsigned char *row = base + (size_t)r * rb;
-        y[r] = (float)mxfp4_rowdot(x, row, row + pn, in, K3_MXFP4_GROUP);
+        y[r] = (float)mxfp4_rowdot(x, xd, row, row + pn, in, K3_MXFP4_GROUP);
     }
+    free(xd);
 }
 
 void k3_mxfp4_dequant(float *out, const unsigned char *packed,
