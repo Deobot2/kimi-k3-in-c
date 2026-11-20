@@ -1476,72 +1476,95 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
  *   exactly the values an fp32 copy would have supplied. The only difference from
  *   k3_matmul is WHERE the widening happens, not what is widened.
  *
- * The accumulator layout mirrors k3_matmul deliberately, four partial sums in double,
- * reduced in the same order, so the two kernels agree to the bit on identical input.
+ * The accumulator layout mirrors k3_matmul deliberately: sixteen fused partial sums
+ * in double, element i to lane i%16, reduced by the same tree, so the two kernels
+ * agree to the bit on identical input.
  *
- * THE AVX2 PATH IS BIT-IDENTICAL TO THE SCALAR PATH, not merely close. A __m256d holds
- * exactly four doubles, and loading four consecutive elements per iteration places
- * element i in lane i%4: the same partition as the scalar accumulators, with the same
- * sequential order within each lane. Reducing with (a0+a1)+(a2+a3) then reproduces the
- * scalar result exactly. Two details carry that guarantee:
+ * THE AVX2 PATH IS BIT-IDENTICAL TO THE SCALAR PATH, not merely close. Four __m256d
+ * accumulators hold the sixteen lanes (element i in register (i/4)%4, lane i%4), and
+ * _mm256_fmadd_pd per lane is the same IEEE operation as scalar fma() in double. The
+ * lanewise (v0+v1)+(v2+v3) followed by the cross-lane (a0+a1)+(a2+a3) is exactly the
+ * scalar b0..b3 tree. bench_kernels prints an output hash; scalar and AVX2 builds
+ * must print the same one.
  *
- *   - MUL THEN ADD, never _mm256_fmadd_pd. The build sets -ffp-contract=off, so the
- *     scalar code rounds the product and the sum separately while an FMA rounds once.
- *     Here the product happens to be exact (a bf16 widens exactly, and float x float
- *     needs 48 mantissa bits, which fits double's 53), so the two would agree anyway
- *     but that is a proof about the inputs. Mul-then-add is a proof about the code.
- *   - The scalar tail loop is reused verbatim for the in % 4 remainder.
+ * x IS WIDENED ONCE PER CALL, not once per row. The kernel is bound by the shuffle
+ * port, not by memory: every four elements cost a bf16 widen and TWO float->double
+ * conversions, and the second of those, on x, was repeated for each of `out` rows.
+ * Converting x to a double vector up front is exact, so the FMAs see the same values,
+ * and it removes a third of the per-element shuffle work.
  */
+#if defined(__AVX2__)
+/* The vector body for one row: everything up to the last multiple of 16. The caller
+ * finishes the in % 16 tail with the scalar fma loop, as the scalar path does. */
+static inline double bf16_rowdot_simd(const uint16_t *row, const double *xd, int n16)
+{
+#if defined(__AVX512F__)
+    /* The same sixteen lanes in two zmm registers: z0 is v0|v1 below, z1 is v2|v3.
+     * Halves the widen and convert uops, which are what bound this loop. */
+    __m512d z0 = _mm512_setzero_pd(), z1 = _mm512_setzero_pd();
+    for (int i = 0; i < n16; i += 16) {
+        const __m512i w32 = _mm512_slli_epi32(_mm512_cvtepu16_epi32(
+                                _mm256_loadu_si256((const __m256i *)(row + i))), 16);
+        const __m512 wf = _mm512_castsi512_ps(w32);
+        z0 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm512_castps512_ps256(wf)),
+                             _mm512_loadu_pd(xd + i), z0);
+        z1 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_castpd_ps(
+                                 _mm512_extractf64x4_pd(_mm512_castps_pd(wf), 1))),
+                             _mm512_loadu_pd(xd + i + 8), z1);
+    }
+    const __m256d v01 = _mm256_add_pd(_mm512_castpd512_pd256(z0), _mm512_extractf64x4_pd(z0, 1));
+    const __m256d v23 = _mm256_add_pd(_mm512_castpd512_pd256(z1), _mm512_extractf64x4_pd(z1, 1));
+    double a[4];
+    _mm256_storeu_pd(a, _mm256_add_pd(v01, v23));
+    return (a[0] + a[1]) + (a[2] + a[3]);
+#else
+    __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
+    __m256d v2 = _mm256_setzero_pd(), v3 = _mm256_setzero_pd();
+    for (int i = 0; i < n16; i += 16) {
+        /* bf16 -> f32 is a 16-bit left shift: widen u16 to u32, shift, reinterpret.
+         * No table, no rounding. */
+#define K3_BF_W(k) _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32( \
+                       _mm_loadl_epi64((const __m128i *)(row + i + 4 * (k)))), 16)))
+        v0 = _mm256_fmadd_pd(K3_BF_W(0), _mm256_loadu_pd(xd + i),      v0);
+        v1 = _mm256_fmadd_pd(K3_BF_W(1), _mm256_loadu_pd(xd + i + 4),  v1);
+        v2 = _mm256_fmadd_pd(K3_BF_W(2), _mm256_loadu_pd(xd + i + 8),  v2);
+        v3 = _mm256_fmadd_pd(K3_BF_W(3), _mm256_loadu_pd(xd + i + 12), v3);
+#undef K3_BF_W
+    }
+    /* (v0+v1)+(v2+v3) lanewise, then the same cross-lane pairing as scalar */
+    const __m256d vt = _mm256_add_pd(_mm256_add_pd(v0, v1), _mm256_add_pd(v2, v3));
+    double a[4];
+    _mm256_storeu_pd(a, vt);
+    return (a[0] + a[1]) + (a[2] + a[3]);
+#endif
+}
+#endif
+
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
 {
+    const int n16 = in & ~15;
+#if defined(__AVX2__)
+    /* 8 bytes per element of x, once per call; at K3's widest trunk input (24576)
+     * that is 192 KB, which is why it is heap and not stack. If it cannot be had,
+     * widening x inline per row (the scalar-path fallback below) is still correct. */
+    double *xd = n16 > 0 ? (double *)malloc((size_t)n16 * sizeof(double)) : NULL;
+    if (xd)
+        for (int i = 0; i < n16; i++) xd[i] = (double)x[i];
+#endif
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
 #endif
     for (int o = 0; o < out; o++) {
         const uint16_t *row = W + (size_t)o * in;
-        int i = 0;
         double acc;
 #if defined(__AVX2__)
-        {
-            /* Four vector accumulators, fused. _mm256_fmadd_pd per lane is the same
-             * IEEE operation as scalar fma() in double, and the reduction below is
-             * lane-for-lane the tree k3_matmul's sixteen scalar accumulators use, so
-             * the two kernels remain BITWISE identical (test_ops asserts it). The old
-             * one-accumulator mul+add form serialized on add latency at 4 elements
-             * per ~4 cycles; this runs the memory-bound side of the roof instead. */
-            __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
-            __m256d v2 = _mm256_setzero_pd(), v3 = _mm256_setzero_pd();
-            for (; i + 15 < in; i += 16) {
-                /* bf16 -> f32 is a 16-bit left shift, so widen u16 to u32, shift,
-                 * and reinterpret. No table, no rounding. */
-                const __m128i h0 = _mm_loadl_epi64((const __m128i *)(row + i));
-                const __m128i h1 = _mm_loadl_epi64((const __m128i *)(row + i + 4));
-                const __m128i h2 = _mm_loadl_epi64((const __m128i *)(row + i + 8));
-                const __m128i h3 = _mm_loadl_epi64((const __m128i *)(row + i + 12));
-                v0 = _mm256_fmadd_pd(
-                    _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h0), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i)), v0);
-                v1 = _mm256_fmadd_pd(
-                    _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h1), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 4)), v1);
-                v2 = _mm256_fmadd_pd(
-                    _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h2), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 8)), v2);
-                v3 = _mm256_fmadd_pd(
-                    _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h3), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 12)), v3);
-            }
-            /* (v0+v1)+(v2+v3) lanewise, then the same cross-lane pairing as scalar */
-            const __m256d vt = _mm256_add_pd(_mm256_add_pd(v0, v1),
-                                             _mm256_add_pd(v2, v3));
-            double a[4];
-            _mm256_storeu_pd(a, vt);
-            acc = (a[0] + a[1]) + (a[2] + a[3]);
-        }
-#else
+        if (xd) {
+            acc = bf16_rowdot_simd(row, xd, n16);
+        } else
+#endif
         {
             double a[16] = {0};
-            for (; i + 15 < in; i += 16)
+            for (int i = 0; i < n16; i += 16)
                 for (int l = 0; l < 16; l++)
                     a[l] = fma((double)k3_bf16f(row[i + l]), (double)x[i + l], a[l]);
             double b0 = (a[0] + a[4]) + (a[8]  + a[12]);
@@ -1550,10 +1573,12 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
             double b3 = (a[3] + a[7]) + (a[11] + a[15]);
             acc = (b0 + b1) + (b2 + b3);
         }
-#endif
-        for (; i < in; i++) acc = fma((double)k3_bf16f(row[i]), (double)x[i], acc);
+        for (int i = n16; i < in; i++) acc = fma((double)k3_bf16f(row[i]), (double)x[i], acc);
         y[o] = (float)acc;
     }
+#if defined(__AVX2__)
+    free(xd);
+#endif
 }
 
 /* Per-row int8 matmul for the draft model: each row is [f32 scale][int8 * in]. The int8
